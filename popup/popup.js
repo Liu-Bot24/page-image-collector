@@ -1,0 +1,1286 @@
+const MSG = {
+  SCAN: "SCAN",
+  GET_IMAGES: "GET_IMAGES",
+  TOGGLE_SELECT: "TOGGLE_SELECT",
+  SET_SELECTION: "SET_SELECTION",
+  GET_SELECTED: "GET_SELECTED",
+  GET_STATS: "GET_STATS",
+  DOWNLOAD: "DOWNLOAD",
+  DOWNLOAD_BATCH: "DOWNLOAD_BATCH",
+  COPY_TO_CLIPBOARD: "COPY_TO_CLIPBOARD",
+  SET_CONFIG: "SET_CONFIG",
+  GET_CONFIG: "GET_CONFIG",
+  START_AUTO_SCAN: "START_AUTO_SCAN",
+  STOP_AUTO_SCAN: "STOP_AUTO_SCAN",
+  IMAGES_UPDATED: "IMAGES_UPDATED",
+  DOWNLOAD_PROGRESS: "DOWNLOAD_PROGRESS",
+  PROBE_IMAGE_DIMENSIONS: "PROBE_IMAGE_DIMENSIONS",
+  OPEN_DOWNLOAD_DIRECTORY: "OPEN_DOWNLOAD_DIRECTORY",
+  OPEN_SOURCE_URL: "OPEN_SOURCE_URL",
+  CLEAR_IMAGES: "CLEAR_IMAGES"
+};
+
+const elements = {
+  btnScan: document.getElementById("btn-scan"),
+  btnClear: document.getElementById("btn-clear"),
+  btnWorkspace: document.getElementById("btn-workspace"),
+  btnSelectAll: document.getElementById("btn-select-all"),
+  btnDownloadSelected: document.getElementById("btn-download-selected"),
+  btnCopySelected: document.getElementById("btn-copy-selected"),
+  btnOpenDownloadDir: document.getElementById("btn-open-download-dir"),
+  toggleHd: document.getElementById("toggle-hd"),
+  toggleAutoScan: document.getElementById("toggle-auto-scan"),
+  toggleSortSize: document.getElementById("toggle-sort-size"),
+  togglePortraitOnly: document.getElementById("toggle-portrait-only"),
+  toggleWebP: document.getElementById("toggle-webp"),
+  toggleBatchZipDownload: document.getElementById("toggle-batch-zip-download"),
+  toggleRightClick: document.getElementById("toggle-right-click"),
+  resolutionPresets: document.getElementById("resolution-presets"),
+  filterMinShort: document.getElementById("filter-min-short"),
+  filterMinLong: document.getElementById("filter-min-long"),
+  filterMinMp: document.getElementById("filter-min-mp"),
+  formatFilters: document.getElementById("format-filters"),
+  actionStatus: document.getElementById("action-status"),
+  statTotal: document.getElementById("stat-total"),
+  statFiltered: document.getElementById("stat-filtered"),
+  statSelected: document.getElementById("stat-selected"),
+  imageGrid: document.getElementById("image-grid"),
+  emptyState: document.getElementById("empty-state"),
+  lightbox: document.getElementById("lightbox"),
+  lightboxImage: document.getElementById("lightbox-image"),
+  lightboxDimensions: document.getElementById("lightbox-dimensions"),
+  lightboxSize: document.getElementById("lightbox-size"),
+  lightboxDownload: document.getElementById("lightbox-download"),
+  lightboxCopy: document.getElementById("lightbox-copy"),
+  lightboxSource: document.getElementById("lightbox-source"),
+  lightboxClose: document.getElementById("lightbox-close"),
+  lightboxPrev: document.getElementById("lightbox-prev"),
+  lightboxNext: document.getElementById("lightbox-next")
+};
+
+let sourceTabId = null;
+let currentImages = [];
+let selectedIds = new Set();
+let lightboxImage = null;
+let lightboxCurrentSrc = "";
+let lightboxSourceUrl = "";
+let lightboxIndex = -1;
+let hasScannedOnce = false;
+let activePreset = "all";
+let actionStatusTimer = null;
+let autoRefreshTimer = null;
+let manualScanInProgress = false;
+let batchDownloadInProgress = false;
+const clipboardPayloadCache = new Map();
+const CLIPBOARD_CACHE_TTL = 5 * 60 * 1000;
+const imageDimensionCache = new Map();
+const cardDimensionCache = new Map();
+const cardDimensionTasks = new Map();
+
+let currentConfig = {
+  enableHD: true,
+  enableSizeSort: true,
+  enablePortraitOnly: false,
+  enableAutoScan: false,
+  enableWebPConvert: false,
+  enableBatchZipDownload: false,
+  enableRightClick: false
+};
+
+const FORMAT_GROUPS = [
+  { value: "jpg", label: "JPG", aliases: ["jpg", "jpeg"] },
+  { value: "png", label: "PNG", aliases: ["png"] },
+  { value: "webp", label: "WebP", aliases: ["webp"] },
+  { value: "gif", label: "GIF", aliases: ["gif"] },
+  { value: "svg", label: "SVG", aliases: ["svg"] },
+  { value: "avif", label: "AVIF", aliases: ["avif"] }
+];
+const PRIMARY_FORMATS = new Set(FORMAT_GROUPS.flatMap((item) => item.aliases));
+
+const RESOLUTION_PRESETS = {
+  all: { type: "all", minShort: 0, minLong: 0, minArea: 0 },
+  "720p": { type: "resolution", minShort: 720, minLong: 1280, minArea: 1280 * 720 },
+  "1080p": { type: "resolution", minShort: 1080, minLong: 1920, minArea: 1920 * 1080 },
+  "2k": { type: "resolution", minShort: 1440, minLong: 2560, minArea: 2560 * 1440 },
+  "4k": { type: "resolution", minShort: 2160, minLong: 3840, minArea: 3840 * 2160 }
+};
+const SELECT_ALL_LABEL = "全 选";
+const UNSELECT_ALL_LABEL = "取消全选";
+
+const getCurrentTabId = async () => {
+  const tabs = await chrome.tabs.query({ active: true, currentWindow: true });
+  return tabs[0]?.id ?? null;
+};
+
+const sendMessage = async (type, payload = {}) => {
+  if (!sourceTabId) sourceTabId = await getCurrentTabId();
+  return new Promise((resolve) => {
+    chrome.runtime.sendMessage(
+      { type, payload, tabId: sourceTabId },
+      (response) => {
+        if (chrome.runtime.lastError) {
+          resolve({ success: false, error: chrome.runtime.lastError.message });
+          return;
+        }
+        resolve(response || { success: false, error: "No response" });
+      }
+    );
+  });
+};
+
+const openDownloadDirectory = async () => {
+  const response = await sendMessage(MSG.OPEN_DOWNLOAD_DIRECTORY);
+  if (!response.success) {
+    setActionStatus(`打开下载目录失败: ${response.error || "未知错误"}`, 2800);
+    return;
+  }
+  setActionStatus("已打开下载目录", 1200);
+};
+
+const syncAutoScanRuntime = async (enabled) => {
+  const response = await sendMessage(enabled ? MSG.START_AUTO_SCAN : MSG.STOP_AUTO_SCAN);
+  if (!response?.success) {
+    const action = enabled ? "开启自动采集" : "关闭自动采集";
+    setActionStatus(`${action}失败: ${response?.error || "未知错误"}`, 3200);
+    return false;
+  }
+  return true;
+};
+
+const setActionStatus = (text = "", timeoutMs = 2400) => {
+  const rawText = String(text || "");
+  const displayText = rawText.length > 58 ? `${rawText.slice(0, 58)}…` : rawText;
+  elements.actionStatus.textContent = displayText;
+  elements.actionStatus.title = rawText;
+  if (actionStatusTimer) {
+    clearTimeout(actionStatusTimer);
+    actionStatusTimer = null;
+  }
+  if (!rawText || timeoutMs <= 0) return;
+  actionStatusTimer = setTimeout(() => {
+    elements.actionStatus.textContent = "";
+    elements.actionStatus.title = "";
+    actionStatusTimer = null;
+  }, timeoutMs);
+};
+
+const scheduleRenderRefresh = () => {
+  if (autoRefreshTimer) return;
+  setActionStatus("采集中...", -1);
+  autoRefreshTimer = setTimeout(() => {
+    autoRefreshTimer = null;
+    renderImages()
+      .then(() => {
+        setActionStatus("采集完成", 1200);
+      })
+      .catch(() => {
+        setActionStatus("刷新失败，请重试", 2400);
+      });
+  }, 120);
+};
+
+const cleanupClipboardCache = () => {
+  const now = Date.now();
+  for (const [key, entry] of clipboardPayloadCache.entries()) {
+    if (!entry || now - entry.time > CLIPBOARD_CACHE_TTL) {
+      clipboardPayloadCache.delete(key);
+    }
+  }
+};
+
+const setClipboardCache = (key, payload) => {
+  if (!key || !payload?.success || !payload?.dataUrl) return;
+  clipboardPayloadCache.set(key, { ...payload, time: Date.now() });
+  cleanupClipboardCache();
+};
+
+const getClipboardCache = (key) => {
+  if (!key) return null;
+  cleanupClipboardCache();
+  return clipboardPayloadCache.get(key) || null;
+};
+
+const dataUrlToBlob = (dataUrl) => {
+  const match = String(dataUrl || "").match(/^data:([^;]+);base64,(.*)$/);
+  if (!match) return null;
+  const mime = match[1] || "image/png";
+  const binary = atob(match[2]);
+  const len = binary.length;
+  const bytes = new Uint8Array(len);
+  for (let i = 0; i < len; i += 1) {
+    bytes[i] = binary.charCodeAt(i);
+  }
+  return new Blob([bytes], { type: mime });
+};
+
+const canWriteClipboardImage = () =>
+  typeof ClipboardItem !== "undefined" &&
+  navigator.clipboard &&
+  typeof navigator.clipboard.write === "function";
+
+const writeClipboardImage = async (payload) => {
+  const blob = dataUrlToBlob(payload?.dataUrl);
+  if (!blob) return false;
+  await navigator.clipboard.write([new ClipboardItem({ [blob.type]: blob })]);
+  return true;
+};
+
+const preloadClipboardPayload = async (image, preferredUrl, preferHD = false) => {
+  if (!image || !preferredUrl) return;
+  if (getClipboardCache(preferredUrl)) return;
+  const response = await sendMessage(MSG.COPY_TO_CLIPBOARD, {
+    image,
+    preferredUrl,
+    preferHD
+  });
+  setClipboardCache(preferredUrl, response);
+};
+
+const getImageDimensions = async (url) => {
+  const normalizedUrl = String(url || "").trim();
+  if (!normalizedUrl) return { width: 0, height: 0 };
+
+  const cached = imageDimensionCache.get(normalizedUrl);
+  if (cached) return await cached;
+
+  const domProbe = () =>
+    new Promise((resolve) => {
+      const probe = new Image();
+      probe.onload = () => resolve({ width: probe.naturalWidth || 0, height: probe.naturalHeight || 0 });
+      probe.onerror = () => resolve({ width: 0, height: 0 });
+      probe.src = normalizedUrl;
+    });
+
+  const promise = (async () => {
+    if (/^https?:/i.test(normalizedUrl)) {
+      const response = await sendMessage(MSG.PROBE_IMAGE_DIMENSIONS, { url: normalizedUrl });
+      if (response?.success) {
+        return {
+          width: Number(response.width) || 0,
+          height: Number(response.height) || 0
+        };
+      }
+      return { width: 0, height: 0 };
+    }
+    return await domProbe();
+  })();
+
+  imageDimensionCache.set(normalizedUrl, promise);
+  return await promise;
+};
+
+const computeArea = (width, height) => Math.max(0, (Number(width) || 0) * (Number(height) || 0));
+const formatAreaMp = (area) => `${(Math.max(0, Number(area) || 0) / 1000000).toFixed(2)} MP`;
+
+const getCardMeta = (image) => {
+  const cached = cardDimensionCache.get(image.id);
+  if (cached && currentConfig.enableHD) return cached;
+  const width = Number(image.width) || 0;
+  const height = Number(image.height) || 0;
+  return {
+    width,
+    height,
+    area: Math.max(Number(image.area) || 0, computeArea(width, height))
+  };
+};
+
+const resolveCardMaxDimensions = async (image) => {
+  if (!image?.id) return getCardMeta(image);
+  const cached = cardDimensionCache.get(image.id);
+  if (cached) return cached;
+
+  const pendingTask = cardDimensionTasks.get(image.id);
+  if (pendingTask) return await pendingTask;
+
+  const hasHdCandidate = Boolean(image.hdSrc && image.hdSrc !== image.src);
+
+  const task = (async () => {
+    try {
+      const probes = [getImageDimensions(image.src)];
+      if (hasHdCandidate) {
+        probes.push(getImageDimensions(image.hdSrc));
+      }
+      const [srcDim, hdDim = { width: 0, height: 0 }] = await Promise.all(probes);
+      const srcArea = computeArea(srcDim.width, srcDim.height);
+      const hdArea = computeArea(hdDim.width, hdDim.height);
+      const base = getCardMeta(image);
+      let width = base.width;
+      let height = base.height;
+      let area = base.area;
+
+      if (srcArea >= area) {
+        width = srcDim.width;
+        height = srcDim.height;
+        area = srcArea;
+      }
+      if (hdArea >= area) {
+        width = hdDim.width;
+        height = hdDim.height;
+        area = hdArea;
+      }
+
+      const resolved = { width, height, area };
+      cardDimensionCache.set(image.id, resolved);
+      return resolved;
+    } finally {
+      cardDimensionTasks.delete(image.id);
+    }
+  })();
+
+  cardDimensionTasks.set(image.id, task);
+  return await task;
+};
+
+const isHdBadge = (image) => {
+  const meta = getCardMeta(image);
+  const highResolution = meta.area >= 1280 * 720;
+  const hasLargerCandidate = Boolean(image.hdSrc && image.hdSrc !== image.src);
+  return hasLargerCandidate || highResolution;
+};
+
+const formatFromUrl = (url) => {
+  if (!url) return "unknown";
+  try {
+    const parsed = new URL(url);
+    if (
+      String(url).startsWith("blob:https://web.telegram.org/") ||
+      (parsed.protocol === "blob:" && /web\.telegram\.org/i.test(String(parsed.pathname || "")))
+    ) {
+      return "jpg";
+    }
+    const fromParam = parsed.searchParams.get("format");
+    if (fromParam) return fromParam.toLowerCase();
+
+    const formatByRule = parsed.href.match(/(?:format=|\/format\/)(jpg|jpeg|png|webp|gif|svg|avif|bmp)(?:[&/?#]|$)/i);
+    if (formatByRule?.[1]) return formatByRule[1].toLowerCase();
+
+    const formatFromSuffix = parsed.pathname.match(/(?:^|[_!.-])(jpg|jpeg|png|webp|gif|svg|avif|bmp)(?:[_!.-]|$)/i);
+    if (formatFromSuffix?.[1]) return formatFromSuffix[1].toLowerCase();
+
+    if (/xhscdn\.com$/i.test(parsed.hostname) && (/webpic/i.test(parsed.hostname) || /notes_pre_post/i.test(parsed.pathname))) {
+      return "webp";
+    }
+  } catch {
+    // Ignore parse failures.
+  }
+  const match = url.split("?")[0].match(/\.([a-z0-9]+)$/i);
+  return match ? match[1].toLowerCase() : "unknown";
+};
+
+const resolveImageFormat = (image) => {
+  const raw = String(image?.format || "").toLowerCase();
+  if (raw && raw !== "unknown") return raw;
+  return formatFromUrl(image?.displaySrc || image?.hdSrc || image?.src || image?.originalSrc || "");
+};
+
+const fallbackImageError = (imgElement, fallbackUrl, image = null) => {
+  if (!fallbackUrl) return;
+  if (imgElement.dataset.fallbackApplied && imgElement.dataset.fallbackApplied !== "0") return;
+  imgElement.dataset.fallbackApplied = "1";
+  imgElement.src = fallbackUrl;
+  if (!image) return;
+  const candidate = String(fallbackUrl || "");
+  if (!/sinaimg\.cn/i.test(candidate)) return;
+  sendMessage(MSG.COPY_TO_CLIPBOARD, {
+    image,
+    preferredUrl: candidate,
+    preferHD: currentConfig.enableHD
+  }).then((response) => {
+    if (!response?.success || !response.dataUrl) return;
+    imgElement.dataset.fallbackApplied = "2";
+    imgElement.src = response.dataUrl;
+  }).catch(() => {});
+};
+
+const getViewSources = (image) => {
+  const hdCandidate = image?.hdSrc || "";
+  if (/twimg\.com/i.test(hdCandidate) && /name=orig/i.test(hdCandidate)) {
+    return {
+      previewSrc: hdCandidate.replace(/name=orig/i, "name=large"),
+      originalSrc: hdCandidate
+    };
+  }
+  const base = image?.src || image?.originalSrc || image?.displaySrc || hdCandidate || "";
+  if (!base) return { previewSrc: "", originalSrc: "" };
+  const originalSrc = image?.hdSrc && image.hdSrc !== base ? image.hdSrc : "";
+  return { previewSrc: base, originalSrc };
+};
+
+const getImageSourceUrl = (image) => {
+  const sourceUrl = String(image?.sourceUrl || "").trim();
+  if (!sourceUrl) return "";
+  try {
+    const parsed = new URL(sourceUrl);
+    if (!/^https?:$/i.test(parsed.protocol)) return "";
+    return parsed.toString();
+  } catch {
+    return "";
+  }
+};
+
+const syncLightboxMeta = (src) => {
+  const width = elements.lightboxImage.naturalWidth || 0;
+  const height = elements.lightboxImage.naturalHeight || 0;
+  elements.lightboxDimensions.textContent = `${width} × ${height}`;
+  const format = String(resolveImageFormat(lightboxImage) || formatFromUrl(src) || "unknown").toUpperCase();
+  elements.lightboxSize.textContent = `${formatAreaMp(width * height)}  ${format}`;
+  if (elements.lightboxSource) {
+    const hasSource = Boolean(lightboxSourceUrl);
+    elements.lightboxSource.disabled = !hasSource;
+    elements.lightboxSource.title = hasSource ? lightboxSourceUrl : "未记录图片来源";
+  }
+};
+
+const setActivePreset = (preset) => {
+  activePreset = preset;
+  elements.resolutionPresets.querySelectorAll(".preset-chip").forEach((chip) => {
+    chip.classList.toggle("active", Boolean(preset) && chip.dataset.preset === preset);
+  });
+};
+
+const formatMpLabel = (area) => `≥ ${(Math.max(0, Number(area) || 0) / 1000000).toFixed(2)} MP`;
+
+const clearDynamicMinMpOptions = () => {
+  elements.filterMinMp.querySelectorAll("option[data-dynamic='1']").forEach((option) => option.remove());
+};
+
+const ensureMinMpOption = (area) => {
+  const normalized = Math.max(0, Math.round(Number(area) || 0));
+  const value = String(normalized);
+  const existing = Array.from(elements.filterMinMp.options).find((option) => option.value === value);
+  if (existing) return existing;
+  const option = document.createElement("option");
+  option.value = value;
+  option.dataset.dynamic = "1";
+  option.textContent = formatMpLabel(normalized);
+  elements.filterMinMp.appendChild(option);
+  return option;
+};
+
+const setMinMpValue = (area, { allowDynamic = true } = {}) => {
+  const normalized = Math.max(0, Math.round(Number(area) || 0));
+  const value = String(normalized);
+  if (allowDynamic) {
+    clearDynamicMinMpOptions();
+  }
+  const existing = Array.from(elements.filterMinMp.options).find((option) => option.value === value);
+  if (!existing) ensureMinMpOption(normalized);
+  elements.filterMinMp.value = value;
+};
+
+const setMetricInputs = ({ minShort = 0, minLong = 0, minArea = 0 }) => {
+  elements.filterMinShort.value = String(minShort);
+  elements.filterMinLong.value = String(minLong);
+  clearDynamicMinMpOptions();
+  setMinMpValue(minArea, { allowDynamic: false });
+};
+
+const getCustomMetricFilters = () => ({
+  minShort: parseInt(elements.filterMinShort.value, 10) || 0,
+  minLong: parseInt(elements.filterMinLong.value, 10) || 0,
+  minArea: parseInt(elements.filterMinMp.value, 10) || 0
+});
+
+const detectPresetFromInputs = () => {
+  const current = getCustomMetricFilters();
+  for (const [key, preset] of Object.entries(RESOLUTION_PRESETS)) {
+    if (
+      current.minShort === preset.minShort &&
+      current.minLong === preset.minLong &&
+      current.minArea === preset.minArea
+    ) {
+      return key;
+    }
+  }
+  return null;
+};
+
+const applyResolutionPreset = (preset) => {
+  if (!RESOLUTION_PRESETS[preset]) return;
+  setMetricInputs(RESOLUTION_PRESETS[preset]);
+  setActivePreset(preset);
+};
+
+const syncMinMpFromSideFilters = () => {
+  const minShort = parseInt(elements.filterMinShort.value, 10) || 0;
+  const minLong = parseInt(elements.filterMinLong.value, 10) || 0;
+  const minArea = minShort > 0 && minLong > 0 ? minShort * minLong : 0;
+  setMinMpValue(minArea);
+};
+
+const getSelectedFormatFilters = () => {
+  const selectedValues = [];
+  elements.formatFilters.querySelectorAll("input[type=\"checkbox\"]:checked").forEach((input) => {
+    selectedValues.push(input.value.toLowerCase());
+  });
+
+  const formats = [];
+  for (const value of selectedValues) {
+    if (value === "other") {
+      formats.push("other");
+      continue;
+    }
+    const group = FORMAT_GROUPS.find((item) => item.value === value);
+    if (group) {
+      formats.push(...group.aliases);
+      continue;
+    }
+    formats.push(value);
+  }
+  return [...new Set(formats)];
+};
+
+const getFilters = () => ({
+  preset: activePreset || "custom",
+  ...getCustomMetricFilters(),
+  formats: getSelectedFormatFilters()
+});
+
+const normalizeFormatStats = (stats = {}) => {
+  const normalized = {};
+  for (const [formatKey, count] of Object.entries(stats)) {
+    const key = String(formatKey || "unknown").toLowerCase();
+    normalized[key] = (normalized[key] || 0) + (Number(count) || 0);
+  }
+  return normalized;
+};
+
+const buildFormatOptions = (stats = {}) => {
+  const normalized = normalizeFormatStats(stats);
+  const options = [];
+  let assigned = 0;
+  for (const group of FORMAT_GROUPS) {
+    const count = group.aliases.reduce((sum, alias) => sum + (normalized[alias] || 0), 0);
+    options.push({ value: group.value, label: group.label, count });
+    assigned += count;
+  }
+  const total = Object.values(normalized).reduce((sum, count) => sum + count, 0);
+  const otherCount = Math.max(0, total - assigned);
+  options.push({ value: "other", label: "其他", count: otherCount });
+  return options;
+};
+
+const renderFormatFilters = (stats = {}) => {
+  const selected = new Set(
+    Array.from(elements.formatFilters.querySelectorAll("input[type=\"checkbox\"]:checked")).map((input) => input.value)
+  );
+  const options = buildFormatOptions(stats);
+  elements.formatFilters.innerHTML = "";
+  const fragment = document.createDocumentFragment();
+  for (const option of options) {
+    const label = document.createElement("label");
+    label.innerHTML = `
+      <input type="checkbox" value="${option.value}" ${selected.has(option.value) ? "checked" : ""}>
+      <span>${option.label}</span>
+      <span class="format-count">${option.count}</span>
+    `;
+    fragment.appendChild(label);
+  }
+  elements.formatFilters.appendChild(fragment);
+};
+
+const getImageMetaForFilters = (image) => {
+  if (currentConfig.enableHD) {
+    const cached = cardDimensionCache.get(image.id);
+    if (cached) return cached;
+  }
+  const width = Number(image.width) || 0;
+  const height = Number(image.height) || 0;
+  return {
+    width,
+    height,
+    area: Math.max(Number(image.area) || 0, computeArea(width, height))
+  };
+};
+
+const passesMetricFilters = (image, filters) => {
+  const meta = getImageMetaForFilters(image);
+  const presetRule = RESOLUTION_PRESETS[filters.preset] || { type: "custom" };
+  const longSide = Math.max(meta.width, meta.height);
+  const shortSide = Math.min(meta.width, meta.height);
+
+  if (presetRule.type === "resolution") {
+    if (shortSide < presetRule.minShort || longSide < presetRule.minLong) return false;
+  }
+  if (presetRule.type === "custom") {
+    if (filters.minShort > 0 && shortSide < filters.minShort) return false;
+    if (filters.minLong > 0 && longSide < filters.minLong) return false;
+    if (filters.minArea > 0 && meta.area < filters.minArea) return false;
+  }
+  return true;
+};
+
+const passesOrientationFilter = (image) => {
+  if (!currentConfig.enablePortraitOnly) return true;
+  const meta = getImageMetaForFilters(image);
+  return meta.height > meta.width;
+};
+
+const passesFormatFilters = (image, selectedFormats = []) => {
+  if (!Array.isArray(selectedFormats) || selectedFormats.length === 0) return true;
+  const formatSet = new Set(selectedFormats.map((item) => String(item).toLowerCase()));
+  const format = resolveImageFormat(image) || "unknown";
+  if (formatSet.has(format)) return true;
+  if (formatSet.has("jpg") && format === "jpeg") return true;
+  if (formatSet.has("jpeg") && format === "jpg") return true;
+  if (formatSet.has("other") && !PRIMARY_FORMATS.has(format)) return true;
+  return false;
+};
+
+const computeFormatStatsFromImages = (images = []) => {
+  const stats = {};
+  for (const image of images) {
+    const key = resolveImageFormat(image) || "unknown";
+    stats[key] = (stats[key] || 0) + 1;
+  }
+  return stats;
+};
+
+const refreshSelectedState = async () => {
+  const response = await sendMessage(MSG.GET_SELECTED);
+  if (!response.success) return new Set();
+  return new Set(response.images.map((image) => image.id));
+};
+
+const updateStats = async ({ visibleImages = [], facetStats = {} } = {}) => {
+  const response = await sendMessage(MSG.GET_STATS);
+  if (!response.success) return;
+  const { total, selected } = response.stats;
+  elements.statTotal.textContent = String(total);
+  elements.statFiltered.textContent = String(visibleImages.length);
+  elements.statSelected.textContent = String(selected);
+  elements.btnDownloadSelected.disabled = selected === 0;
+  elements.btnCopySelected.disabled = selected === 0;
+  renderFormatFilters(facetStats);
+};
+
+const getVisibleSelectionInfo = () => {
+  const visibleIds = currentImages.map((image) => image.id);
+  const selectedVisibleCount = visibleIds.reduce(
+    (count, id) => count + (selectedIds.has(id) ? 1 : 0),
+    0
+  );
+  const allVisibleSelected = visibleIds.length > 0 && selectedVisibleCount === visibleIds.length;
+  return { visibleIds, allVisibleSelected };
+};
+
+const syncSelectAllButtonLabel = () => {
+  const { allVisibleSelected } = getVisibleSelectionInfo();
+  elements.btnSelectAll.textContent = allVisibleSelected ? UNSELECT_ALL_LABEL : SELECT_ALL_LABEL;
+};
+
+const syncScanButtonLabel = () => {
+  if (elements.btnScan.disabled) return;
+  elements.btnScan.textContent = hasScannedOnce ? "继续扫描" : "开始扫描";
+};
+
+const createCard = (image, index) => {
+  const displaySrc = image.displaySrc || image.src;
+  const format = String(resolveImageFormat(image) || formatFromUrl(displaySrc) || "unknown").toUpperCase();
+  const isSelected = selectedIds.has(image.id);
+  const meta = getCardMeta(image);
+  const card = document.createElement("div");
+  card.className = `image-card${isSelected ? " selected" : ""}`;
+  card.dataset.id = image.id;
+  card.innerHTML = `
+    <div class="image-wrapper">
+      <img src="${displaySrc}" alt="Image preview" loading="lazy">
+      ${isHdBadge(image) ? '<span class="hd-badge">HD</span>' : ""}
+      <span class="format-badge">${format}</span>
+      <button class="checkbox ${isSelected ? "checked" : ""}" type="button">${isSelected ? "✓" : ""}</button>
+    </div>
+    <div class="image-info">
+      <span>${meta.width} × ${meta.height}</span>
+      <span>${formatAreaMp(meta.area)}</span>
+    </div>
+  `;
+
+  const imageNode = card.querySelector("img");
+  imageNode.addEventListener("error", () => fallbackImageError(imageNode, image.src, image));
+  imageNode.addEventListener("click", () => openLightbox(image, index));
+
+  const checkbox = card.querySelector(".checkbox");
+  checkbox.addEventListener("click", async (event) => {
+    event.stopPropagation();
+    await toggleSelect(image.id);
+  });
+
+  resolveCardMaxDimensions(image).catch(() => {});
+  return card;
+};
+
+const renderImages = async () => {
+  const filters = getFilters();
+  const allResponse = await sendMessage(MSG.GET_IMAGES, { filtered: false });
+  if (!allResponse.success) {
+    setActionStatus(`加载失败: ${allResponse.error || "未知错误"}`, 3200);
+    return;
+  }
+  const allImages = allResponse.images || [];
+
+  const needsDimensionHydration =
+    currentConfig.enableHD &&
+    (
+      currentConfig.enableSizeSort ||
+      currentConfig.enablePortraitOnly ||
+      filters.preset !== "all" ||
+      filters.formats.length > 0 ||
+      filters.minShort > 0 ||
+      filters.minLong > 0 ||
+      filters.minArea > 0
+    );
+  if (needsDimensionHydration) {
+    await Promise.all(allImages.map((image) => resolveCardMaxDimensions(image)));
+  }
+
+  const metricAndOrientationFiltered = allImages
+    .filter((image) => passesMetricFilters(image, filters))
+    .filter((image) => passesOrientationFilter(image));
+  const facetStats = computeFormatStatsFromImages(metricAndOrientationFiltered);
+
+  currentImages = metricAndOrientationFiltered
+    .filter((image) => passesFormatFilters(image, filters.formats));
+
+  if (currentConfig.enableSizeSort) {
+    currentImages = currentImages.sort((a, b) => {
+      const aMeta = getImageMetaForFilters(a);
+      const bMeta = getImageMetaForFilters(b);
+      return bMeta.area - aMeta.area;
+    });
+  }
+
+  selectedIds = await refreshSelectedState();
+
+  if (elements.lightbox.classList.contains("active") && lightboxImage) {
+    const nextIndex = currentImages.findIndex((item) => item.id === lightboxImage.id);
+    if (nextIndex === -1) {
+      closeLightbox();
+    } else {
+      lightboxIndex = nextIndex;
+      updateLightboxNavigation();
+    }
+  }
+
+  elements.imageGrid.innerHTML = "";
+
+  if (currentImages.length === 0) {
+    elements.emptyState.style.display = "flex";
+    elements.imageGrid.appendChild(elements.emptyState);
+    elements.btnSelectAll.textContent = SELECT_ALL_LABEL;
+    await updateStats({ visibleImages: currentImages, facetStats });
+    hasScannedOnce = hasScannedOnce || allImages.length > 0;
+    syncScanButtonLabel();
+    return;
+  }
+
+  elements.emptyState.style.display = "none";
+  const fragment = document.createDocumentFragment();
+  for (const [index, image] of currentImages.entries()) {
+    fragment.appendChild(createCard(image, index));
+  }
+  elements.imageGrid.appendChild(fragment);
+  syncSelectAllButtonLabel();
+  await updateStats({ visibleImages: currentImages, facetStats });
+  hasScannedOnce = true;
+  syncScanButtonLabel();
+};
+
+const toggleSelect = async (imageId) => {
+  const response = await sendMessage(MSG.TOGGLE_SELECT, { imageId });
+  if (!response.success) return;
+  selectedIds = new Set(response.selectedIds || []);
+  await renderImages();
+};
+
+const toggleSelectAll = async () => {
+  const { visibleIds, allVisibleSelected } = getVisibleSelectionInfo();
+  if (visibleIds.length === 0) return;
+  const response = await sendMessage(MSG.SET_SELECTION, {
+    imageIds: visibleIds,
+    selected: !allVisibleSelected
+  });
+  if (!response.success) {
+    setActionStatus(`操作失败: ${response.error || "未知错误"}`, 3200);
+    return;
+  }
+  await renderImages();
+};
+
+const updateLightboxNavigation = () => {
+  const enabled = currentImages.length > 1;
+  if (elements.lightboxPrev) elements.lightboxPrev.disabled = !enabled;
+  if (elements.lightboxNext) elements.lightboxNext.disabled = !enabled;
+};
+
+const openLightbox = (image, index = -1) => {
+  lightboxImage = image;
+  if (index >= 0) {
+    lightboxIndex = index;
+  } else {
+    lightboxIndex = currentImages.findIndex((item) => item.id === image?.id);
+  }
+  const { previewSrc } = getViewSources(image);
+  const displaySrc = currentConfig.enableHD
+    ? (previewSrc || image.src || image.originalSrc || image.displaySrc || image.hdSrc)
+    : (image.src || image.originalSrc || image.displaySrc || image.hdSrc || previewSrc);
+  lightboxCurrentSrc = displaySrc;
+  lightboxSourceUrl = getImageSourceUrl(image);
+  elements.lightboxImage.dataset.fallbackApplied = "0";
+  elements.lightboxImage.src = displaySrc;
+  elements.lightboxImage.onerror = () => fallbackImageError(elements.lightboxImage, image.src, image);
+  elements.lightboxImage.onload = () => syncLightboxMeta(displaySrc);
+  syncLightboxMeta(displaySrc);
+  preloadClipboardPayload(image, displaySrc, false).catch(() => {});
+  updateLightboxNavigation();
+  elements.lightbox.classList.add("active");
+};
+
+const navigateLightbox = (step) => {
+  if (!elements.lightbox.classList.contains("active")) return;
+  if (!lightboxImage || currentImages.length <= 1) return;
+  const current = lightboxIndex >= 0
+    ? lightboxIndex
+    : currentImages.findIndex((item) => item.id === lightboxImage.id);
+  const nextIndex = (current + step + currentImages.length) % currentImages.length;
+  const target = currentImages[nextIndex];
+  if (!target) return;
+  openLightbox(target, nextIndex);
+};
+
+const closeLightbox = () => {
+  elements.lightbox.classList.remove("active");
+  lightboxImage = null;
+  lightboxCurrentSrc = "";
+  lightboxSourceUrl = "";
+  lightboxIndex = -1;
+};
+
+const copyImageOrUrl = async (image, options = {}) => {
+  const canWriteImage = canWriteClipboardImage();
+  const preferredUrl = options.preferredUrl || "";
+
+  if (canWriteImage && preferredUrl) {
+    const cached = getClipboardCache(preferredUrl);
+    if (cached?.success && cached.dataUrl) {
+      try {
+        await writeClipboardImage(cached);
+        return { success: true, mode: "image" };
+      } catch {
+        // Continue fallback attempts.
+      }
+    }
+  }
+
+  const backgroundResponse = await sendMessage(MSG.COPY_TO_CLIPBOARD, {
+    image,
+    preferredUrl,
+    preferHD: options.preferHD === true
+  });
+  if (preferredUrl) setClipboardCache(preferredUrl, backgroundResponse);
+
+  if (canWriteImage && backgroundResponse?.success && backgroundResponse.dataUrl) {
+    try {
+      await writeClipboardImage(backgroundResponse);
+      return { success: true, mode: "image" };
+    } catch {
+      // Continue fallback.
+    }
+  }
+
+  const candidates = [
+    preferredUrl,
+    backgroundResponse?.url,
+    image.displaySrc,
+    image.hdSrc,
+    image.src,
+    image.originalSrc
+  ].filter(Boolean);
+
+  if (!canWriteImage) {
+    const fallback = candidates[0];
+    if (fallback) {
+      await navigator.clipboard.writeText(fallback);
+      return { success: true, mode: "url" };
+    }
+    return { success: false };
+  }
+
+  const fallback = candidates[0];
+  if (fallback) {
+    await navigator.clipboard.writeText(fallback);
+    return { success: true, mode: "url" };
+  }
+  return { success: false };
+};
+
+const scanImages = async ({ syncAutoScanAfterScan = true } = {}) => {
+  manualScanInProgress = true;
+  elements.btnScan.disabled = true;
+  elements.btnScan.textContent = "采集中...";
+  setActionStatus("采集中...", -1);
+  try {
+    const response = await sendMessage(MSG.SCAN);
+    if (!response.success) {
+      setActionStatus(`扫描失败: ${response.error || "未知错误"}`, 3200);
+      return false;
+    }
+    hasScannedOnce = true;
+    await renderImages();
+    if (currentConfig.enableAutoScan && syncAutoScanAfterScan) {
+      const synced = await syncAutoScanRuntime(true);
+      if (!synced) {
+        setActionStatus("采集完成，但自动采集启动失败", 3200);
+        return false;
+      }
+    }
+    setActionStatus("采集完成", 1400);
+    return true;
+  } finally {
+    manualScanInProgress = false;
+    elements.btnScan.disabled = false;
+    syncScanButtonLabel();
+  }
+};
+
+const clearImages = async () => {
+  if (manualScanInProgress) return;
+  const response = await sendMessage(MSG.CLEAR_IMAGES);
+  if (!response?.success) {
+    setActionStatus(`清理失败: ${response?.error || "未知错误"}`, 3200);
+    return;
+  }
+
+  closeLightbox();
+  currentImages = [];
+  selectedIds = new Set();
+  hasScannedOnce = false;
+  await renderImages();
+  setActionStatus("已清理采集结果", 1400);
+};
+
+const downloadSelected = async () => {
+  if (batchDownloadInProgress) return;
+  batchDownloadInProgress = true;
+  elements.btnDownloadSelected.disabled = true;
+  const enableBatchZipDownload = elements.toggleBatchZipDownload?.checked === true;
+  const enableConvertToJpg = elements.toggleWebP?.checked === true;
+  try {
+    if (enableBatchZipDownload) {
+      setActionStatus("正在打包 ZIP，请稍候…");
+    }
+    const response = await sendMessage(MSG.DOWNLOAD_BATCH, {
+      enableBatchZipDownload,
+      enableBatchZip: enableBatchZipDownload,
+      zip: enableBatchZipDownload,
+      mode: enableBatchZipDownload ? "zip" : "direct",
+      downloadMode: enableBatchZipDownload ? "zip" : "direct",
+      enableConvertToJpg
+    });
+    if (!response.success) {
+      if (response?.zipped && Number(response?.zipPartCount) > 1) {
+        const done = Number(response?.downloadedPartCount) || 0;
+        const total = Number(response?.zipPartCount) || 0;
+        setActionStatus(`分卷ZIP下载中断：已完成 ${done}/${total} 卷，${response.error || "未知错误"}`, 4200);
+        return;
+      }
+      setActionStatus(`下载失败: ${response.error || "未知错误"}`, 3200);
+      return;
+    }
+    const ok = response.results.filter((item) => item.success).length;
+    if (response.zipped) {
+      const partCount = Number(response.zipPartCount) || 1;
+      if (partCount > 1) {
+        setActionStatus(`ZIP已分卷下载：共 ${partCount} 卷（${ok} 张）`, 3600);
+        return;
+      }
+      const zipName = response.zipFileName || "images.zip";
+      setActionStatus(`ZIP已加入下载队列：${zipName}（${ok} 张）`, 3000);
+      return;
+    }
+    setActionStatus(`已加入下载队列: ${ok} 张`);
+  } finally {
+    batchDownloadInProgress = false;
+    elements.btnDownloadSelected.disabled = false;
+    renderImages();
+  }
+};
+
+const copySelected = async () => {
+  const response = await sendMessage(MSG.GET_SELECTED);
+  if (!response.success || response.images.length === 0) return;
+  const useOriginal = currentConfig.enableHD;
+  const urls = response.images
+    .map((item) => {
+      if (useOriginal) return item.hdSrc || item.src || item.originalSrc;
+      return item.src || item.originalSrc || item.hdSrc;
+    })
+    .filter(Boolean)
+    .join("\n");
+  await navigator.clipboard.writeText(urls);
+  setActionStatus(`已复制 ${response.images.length} 条链接`);
+};
+
+const openWorkspace = async () => {
+  if (!sourceTabId) sourceTabId = await getCurrentTabId();
+  const workspaceUrl = chrome.runtime.getURL(`workspace/workspace.html?tabId=${sourceTabId}`);
+  await chrome.tabs.create({ url: workspaceUrl });
+};
+
+const bindEvents = () => {
+  elements.btnScan.addEventListener("click", scanImages);
+  elements.btnClear.addEventListener("click", clearImages);
+  elements.btnWorkspace.addEventListener("click", openWorkspace);
+  elements.btnSelectAll.addEventListener("click", toggleSelectAll);
+  elements.btnDownloadSelected.addEventListener("click", downloadSelected);
+  elements.btnCopySelected.addEventListener("click", copySelected);
+  elements.btnOpenDownloadDir.addEventListener("click", openDownloadDirectory);
+
+  elements.resolutionPresets.addEventListener("click", (event) => {
+    const target = event.target;
+    if (!(target instanceof HTMLButtonElement)) return;
+    const preset = target.dataset.preset;
+    if (!preset) return;
+    applyResolutionPreset(preset);
+    renderImages();
+  });
+
+  const refreshFromSideInputs = () => {
+    syncMinMpFromSideFilters();
+    const matchedPreset = detectPresetFromInputs();
+    setActivePreset(matchedPreset || "custom");
+    renderImages();
+  };
+  for (const input of [elements.filterMinShort, elements.filterMinLong]) {
+    input.addEventListener("change", refreshFromSideInputs);
+    input.addEventListener("input", refreshFromSideInputs);
+  }
+  elements.filterMinMp.addEventListener("change", () => {
+    const minArea = parseInt(elements.filterMinMp.value, 10) || 0;
+    clearDynamicMinMpOptions();
+    if (minArea > 0) {
+      elements.filterMinShort.value = "0";
+      elements.filterMinLong.value = "0";
+    }
+    setMinMpValue(minArea, { allowDynamic: false });
+    const matchedPreset = detectPresetFromInputs();
+    setActivePreset(matchedPreset || "custom");
+    renderImages();
+  });
+
+  elements.formatFilters.addEventListener("change", (event) => {
+    if (event.target instanceof HTMLInputElement && event.target.type === "checkbox") {
+      renderImages();
+    }
+  });
+
+  elements.toggleHd.addEventListener("change", async (event) => {
+    const response = await sendMessage(MSG.SET_CONFIG, { enableHD: event.target.checked });
+    if (!response.success) {
+      setActionStatus(`设置失败: ${response.error || "未知错误"}`, 3200);
+      return;
+    }
+    currentConfig.enableHD = event.target.checked;
+    if (elements.lightbox.classList.contains("active") && lightboxImage) {
+      openLightbox(lightboxImage, lightboxIndex);
+    }
+    await renderImages();
+  });
+
+  elements.toggleAutoScan.addEventListener("change", async (event) => {
+    const checked = event.target.checked;
+    const response = await sendMessage(MSG.SET_CONFIG, { enableAutoScan: checked });
+    if (!response.success) {
+      setActionStatus(`设置失败: ${response.error || "未知错误"}`, 3200);
+      event.target.checked = !checked;
+      return;
+    }
+
+    currentConfig.enableAutoScan = checked;
+    if (checked) {
+      if (!hasScannedOnce && currentImages.length === 0) {
+        const scanned = await scanImages({ syncAutoScanAfterScan: false });
+        if (!scanned) return;
+      }
+      setActionStatus("已开启自动采集");
+    } else {
+      setActionStatus("已关闭自动采集");
+    }
+  });
+
+  elements.toggleSortSize.addEventListener("change", async (event) => {
+    const checked = event.target.checked;
+    const response = await sendMessage(MSG.SET_CONFIG, { enableSizeSort: checked });
+    if (!response.success) {
+      setActionStatus(`设置失败: ${response.error || "未知错误"}`, 3200);
+      event.target.checked = !checked;
+      return;
+    }
+    currentConfig.enableSizeSort = checked;
+    await renderImages();
+  });
+
+  elements.togglePortraitOnly.addEventListener("change", async (event) => {
+    const checked = event.target.checked;
+    const response = await sendMessage(MSG.SET_CONFIG, { enablePortraitOnly: checked });
+    if (!response.success) {
+      setActionStatus(`设置失败: ${response.error || "未知错误"}`, 3200);
+      event.target.checked = !checked;
+      return;
+    }
+    currentConfig.enablePortraitOnly = checked;
+    await renderImages();
+  });
+
+  elements.toggleWebP.addEventListener("change", async (event) => {
+    const checked = event.target.checked;
+    const response = await sendMessage(MSG.SET_CONFIG, { enableWebPConvert: checked });
+    if (!response.success) {
+      setActionStatus(`设置失败: ${response.error || "未知错误"}`, 3200);
+      event.target.checked = !checked;
+      return;
+    }
+    currentConfig.enableWebPConvert = checked;
+  });
+
+  elements.toggleBatchZipDownload.addEventListener("change", async (event) => {
+    const checked = event.target.checked;
+    currentConfig.enableBatchZipDownload = checked;
+    setActionStatus(checked ? "已开启批量ZIP下载" : "已关闭批量ZIP下载", 1800);
+  });
+
+  elements.toggleRightClick.addEventListener("change", async (event) => {
+    const checked = event.target.checked;
+    const response = await sendMessage(MSG.SET_CONFIG, { enableRightClick: checked });
+    if (!response.success) {
+      setActionStatus(`解锁右键失败: ${response.error || "未知错误"}`, 3200);
+      event.target.checked = !checked;
+      return;
+    }
+    currentConfig.enableRightClick = checked;
+    setActionStatus(checked ? "已启用解锁右键" : "已关闭解锁右键");
+  });
+
+  elements.lightbox.querySelector(".lightbox-backdrop").addEventListener("click", closeLightbox);
+  elements.lightboxClose.addEventListener("click", closeLightbox);
+  elements.lightboxPrev.addEventListener("click", () => navigateLightbox(-1));
+  elements.lightboxNext.addEventListener("click", () => navigateLightbox(1));
+  elements.lightboxDownload.addEventListener("click", async () => {
+    if (!lightboxImage) return;
+    const result = await sendMessage(MSG.DOWNLOAD, { image: lightboxImage });
+    if (!result.success) {
+      setActionStatus(`下载失败: ${result.error || "未知错误"}`, 3200);
+      return;
+    }
+    setActionStatus("已加入下载队列");
+  });
+  elements.lightboxCopy.addEventListener("click", async () => {
+    if (!lightboxImage) return;
+    try {
+      const result = await copyImageOrUrl(lightboxImage, {
+        preferredUrl: lightboxCurrentSrc,
+        preferHD: false
+      });
+      if (!result.success) {
+        setActionStatus("复制失败", 3200);
+        return;
+      }
+      setActionStatus(result.mode === "image" ? "已复制图片" : "已复制链接");
+    } catch (error) {
+      setActionStatus(`复制失败: ${error?.message || "未知错误"}`, 3200);
+    }
+  });
+  if (elements.lightboxSource) {
+    elements.lightboxSource.addEventListener("click", async () => {
+      if (!lightboxImage) return;
+      const sourceUrl = lightboxSourceUrl || getImageSourceUrl(lightboxImage);
+      const response = await sendMessage(MSG.OPEN_SOURCE_URL, { url: sourceUrl });
+      if (!response?.success) {
+        setActionStatus(`打开来源失败: ${response?.error || "未记录来源"}`, 3200);
+        return;
+      }
+      setActionStatus("已打开图片来源", 1200);
+    });
+  }
+
+  document.addEventListener("keydown", (event) => {
+    if (!elements.lightbox.classList.contains("active")) return;
+    if (event.key === "Escape") {
+      event.preventDefault();
+      closeLightbox();
+      return;
+    }
+    if (event.key === "ArrowLeft") {
+      event.preventDefault();
+      navigateLightbox(-1);
+      return;
+    }
+    if (event.key === "ArrowRight") {
+      event.preventDefault();
+      navigateLightbox(1);
+    }
+  });
+
+};
+
+const init = async () => {
+  sourceTabId = await getCurrentTabId();
+  bindEvents();
+
+  const configResponse = await sendMessage(MSG.GET_CONFIG);
+  if (configResponse.success) {
+    elements.toggleHd.checked = configResponse.config.enableHD !== false;
+    elements.toggleAutoScan.checked = configResponse.config.enableAutoScan === true;
+    elements.toggleSortSize.checked = configResponse.config.enableSizeSort !== false;
+    elements.togglePortraitOnly.checked = configResponse.config.enablePortraitOnly === true;
+    elements.toggleWebP.checked = configResponse.config.enableWebPConvert === true;
+    elements.toggleBatchZipDownload.checked = false;
+    elements.toggleRightClick.checked = configResponse.config.enableRightClick === true;
+    currentConfig.enableHD = elements.toggleHd.checked;
+    currentConfig.enableAutoScan = elements.toggleAutoScan.checked;
+    currentConfig.enableSizeSort = elements.toggleSortSize.checked;
+    currentConfig.enablePortraitOnly = elements.togglePortraitOnly.checked;
+    currentConfig.enableWebPConvert = elements.toggleWebP.checked;
+    currentConfig.enableBatchZipDownload = false;
+    currentConfig.enableRightClick = elements.toggleRightClick.checked;
+    if (currentConfig.enableRightClick) {
+      const ensureRightClick = await sendMessage(MSG.SET_CONFIG, { enableRightClick: true });
+      if (!ensureRightClick.success) {
+        setActionStatus(`解锁右键失败: ${ensureRightClick.error || "未知错误"}`, 3200);
+      }
+    }
+  }
+
+  setMetricInputs(RESOLUTION_PRESETS.all);
+  setActivePreset("all");
+  await renderImages();
+  if (currentConfig.enableAutoScan) {
+    if (currentImages.length > 0) {
+      await syncAutoScanRuntime(true);
+    } else {
+      await scanImages();
+    }
+  }
+};
+
+chrome.runtime.onMessage.addListener((message) => {
+  if (message?.type === MSG.DOWNLOAD_PROGRESS) {
+    const { current, total, phase, partCount, packed } = message.payload || {};
+    if (phase === "zip_split_notice") {
+      setActionStatus(`检测到大批量下载，已切换分卷打包（${partCount || 0} 卷，约 ${packed || 0} 张）`, 3200);
+      return;
+    }
+    if (!Number.isInteger(current) || !Number.isInteger(total)) return;
+    const prefix = phase === "zip" ? "打包中" : "下载中";
+    setActionStatus(`${prefix} ${current}/${total}`, 1200);
+    return;
+  }
+
+  if (message?.type === MSG.IMAGES_UPDATED) {
+    const updatedTabId = Number(message?.payload?.tabId);
+    if (!Number.isInteger(updatedTabId) || updatedTabId !== sourceTabId) return;
+    if (manualScanInProgress) return;
+    scheduleRenderRefresh();
+  }
+});
+
+document.addEventListener("DOMContentLoaded", init);

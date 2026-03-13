@@ -1,0 +1,169 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>图片采集查看器 - WORKSPACE</title>
+  <link rel="stylesheet" href="../styles/workspace.css">
+</head>
+<body>
+  <div class="workspace">
+    <!-- 顶部全局控制台 -->
+    <header class="console">
+      <div class="console-row row-top">
+        <div class="top-left">
+          <div class="logo">
+            <span class="logo-text">图片采集查看器 · WORKSPACE</span>
+            <a class="author-signature" href="https://blog.liu-qi.cn/" target="_blank" rel="noopener noreferrer">Created by @liuqi</a>
+          </div>
+          <label class="switch-toggle switch-accent compact">
+            <input type="checkbox" id="toggle-auto-scan">
+            <span class="switch-slider" aria-hidden="true"></span>
+            <span class="switch-text">自动采集</span>
+          </label>
+          <div class="stats">
+            <span class="stat"><strong id="stat-total">0</strong> 总图片</span>
+            <span class="stat"><strong id="stat-filtered">0</strong> 已筛选</span>
+            <span class="stat"><strong id="stat-selected">0</strong> 已选中</span>
+          </div>
+        </div>
+      </div>
+
+      <div class="console-row row-config">
+          <label class="switch-toggle">
+            <input type="checkbox" id="toggle-hd" checked>
+            <span class="switch-slider" aria-hidden="true"></span>
+            <span class="switch-text">采集原图</span>
+          </label>
+          <label class="switch-toggle">
+            <input type="checkbox" id="toggle-sort-size" checked>
+            <span class="switch-slider" aria-hidden="true"></span>
+            <span class="switch-text">大到小排序</span>
+          </label>
+          <label class="switch-toggle">
+            <input type="checkbox" id="toggle-portrait-only">
+            <span class="switch-slider" aria-hidden="true"></span>
+            <span class="switch-text">仅显示竖图</span>
+          </label>
+          <label class="switch-toggle">
+            <input type="checkbox" id="toggle-webp">
+            <span class="switch-slider" aria-hidden="true"></span>
+            <span class="switch-text">下载转JPG</span>
+          </label>
+          <label class="switch-toggle">
+            <input type="checkbox" id="toggle-batch-zip-download">
+            <span class="switch-slider" aria-hidden="true"></span>
+            <span class="switch-text">批量下载ZIP</span>
+          </label>
+      </div>
+
+      <div class="console-row row-formats">
+        <div class="filter-formats compact" id="format-filters">
+          <span class="format-loading">格式统计中...</span>
+        </div>
+      </div>
+
+      <div class="console-row row-resolution">
+        <div class="resolution-presets" id="resolution-presets">
+          <button type="button" class="preset-chip active" data-preset="all">全部</button>
+          <button type="button" class="preset-chip" data-preset="720p">≥ 720P</button>
+          <button type="button" class="preset-chip" data-preset="1080p">≥ 1080P</button>
+          <button type="button" class="preset-chip" data-preset="2k">≥ 2K</button>
+          <button type="button" class="preset-chip" data-preset="4k">≥ 4K</button>
+        </div>
+        <div class="filter-group">
+          <label class="metric-filter">
+            <span>最小短边</span>
+            <input type="number" id="filter-min-short" min="0" value="0">
+          </label>
+          <label class="metric-filter">
+            <span>最小长边</span>
+            <input type="number" id="filter-min-long" min="0" value="0">
+          </label>
+          <label class="metric-filter">
+            <span>最小像素</span>
+            <select id="filter-min-mp">
+              <option value="0">不限</option>
+              <option value="500000">≥ 0.50 MP</option>
+              <option value="921600">≥ 0.92 MP</option>
+              <option value="1000000">≥ 1.00 MP</option>
+              <option value="2073600">≥ 2.07 MP</option>
+              <option value="3686400">≥ 3.69 MP</option>
+              <option value="8294400">≥ 8.29 MP</option>
+              <option value="12000000">≥ 12.00 MP</option>
+              <option value="24000000">≥ 24.00 MP</option>
+            </select>
+          </label>
+        </div>
+      </div>
+
+      <div class="console-row row-actions">
+        <button id="btn-scan" class="btn btn-primary">开始扫描</button>
+        <button id="btn-clear" class="btn btn-secondary btn-icon-square" type="button" aria-label="清理当前采集结果" title="清理当前采集结果">
+          <svg class="btn-icon-svg" viewBox="0 0 24 24" fill="none" aria-hidden="true">
+            <path d="M12 3.5v8.5" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/>
+            <path d="M10 12h4" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/>
+            <path d="M7.5 12.2h9v7.3h-9z" stroke="currentColor" stroke-width="1.8" stroke-linejoin="round"/>
+            <path d="M9.8 14.5v3.8M12 14.5v3.8M14.2 14.5v3.8" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/>
+          </svg>
+        </button>
+        <button id="btn-select-all" class="btn btn-neutral">全选</button>
+        <button id="btn-copy-batch" class="btn btn-info">批量复制链接</button>
+        <button id="btn-download-batch" class="btn btn-success">批量下载</button>
+        <button id="btn-open-download-dir" class="btn btn-secondary">打开下载目录</button>
+        <span class="action-status" id="action-status"></span>
+      </div>
+    </header>
+
+    <!-- 图片画廊 -->
+    <main class="gallery" id="gallery">
+      <div class="empty-state" id="empty-state">
+        <div class="empty-icon">PIC</div>
+        <h3>暂无图片</h3>
+        <p>点击「扫描」按钮获取本页图片</p>
+      </div>
+    </main>
+  </div>
+
+  <!-- Lightbox -->
+  <div class="lightbox" id="lightbox">
+    <div class="lightbox-backdrop"></div>
+    <div class="lightbox-content">
+      <button id="lightbox-prev" class="lightbox-nav lightbox-nav-prev" type="button" aria-label="上一张">‹</button>
+      <div class="lightbox-image-stage" id="lightbox-image-stage">
+        <img id="lightbox-image" src="" alt="Preview">
+      </div>
+      <button id="lightbox-next" class="lightbox-nav lightbox-nav-next" type="button" aria-label="下一张">›</button>
+      <div class="lightbox-info">
+        <div class="lightbox-details">
+          <span id="lightbox-dimensions"></span>
+          <span id="lightbox-area"></span>
+          <span id="lightbox-format"></span>
+          <span id="lightbox-mode">预览图</span>
+        </div>
+        <div class="lightbox-url" id="lightbox-url"></div>
+      </div>
+      <div class="lightbox-actions">
+        <button id="lightbox-download" class="btn btn-success">下载</button>
+        <button id="lightbox-copy" class="btn btn-info">复制</button>
+        <button id="lightbox-source" class="btn btn-secondary">图片来源</button>
+        <button id="lightbox-original" class="btn btn-secondary">查看大图</button>
+        <button id="lightbox-fullscreen" class="btn btn-secondary">全屏看图</button>
+        <button id="lightbox-close" class="btn btn-secondary">关闭</button>
+      </div>
+    </div>
+  </div>
+
+  <div class="fullscreen-viewer" id="fullscreen-viewer">
+    <button id="fullscreen-prev" class="lightbox-nav lightbox-nav-prev" type="button" aria-label="上一张">‹</button>
+    <div class="fullscreen-stage" id="fullscreen-stage">
+      <img id="fullscreen-image" src="" alt="Fullscreen preview">
+      <div class="fullscreen-loading" id="fullscreen-loading">加载中...</div>
+    </div>
+    <button id="fullscreen-next" class="lightbox-nav lightbox-nav-next" type="button" aria-label="下一张">›</button>
+    <button id="fullscreen-close" class="fullscreen-close" type="button" aria-label="关闭全屏">×</button>
+  </div>
+
+  <script src="workspace.js"></script>
+</body>
+</html>
