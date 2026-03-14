@@ -34,16 +34,26 @@
           <span class="stat"><strong id="stat-filtered">0</strong> 已筛选</span>
           <span class="stat"><strong id="stat-selected">0</strong> 已选中</span>
         </div>
-        <label class="switch-toggle switch-accent compact">
-          <input type="checkbox" id="toggle-auto-scan">
-          <span class="switch-slider" aria-hidden="true"></span>
-          <span class="switch-text">自动采集</span>
-        </label>
-        <label class="switch-toggle switch-accent compact">
-          <input type="checkbox" id="toggle-right-click">
-          <span class="switch-slider" aria-hidden="true"></span>
-          <span class="switch-text">解锁右键</span>
-        </label>
+        <div class="stat-controls">
+          <button id="btn-auto-scroll" class="btn stat-icon-btn" type="button" aria-label="开启自动滚动" aria-pressed="false" title="开启自动滚动">
+            <svg class="btn-icon-svg" viewBox="0 0 24 24" fill="none" aria-hidden="true">
+              <path d="M12 4v7.5" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/>
+              <path d="M8.5 10.5L12 14l3.5-3.5" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/>
+              <path d="M8.5 15L12 18.5l3.5-3.5" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/>
+              <path d="M6.5 3.5h11" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" opacity="0.68"/>
+            </svg>
+          </button>
+          <label class="switch-toggle switch-accent compact">
+            <input type="checkbox" id="toggle-auto-scan">
+            <span class="switch-slider" aria-hidden="true"></span>
+            <span class="switch-text">自动采集</span>
+          </label>
+          <label class="switch-toggle switch-accent compact">
+            <input type="checkbox" id="toggle-right-click">
+            <span class="switch-slider" aria-hidden="true"></span>
+            <span class="switch-text">解锁右键</span>
+          </label>
+        </div>
       </div>
 
       <div class="console-row row-config">

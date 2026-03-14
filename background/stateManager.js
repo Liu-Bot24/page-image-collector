@@ -21,6 +21,7 @@ const DEFAULT_CONFIG = Object.freeze({
   enableSizeSort: true,
   enablePortraitOnly: false,
   enableAutoScan: false,
+  enableAutoScroll: false,
   enableWebPConvert: false,
   enableRightClick: false
 });
@@ -369,6 +370,9 @@ const normalizeConfig = (config = {}, partial = false) => {
   }
   if (!partial || Object.prototype.hasOwnProperty.call(config, "enableAutoScan")) {
     next.enableAutoScan = config.enableAutoScan === true;
+  }
+  if (!partial || Object.prototype.hasOwnProperty.call(config, "enableAutoScroll")) {
+    next.enableAutoScroll = config.enableAutoScroll === true;
   }
   if (!partial || Object.prototype.hasOwnProperty.call(config, "enableWebPConvert")) {
     next.enableWebPConvert = config.enableWebPConvert === true;

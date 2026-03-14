@@ -7,6 +7,7 @@ const MSG = {
   GET_STATS: "GET_STATS",
   DOWNLOAD: "DOWNLOAD",
   DOWNLOAD_BATCH: "DOWNLOAD_BATCH",
+  GET_DOWNLOAD_STATUS: "GET_DOWNLOAD_STATUS",
   COPY_TO_CLIPBOARD: "COPY_TO_CLIPBOARD",
   SET_CONFIG: "SET_CONFIG",
   GET_CONFIG: "GET_CONFIG",
@@ -112,13 +113,20 @@ const cardDimensionTasks = new Map();
 const fullscreenCache = new Map();
 const fullscreenPendingTasks = new Map();
 let actionStatusTimer = null;
+let pinnedActionStatusTimer = null;
 let autoRefreshTimer = null;
 let manualScanInProgress = false;
 let batchDownloadInProgress = false;
+let activeDownloadStatus = null;
+let downloadStatusPollTimer = null;
 let suppressLightboxClickUntil = 0;
 let dragSelectState = null;
 let dragSelectionBox = null;
 let dragPreviewIds = new Set();
+let transientActionStatus = "";
+let transientActionStatusTitle = "";
+let pinnedActionStatus = "";
+let pinnedActionStatusTitle = "";
 const FULLSCREEN_PRELOAD_RADIUS = 4;
 const DRAG_SELECT_MOVE_THRESHOLD = 6;
 const DRAG_CLICK_SUPPRESS_MS = 260;
@@ -548,34 +556,165 @@ const renderFormatFilters = (stats = {}) => {
   elements.formatFilters.appendChild(fragment);
 };
 
-const setActionStatus = (text = "", timeoutMs = 2400) => {
-  const rawText = String(text || "");
-  const displayText = rawText.length > 72 ? `${rawText.slice(0, 72)}…` : rawText;
+const ACTION_STATUS_MAX_LENGTH = 72;
+
+const renderActionStatus = () => {
+  const rawText = pinnedActionStatus || transientActionStatus;
+  const title = pinnedActionStatus ? pinnedActionStatusTitle : transientActionStatusTitle;
+  const displayText =
+    rawText.length > ACTION_STATUS_MAX_LENGTH
+      ? `${rawText.slice(0, ACTION_STATUS_MAX_LENGTH)}…`
+      : rawText;
   elements.actionStatus.textContent = displayText;
-  elements.actionStatus.title = rawText;
+  elements.actionStatus.title = title;
+};
+
+const clearTransientActionStatus = () => {
   if (actionStatusTimer) {
     clearTimeout(actionStatusTimer);
     actionStatusTimer = null;
   }
-  if (!rawText || timeoutMs <= 0) return;
-  actionStatusTimer = setTimeout(() => {
-    elements.actionStatus.textContent = "";
-    elements.actionStatus.title = "";
-    actionStatusTimer = null;
+  transientActionStatus = "";
+  transientActionStatusTitle = "";
+};
+
+const setPinnedActionStatus = (text = "", timeoutMs = -1) => {
+  pinnedActionStatus = String(text || "");
+  pinnedActionStatusTitle = pinnedActionStatus;
+  if (pinnedActionStatusTimer) {
+    clearTimeout(pinnedActionStatusTimer);
+    pinnedActionStatusTimer = null;
+  }
+  renderActionStatus();
+  if (!pinnedActionStatus || timeoutMs <= 0) return;
+  pinnedActionStatusTimer = setTimeout(() => {
+    pinnedActionStatus = "";
+    pinnedActionStatusTitle = "";
+    pinnedActionStatusTimer = null;
+    renderActionStatus();
   }, timeoutMs);
+};
+
+const setActionStatus = (text = "", timeoutMs = 2400) => {
+  transientActionStatus = String(text || "");
+  transientActionStatusTitle = transientActionStatus;
+  if (actionStatusTimer) {
+    clearTimeout(actionStatusTimer);
+    actionStatusTimer = null;
+  }
+  renderActionStatus();
+  if (!transientActionStatus || timeoutMs <= 0) return;
+  actionStatusTimer = setTimeout(() => {
+    transientActionStatus = "";
+    transientActionStatusTitle = "";
+    actionStatusTimer = null;
+    renderActionStatus();
+  }, timeoutMs);
+};
+
+const hasActiveDownloadTask = () => activeDownloadStatus?.active === true;
+
+const stopDownloadStatusPolling = () => {
+  if (!downloadStatusPollTimer) return;
+  clearTimeout(downloadStatusPollTimer);
+  downloadStatusPollTimer = null;
+};
+
+const ensureDownloadStatusPolling = () => {
+  if (downloadStatusPollTimer || !hasActiveDownloadTask()) return;
+  downloadStatusPollTimer = setTimeout(async () => {
+    downloadStatusPollTimer = null;
+    if (!hasActiveDownloadTask()) return;
+    await restoreDownloadStatus();
+    ensureDownloadStatusPolling();
+  }, 1200);
+};
+
+const formatDownloadStatusText = (status) => {
+  if (!status) return "";
+  const phase = String(status.phase || "");
+  const mode = String(status.mode || "");
+  const current = Number(status.current);
+  const total = Number(status.total);
+  const partIndex = Math.max(1, Number(status.partIndex) || 1);
+
+  if (phase === "zip_prepare") return "正在打包 ZIP，请稍候…";
+  if (phase === "zip") return Number.isInteger(current) && Number.isInteger(total) ? `打包中 ${current}/${total}` : "正在打包 ZIP，请稍候…";
+  if (phase === "zip_part_build") return `正在生成ZIP第 ${partIndex} 卷`;
+  if (phase === "zip_part_download") return `正在下载ZIP第 ${partIndex} 卷`;
+  if (phase === "direct_prepare") return "正在准备批量下载…";
+  if (phase === "direct") return Number.isInteger(current) && Number.isInteger(total) ? `下载中 ${current}/${total}` : "下载中…";
+  if (phase === "completed") return mode === "zip" ? "打包下载完毕" : "批量下载完毕";
+  if (phase === "failed") return `下载失败: ${status.error || "未知错误"}`;
+  return "";
+};
+
+const formatDownloadButtonText = (status) => {
+  if (!status || status.active !== true) return "批量下载";
+  const phase = String(status.phase || "");
+  const current = Number(status.current);
+  const total = Number(status.total);
+  const partIndex = Math.max(1, Number(status.partIndex) || 1);
+
+  if (phase === "zip_prepare") return "准备打包";
+  if (phase === "zip") return Number.isInteger(current) && Number.isInteger(total) ? `打包中 ${current}/${total}` : "打包中";
+  if (phase === "zip_part_build") return `生成ZIP ${partIndex}`;
+  if (phase === "zip_part_download") return `下载ZIP ${partIndex}`;
+  if (phase === "direct_prepare") return "准备下载";
+  if (phase === "direct") return Number.isInteger(current) && Number.isInteger(total) ? `下载中 ${current}/${total}` : "下载中";
+  return "批量下载";
+};
+
+const syncBatchDownloadUiState = () => {
+  const selected = selectedIds.size;
+  elements.btnDownloadBatch.disabled = batchDownloadInProgress || selected === 0;
+  elements.btnDownloadBatch.textContent = formatDownloadButtonText(activeDownloadStatus);
+};
+
+const applyDownloadStatus = (status) => {
+  activeDownloadStatus = status || null;
+  batchDownloadInProgress = activeDownloadStatus?.active === true;
+  syncBatchDownloadUiState();
+  const text = formatDownloadStatusText(activeDownloadStatus);
+  if (activeDownloadStatus?.active === true) {
+    ensureDownloadStatusPolling();
+  } else {
+    stopDownloadStatusPolling();
+  }
+  clearTransientActionStatus();
+  if (!text) {
+    setPinnedActionStatus("");
+    return;
+  }
+  const timeoutMs = activeDownloadStatus?.active === true ? -1 : activeDownloadStatus?.phase === "failed" ? 4200 : 2600;
+  setPinnedActionStatus(text, timeoutMs);
+};
+
+const restoreDownloadStatus = async () => {
+  const response = await sendMessage(MSG.GET_DOWNLOAD_STATUS);
+  if (!response?.success) return;
+  if (!response.status && hasActiveDownloadTask()) return;
+  applyDownloadStatus(response.status || null);
 };
 
 const scheduleRenderRefresh = () => {
   if (autoRefreshTimer) return;
-  setActionStatus("采集中...", -1);
+  const preserveDownloadStatus = hasActiveDownloadTask();
+  if (!preserveDownloadStatus) {
+    setActionStatus("采集中...", -1);
+  }
   autoRefreshTimer = setTimeout(() => {
     autoRefreshTimer = null;
     renderGallery()
       .then(() => {
-        setActionStatus("采集完成", 1200);
+        if (!preserveDownloadStatus) {
+          setActionStatus("采集完成", 1200);
+        }
       })
       .catch(() => {
-        setActionStatus("刷新失败，请重试", 2400);
+        if (!preserveDownloadStatus) {
+          setActionStatus("刷新失败，请重试", 2400);
+        }
       });
   }, 120);
 };
@@ -1162,8 +1301,9 @@ const updateStats = async ({ visibleImages = [], facetStats = {} } = {}) => {
   elements.statTotal.textContent = String(total);
   elements.statFiltered.textContent = String(visibleImages.length);
   elements.statSelected.textContent = String(selected);
-  elements.btnDownloadBatch.disabled = selected === 0;
+  elements.btnDownloadBatch.disabled = batchDownloadInProgress || selected === 0;
   elements.btnCopyBatch.disabled = selected === 0;
+  elements.btnDownloadBatch.textContent = formatDownloadButtonText(activeDownloadStatus);
   renderFormatFilters(facetStats);
 };
 
@@ -1725,13 +1865,16 @@ const toggleSelectAll = async () => {
 const downloadBatch = async () => {
   if (batchDownloadInProgress) return;
   batchDownloadInProgress = true;
-  elements.btnDownloadBatch.disabled = true;
   const enableBatchZipDownload = elements.toggleBatchZipDownload?.checked === true;
   const enableConvertToJpg = elements.toggleWebP?.checked === true;
+  applyDownloadStatus({
+    active: true,
+    mode: enableBatchZipDownload ? "zip" : "direct",
+    phase: enableBatchZipDownload ? "zip_prepare" : "direct_prepare",
+    current: 0,
+    total: selectedIds.size
+  });
   try {
-    if (enableBatchZipDownload) {
-      setActionStatus("正在打包 ZIP，请稍候…");
-    }
     const response = await sendMessage(MSG.DOWNLOAD_BATCH, {
       enableBatchZipDownload,
       enableBatchZip: enableBatchZipDownload,
@@ -1744,27 +1887,47 @@ const downloadBatch = async () => {
       if (response?.zipped && Number(response?.zipPartCount) > 1) {
         const done = Number(response?.downloadedPartCount) || 0;
         const total = Number(response?.zipPartCount) || 0;
-        setActionStatus(`分卷ZIP下载中断：已完成 ${done}/${total} 卷，${response.error || "未知错误"}`, 4200);
+        applyDownloadStatus({
+          active: false,
+          mode: "zip",
+          phase: "failed",
+          current: done,
+          total,
+          partIndex: done,
+          partCount: total,
+          error: response.error || "未知错误"
+        });
         return;
       }
-      setActionStatus(`下载失败: ${response.error || "未知错误"}`, 3200);
+      applyDownloadStatus({
+        active: false,
+        mode: enableBatchZipDownload ? "zip" : "direct",
+        phase: "failed",
+        error: response.error || "未知错误"
+      });
       return;
     }
-    const ok = response.results.filter((item) => item.success).length;
     if (response.zipped) {
-      const partCount = Number(response.zipPartCount) || 1;
-      if (partCount > 1) {
-        setActionStatus(`ZIP已分卷下载：共 ${partCount} 卷（${ok} 张）`, 3600);
-        return;
-      }
-      const zipName = response.zipFileName || "images.zip";
-      setActionStatus(`ZIP已加入下载队列：${zipName}（${ok} 张）`, 3000);
+      applyDownloadStatus({
+        active: false,
+        mode: "zip",
+        phase: "completed",
+        current: Number(response.packed) || Number(response.results?.length) || 0,
+        total: Number(response.packed) || Number(response.results?.length) || 0,
+        partIndex: Number(response.zipPartCount) || 1,
+        partCount: Number(response.zipPartCount) || 1
+      });
       return;
     }
-    setActionStatus(`已加入下载队列: ${ok} 张`);
+    applyDownloadStatus({
+      active: false,
+      mode: "direct",
+      phase: "completed",
+      current: response.results.filter((item) => item.success).length,
+      total: response.results.length
+    });
   } finally {
-    batchDownloadInProgress = false;
-    elements.btnDownloadBatch.disabled = false;
+    batchDownloadInProgress = activeDownloadStatus?.active === true;
     renderGallery();
   }
 };
@@ -2087,23 +2250,14 @@ const init = async () => {
       await scanImages();
     }
   }
+  await restoreDownloadStatus();
 };
 
 chrome.runtime.onMessage.addListener((message) => {
   if (message?.type === MSG.DOWNLOAD_PROGRESS) {
-    const { current, total, phase, partCount, packed } = message.payload || {};
-    if (phase === "zip_split_notice") {
-      setActionStatus(`检测到大批量下载，已切换分卷打包（${partCount || 0} 卷，约 ${packed || 0} 张）`, 3200);
-      return;
-    }
-    if (!Number.isInteger(current) || !Number.isInteger(total)) return;
-    const prefix = phase === "zip" ? "打包中" : "下载中";
-    elements.btnDownloadBatch.textContent = `${prefix} ${current}/${total}`;
-    if (current >= total) {
-      setTimeout(() => {
-        elements.btnDownloadBatch.textContent = "批量下载";
-      }, 1200);
-    }
+    const downloadTabId = Number(message?.payload?.tabId);
+    if (!Number.isInteger(downloadTabId) || downloadTabId !== sourceTabId) return;
+    applyDownloadStatus(message.payload || null);
     return;
   }
 

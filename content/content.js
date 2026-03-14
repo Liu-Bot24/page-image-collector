@@ -10,6 +10,8 @@ const MSG = {
   TOGGLE_RIGHT_CLICK: "TOGGLE_RIGHT_CLICK",
   START_AUTO_SCAN: "START_AUTO_SCAN",
   STOP_AUTO_SCAN: "STOP_AUTO_SCAN",
+  START_AUTO_SCROLL: "START_AUTO_SCROLL",
+  STOP_AUTO_SCROLL: "STOP_AUTO_SCROLL",
   COPY_IMAGE_DATA_URL: "COPY_IMAGE_DATA_URL",
   CLEAR_RUNTIME_CACHE: "CLEAR_RUNTIME_CACHE"
 };
@@ -1723,6 +1725,18 @@ let autoScanTimer = null;
 let autoScanDirty = false;
 const knownNormalizedUrls = new Set();
 const autoScanMutationRoots = new Set();
+let autoScrollEnabled = false;
+let autoScrollTimer = null;
+let autoScrollStallCount = 0;
+let autoScrollLastHeight = 0;
+const AUTO_SCROLL_INTERVAL_MS = 680;
+const AUTO_SCROLL_SETTLE_INTERVAL_MS = 980;
+const AUTO_SCROLL_STEP_MIN = 280;
+const AUTO_SCROLL_STEP_MAX = 620;
+const AUTO_SCROLL_STEP_RATIO = 0.72;
+const AUTO_SCROLL_STALL_RETRY_EVERY = 5;
+const AUTO_SCROLL_NUDGE_BACK_MAX = 220;
+const AUTO_SCROLL_HEIGHT_GROWTH_THRESHOLD = 24;
 
 const recordKnownImages = (images) => {
   for (const image of images) {
@@ -1884,6 +1898,116 @@ const stopAutoScan = () => {
   autoScanMutationRoots.clear();
 };
 
+const getScrollMetrics = () => {
+  const root = document.scrollingElement || document.documentElement || document.body;
+  const viewportHeight = Math.max(
+    Number(window.innerHeight) || 0,
+    Number(root?.clientHeight) || 0,
+    Number(document.documentElement?.clientHeight) || 0,
+    420
+  );
+  const scrollHeight = Math.max(
+    Number(root?.scrollHeight) || 0,
+    Number(document.documentElement?.scrollHeight) || 0,
+    Number(document.body?.scrollHeight) || 0,
+    viewportHeight
+  );
+  const scrollTop = Math.max(
+    Number(root?.scrollTop) || 0,
+    Number(window.scrollY) || 0,
+    Number(document.documentElement?.scrollTop) || 0,
+    0
+  );
+
+  return {
+    root,
+    viewportHeight,
+    scrollHeight,
+    scrollTop,
+    maxTop: Math.max(0, scrollHeight - viewportHeight)
+  };
+};
+
+const scheduleAutoScrollTick = (delayMs = AUTO_SCROLL_INTERVAL_MS) => {
+  if (!autoScrollEnabled || autoScrollTimer) return;
+  autoScrollTimer = setTimeout(() => {
+    autoScrollTimer = null;
+    if (!autoScrollEnabled) return;
+
+    const metrics = getScrollMetrics();
+    if (metrics.maxTop <= 0) {
+      autoScrollLastHeight = metrics.scrollHeight;
+      scheduleAutoScrollTick(AUTO_SCROLL_SETTLE_INTERVAL_MS);
+      return;
+    }
+
+    const heightGrewSinceLastTick =
+      metrics.scrollHeight > autoScrollLastHeight + AUTO_SCROLL_HEIGHT_GROWTH_THRESHOLD;
+    const stepRatio = heightGrewSinceLastTick ? 0.62 : AUTO_SCROLL_STEP_RATIO;
+    const step = Math.min(
+      AUTO_SCROLL_STEP_MAX,
+      Math.max(AUTO_SCROLL_STEP_MIN, Math.round(metrics.viewportHeight * stepRatio))
+    );
+    const nearBottom = metrics.scrollTop >= metrics.maxTop - 4;
+    let targetTop = Math.min(metrics.maxTop, metrics.scrollTop + step);
+
+    if (nearBottom && autoScrollStallCount > 0 && autoScrollStallCount % AUTO_SCROLL_STALL_RETRY_EVERY === 0) {
+      targetTop = Math.max(0, metrics.scrollTop - Math.min(
+        AUTO_SCROLL_NUDGE_BACK_MAX,
+        Math.round(metrics.viewportHeight * 0.24)
+      ));
+    } else if (targetTop <= metrics.scrollTop + 2) {
+      targetTop = metrics.maxTop;
+    }
+
+    window.scrollTo({
+      top: targetTop,
+      behavior: "auto"
+    });
+
+    requestAnimationFrame(() => {
+      if (!autoScrollEnabled) return;
+      const nextMetrics = getScrollMetrics();
+      const heightGrewAfterScroll =
+        nextMetrics.scrollHeight >
+        Math.max(autoScrollLastHeight, metrics.scrollHeight) + AUTO_SCROLL_HEIGHT_GROWTH_THRESHOLD;
+      const moved = Math.abs(nextMetrics.scrollTop - metrics.scrollTop) > 4;
+      const stillNearBottom = nextMetrics.scrollTop >= nextMetrics.maxTop - 4;
+
+      if (heightGrewAfterScroll || moved || !stillNearBottom) {
+        autoScrollStallCount = 0;
+      } else {
+        autoScrollStallCount += 1;
+      }
+
+      autoScrollLastHeight = nextMetrics.scrollHeight;
+      const nextDelay =
+        heightGrewSinceLastTick || heightGrewAfterScroll
+          ? AUTO_SCROLL_SETTLE_INTERVAL_MS
+          : AUTO_SCROLL_INTERVAL_MS;
+      scheduleAutoScrollTick(nextDelay);
+    });
+  }, Math.max(80, Number(delayMs) || AUTO_SCROLL_INTERVAL_MS));
+};
+
+const startAutoScroll = () => {
+  if (autoScrollEnabled) return;
+  autoScrollEnabled = true;
+  autoScrollStallCount = 0;
+  autoScrollLastHeight = getScrollMetrics().scrollHeight;
+  scheduleAutoScrollTick(180);
+};
+
+const stopAutoScroll = () => {
+  autoScrollEnabled = false;
+  autoScrollStallCount = 0;
+  autoScrollLastHeight = 0;
+  if (autoScrollTimer) {
+    clearTimeout(autoScrollTimer);
+    autoScrollTimer = null;
+  }
+};
+
 chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
   switch (message?.type) {
     case MSG.SCAN_IMAGES: {
@@ -1907,6 +2031,18 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
 
     case MSG.STOP_AUTO_SCAN: {
       stopAutoScan();
+      sendResponse({ success: true });
+      break;
+    }
+
+    case MSG.START_AUTO_SCROLL: {
+      startAutoScroll();
+      sendResponse({ success: true });
+      break;
+    }
+
+    case MSG.STOP_AUTO_SCROLL: {
+      stopAutoScroll();
       sendResponse({ success: true });
       break;
     }

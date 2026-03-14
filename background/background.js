@@ -12,12 +12,15 @@ const MSG = {
   GET_STATS: "GET_STATS",
   DOWNLOAD: "DOWNLOAD",
   DOWNLOAD_BATCH: "DOWNLOAD_BATCH",
+  GET_DOWNLOAD_STATUS: "GET_DOWNLOAD_STATUS",
   COPY_TO_CLIPBOARD: "COPY_TO_CLIPBOARD",
   SET_CONFIG: "SET_CONFIG",
   GET_CONFIG: "GET_CONFIG",
   TOGGLE_RIGHT_CLICK: "TOGGLE_RIGHT_CLICK",
   START_AUTO_SCAN: "START_AUTO_SCAN",
   STOP_AUTO_SCAN: "STOP_AUTO_SCAN",
+  START_AUTO_SCROLL: "START_AUTO_SCROLL",
+  STOP_AUTO_SCROLL: "STOP_AUTO_SCROLL",
   DOWNLOAD_PROGRESS: "DOWNLOAD_PROGRESS",
   COPY_IMAGE_DATA_URL: "COPY_IMAGE_DATA_URL",
   PROBE_IMAGE_DIMENSIONS: "PROBE_IMAGE_DIMENSIONS",
@@ -44,6 +47,8 @@ const stateManager = createTabStateManager();
 const TEXT_ENCODER = new TextEncoder();
 const pendingFilenameHints = new Map();
 const activeBatchDownloads = new Set();
+const batchDownloadStatusByTab = new Map();
+const DOWNLOAD_STATUS_TTL_MS = 15 * 1000;
 const CRC32_TABLE = (() => {
   const table = new Uint32Array(256);
   for (let i = 0; i < 256; i += 1) {
@@ -55,6 +60,63 @@ const CRC32_TABLE = (() => {
   }
   return table;
 })();
+
+const cloneDownloadStatus = (status) => (status ? { ...status } : null);
+
+const cleanupExpiredDownloadStatuses = (tabId = null) => {
+  const now = Date.now();
+  if (Number.isInteger(tabId)) {
+    const status = batchDownloadStatusByTab.get(tabId);
+    if (status && status.active !== true && Number(status.expiresAt) > 0 && Number(status.expiresAt) <= now) {
+      batchDownloadStatusByTab.delete(tabId);
+    }
+    return;
+  }
+
+  for (const [key, status] of batchDownloadStatusByTab.entries()) {
+    if (status?.active === true) continue;
+    if (Number(status?.expiresAt) > 0 && Number(status.expiresAt) <= now) {
+      batchDownloadStatusByTab.delete(key);
+    }
+  }
+};
+
+const updateDownloadStatus = (tabId, patch = {}) => {
+  if (!Number.isInteger(tabId)) return null;
+  cleanupExpiredDownloadStatuses(tabId);
+  const previous = batchDownloadStatusByTab.get(tabId) || {};
+  const next = {
+    ...previous,
+    ...patch,
+    tabId,
+    updatedAt: Date.now()
+  };
+
+  if (next.active === false) {
+    next.expiresAt = Date.now() + DOWNLOAD_STATUS_TTL_MS;
+  } else {
+    delete next.expiresAt;
+  }
+
+  batchDownloadStatusByTab.set(tabId, next);
+  return cloneDownloadStatus(next);
+};
+
+const emitDownloadStatus = (tabId, patch = {}) => {
+  const status = updateDownloadStatus(tabId, patch);
+  if (!status) return null;
+  chrome.runtime.sendMessage({
+    type: MSG.DOWNLOAD_PROGRESS,
+    payload: status
+  }).catch(() => {});
+  return status;
+};
+
+const getDownloadStatus = (tabId) => {
+  if (!Number.isInteger(tabId)) return null;
+  cleanupExpiredDownloadStatuses(tabId);
+  return cloneDownloadStatus(batchDownloadStatusByTab.get(tabId) || null);
+};
 
 if (chrome.downloads?.onDeterminingFilename) {
   chrome.downloads.onDeterminingFilename.addListener((downloadItem, suggest) => {
@@ -527,37 +589,8 @@ const buildBatchZipPartFilename = (baseZipFilename, partIndex, totalParts) => {
   if (!Number.isInteger(totalParts) || totalParts <= 1) return baseZipFilename;
   const base = String(baseZipFilename || "images.zip");
   const withoutExt = base.replace(/\.zip$/i, "");
-  const width = String(totalParts).length;
-  const current = String(partIndex + 1).padStart(width, "0");
-  const total = String(totalParts).padStart(width, "0");
-  return `${withoutExt}.part${current}-of-${total}.zip`;
-};
-
-const splitZipEntriesIntoParts = (entries, options = {}) => {
-  const maxBytes = Number(options.maxBytes) > 0 ? Number(options.maxBytes) : ZIP_PART_MAX_BYTES;
-  const maxFiles = Number(options.maxFiles) > 0 ? Number(options.maxFiles) : ZIP_PART_MAX_FILES;
-
-  const parts = [];
-  let currentPart = [];
-  let currentBytes = 0;
-
-  for (const entry of entries) {
-    const entryBytes = Number(entry?.bytes?.length) || 0;
-    const reachFileLimit = currentPart.length >= maxFiles;
-    const reachByteLimit = currentPart.length > 0 && currentBytes + entryBytes > maxBytes;
-    if (reachFileLimit || reachByteLimit) {
-      parts.push(currentPart);
-      currentPart = [];
-      currentBytes = 0;
-    }
-    currentPart.push(entry);
-    currentBytes += entryBytes;
-  }
-
-  if (currentPart.length > 0) {
-    parts.push(currentPart);
-  }
-  return parts;
+  const current = String(partIndex + 1).padStart(3, "0");
+  return `${withoutExt}.part${current}.zip`;
 };
 
 const mimeToExtension = (mimeType, fallback = "jpg") => {
@@ -976,7 +1009,7 @@ const downloadBlobAsFile = async (
           // Ignore revoke errors.
         }
       };
-      setTimeout(revoke, awaitCompletion ? Math.max(revokeDelayMs, 2 * 60 * 1000) : revokeDelayMs);
+      setTimeout(revoke, awaitCompletion ? 30 * 1000 : revokeDelayMs);
     }
   }
 
@@ -1063,33 +1096,109 @@ const buildZipEntryFromImage = async (image, options = {}) => {
   };
 };
 
+const finalizeZipPartDownload = async (tabId, entries, options = {}) => {
+  if (!Array.isArray(entries) || entries.length === 0) {
+    return { success: true, partFilename: "" };
+  }
+
+  const partIndex = Number.isInteger(options.partIndex) ? options.partIndex : 0;
+  const baseZipFilename = String(options.baseZipFilename || "images.zip");
+  const partLabel = `${partIndex + 1}`;
+
+  emitDownloadStatus(tabId, {
+    active: true,
+    mode: "zip",
+    phase: "zip_part_build",
+    partIndex: partIndex + 1
+  });
+
+  const partFilename = buildBatchZipPartFilename(baseZipFilename, partIndex, Number(options.partCount) || 1);
+  const zipBlob = buildZipBlob(entries);
+  if (!zipBlob || Number(zipBlob.size) <= 0) {
+    return {
+      success: false,
+      error: `ZIP第 ${partLabel} 卷构建失败: Empty zip blob`,
+      partFilename
+    };
+  }
+
+  emitDownloadStatus(tabId, {
+    active: true,
+    mode: "zip",
+    phase: "zip_part_download",
+    partIndex: partIndex + 1
+  });
+
+  try {
+    await downloadBlobAsFile(zipBlob, partFilename, "application/zip", {
+      overrideFilenameByUrl: true,
+      awaitCompletion: true,
+      downloadTimeoutMs: 30 * 60 * 1000,
+      requireNonZeroSize: true
+    });
+    return { success: true, partFilename };
+  } catch (error) {
+    return {
+      success: false,
+      error: `ZIP第 ${partLabel} 卷下载失败: ${error?.message || "未知错误"}`,
+      partFilename
+    };
+  }
+};
+
 const downloadBatchAsZip = async (tabId, selectedImages, options = {}) => {
   const { convertToJpg = false, preferHD = true } = options;
   const results = [];
-  const zipEntries = [];
   const usedNames = new Set();
-  let estimatedPartCount = 1;
-  let estimatedCurrentPartBytes = 0;
-  let estimatedCurrentPartFiles = 0;
-  let splitNoticeSentEarly = false;
-
   const totalSelected = Number(selectedImages.length) || 0;
-  const forcedPartCountByFiles =
-    totalSelected > ZIP_PART_MAX_FILES
-      ? Math.ceil(totalSelected / ZIP_PART_MAX_FILES)
-      : 1;
-  if (forcedPartCountByFiles > 1) {
-    splitNoticeSentEarly = true;
-    chrome.runtime.sendMessage({
-      type: MSG.DOWNLOAD_PROGRESS,
-      payload: {
-        tabId,
-        phase: "zip_split_notice",
-        partCount: forcedPartCountByFiles,
-        packed: totalSelected
-      }
-    }).catch(() => {});
-  }
+  const baseZipFilename = await buildBatchZipFilename(tabId);
+  const zipFileNames = [];
+  const currentPartEntries = [];
+  let currentPartBytes = 0;
+  let downloadedParts = 0;
+  let packedCount = 0;
+
+  const flushCurrentPart = async (expectMoreParts = false) => {
+    if (currentPartEntries.length === 0) {
+      return { success: true };
+    }
+
+    const entriesToFlush = currentPartEntries.splice(0, currentPartEntries.length);
+    currentPartBytes = 0;
+    const result = await finalizeZipPartDownload(tabId, entriesToFlush, {
+      baseZipFilename,
+      partIndex: downloadedParts,
+      partCount: expectMoreParts ? downloadedParts + 2 : downloadedParts + 1
+    });
+    if (!result.success) {
+      emitDownloadStatus(tabId, {
+        active: false,
+        mode: "zip",
+        phase: "failed",
+        current: packedCount,
+        total: selectedImages.length,
+        partIndex: downloadedParts + 1,
+        partCount: zipFileNames.length + 1,
+        error: result.error
+      });
+      return {
+        success: false,
+        error: result.error,
+        zipped: true,
+        zipPartCount: zipFileNames.length + 1,
+        downloadedPartCount: downloadedParts,
+        zipFileNames,
+        packed: packedCount,
+        failed: selectedImages.length - packedCount,
+        results
+      };
+    }
+
+    zipFileNames.push(result.partFilename);
+    downloadedParts += 1;
+    await timeout(0);
+    return { success: true };
+  };
 
   for (let i = 0; i < selectedImages.length; i += 1) {
     const image = selectedImages[i];
@@ -1106,36 +1215,25 @@ const downloadBatchAsZip = async (tabId, selectedImages, options = {}) => {
     if (entryResult.success) {
       const uniqueName = ensureUniqueArchiveFilename(entryResult.filename, usedNames);
       const entryBytes = Number(entryResult.bytes?.length) || 0;
-      const willOverflowByFiles = estimatedCurrentPartFiles >= ZIP_PART_MAX_FILES;
+      const willOverflowByFiles = currentPartEntries.length >= ZIP_PART_MAX_FILES;
       const willOverflowByBytes =
-        estimatedCurrentPartFiles > 0 &&
-        estimatedCurrentPartBytes + entryBytes > ZIP_PART_MAX_BYTES;
+        currentPartEntries.length > 0 &&
+        currentPartBytes + entryBytes > ZIP_PART_MAX_BYTES;
+
       if (willOverflowByFiles || willOverflowByBytes) {
-        estimatedPartCount += 1;
-        estimatedCurrentPartBytes = 0;
-        estimatedCurrentPartFiles = 0;
-      }
-      estimatedCurrentPartFiles += 1;
-      estimatedCurrentPartBytes += entryBytes;
-
-      if (!splitNoticeSentEarly && estimatedPartCount > 1) {
-        splitNoticeSentEarly = true;
-        chrome.runtime.sendMessage({
-          type: MSG.DOWNLOAD_PROGRESS,
-          payload: {
-            tabId,
-            phase: "zip_split_notice",
-            partCount: estimatedPartCount,
-            packed: i + 1
-          }
-        }).catch(() => {});
+        const flushResult = await flushCurrentPart(true);
+        if (!flushResult.success) {
+          return flushResult;
+        }
       }
 
-      zipEntries.push({
+      currentPartEntries.push({
         filename: uniqueName,
         bytes: entryResult.bytes,
         date: new Date()
       });
+      currentPartBytes += entryBytes;
+      packedCount += 1;
       results.push({
         imageId: image.id,
         success: true,
@@ -1151,94 +1249,60 @@ const downloadBatchAsZip = async (tabId, selectedImages, options = {}) => {
       });
     }
 
-    chrome.runtime.sendMessage({
-      type: MSG.DOWNLOAD_PROGRESS,
-      payload: {
-        tabId,
-        current: i + 1,
-        total: selectedImages.length,
-        phase: "zip",
-        result: {
-          success: entryResult.success === true,
-          converted: entryResult.converted === true,
-          fallbackUsed: entryResult.fallbackUsed === true,
-          filename: entryResult.filename || "",
-          error: entryResult.error ? String(entryResult.error).slice(0, 200) : ""
-        }
+    emitDownloadStatus(tabId, {
+      active: true,
+      mode: "zip",
+      current: i + 1,
+      total: selectedImages.length,
+      phase: "zip",
+      partIndex: downloadedParts + 1,
+      result: {
+        success: entryResult.success === true,
+        converted: entryResult.converted === true,
+        fallbackUsed: entryResult.fallbackUsed === true,
+        filename: entryResult.filename || "",
+        error: entryResult.error ? String(entryResult.error).slice(0, 200) : ""
       }
-    }).catch(() => {});
+    });
   }
 
-  if (zipEntries.length === 0) {
+  if (packedCount === 0) {
+    emitDownloadStatus(tabId, {
+      active: false,
+      mode: "zip",
+      phase: "failed",
+      current: 0,
+      total: selectedImages.length,
+      error: "未能获取可打包的图片"
+    });
     return { success: false, error: "未能获取可打包的图片", results, zipped: true };
   }
 
-  const baseZipFilename = await buildBatchZipFilename(tabId);
-  const zipParts = splitZipEntriesIntoParts(zipEntries);
-  if (zipParts.length > 1 && !splitNoticeSentEarly) {
-    chrome.runtime.sendMessage({
-      type: MSG.DOWNLOAD_PROGRESS,
-      payload: {
-        tabId,
-        phase: "zip_split_notice",
-        partCount: zipParts.length,
-        packed: zipEntries.length
-      }
-    }).catch(() => {});
+  const finalFlushResult = await flushCurrentPart(false);
+  if (!finalFlushResult.success) {
+    return finalFlushResult;
   }
-  const zipFileNames = [];
-  let downloadedParts = 0;
 
-  for (let i = 0; i < zipParts.length; i += 1) {
-    const partEntries = zipParts[i];
-    const partFilename = buildBatchZipPartFilename(baseZipFilename, i, zipParts.length);
-    const zipBlob = buildZipBlob(partEntries);
-    if (!zipBlob || Number(zipBlob.size) <= 0) {
-      return {
-        success: false,
-        error: `ZIP第 ${i + 1} 卷构建失败: Empty zip blob`,
-        zipped: true,
-        zipPartCount: zipParts.length,
-        downloadedPartCount: downloadedParts,
-        zipFileNames,
-        packed: zipEntries.length,
-        failed: selectedImages.length - zipEntries.length,
-        results
-      };
-    }
-    try {
-      await downloadBlobAsFile(zipBlob, partFilename, "application/zip", {
-        overrideFilenameByUrl: true,
-        awaitCompletion: true,
-        downloadTimeoutMs: 30 * 60 * 1000,
-        requireNonZeroSize: true
-      });
-      zipFileNames.push(partFilename);
-      downloadedParts += 1;
-    } catch (error) {
-      return {
-        success: false,
-        error: `ZIP第 ${i + 1} 卷下载失败: ${error?.message || "未知错误"}`,
-        zipped: true,
-        zipPartCount: zipParts.length,
-        downloadedPartCount: downloadedParts,
-        zipFileNames,
-        packed: zipEntries.length,
-        failed: selectedImages.length - zipEntries.length,
-        results
-      };
-    }
-  }
+  emitDownloadStatus(tabId, {
+    active: false,
+    mode: "zip",
+    phase: "completed",
+    current: selectedImages.length,
+    total: selectedImages.length,
+    partIndex: zipFileNames.length,
+    partCount: zipFileNames.length,
+    error: ""
+  });
 
   return {
     success: true,
     zipped: true,
     zipFileName: zipFileNames[0] || baseZipFilename,
     zipFileNames,
-    zipPartCount: zipParts.length,
-    splitZip: zipParts.length > 1,
-    packed: zipEntries.length,
-    failed: selectedImages.length - zipEntries.length,
+    zipPartCount: zipFileNames.length,
+    splitZip: zipFileNames.length > 1,
+    packed: packedCount,
+    failed: selectedImages.length - packedCount,
     results
   };
 };
@@ -1389,6 +1453,16 @@ const syncRightClickForTab = async (tabId, enabled, options = {}) => {
   };
 };
 
+const syncAutoScrollForTab = async (tabId, enabled, options = {}) => {
+  const result = await sendMessageToTab(tabId, {
+    type: enabled === true ? MSG.START_AUTO_SCROLL : MSG.STOP_AUTO_SCROLL
+  }, options);
+  return {
+    success: result?.success === true,
+    error: result?.error || "同步自动滚动状态失败"
+  };
+};
+
 const handleMessage = async (message, sender) => {
   await stateManager.ensureReady();
   const tabId = getTabIdFromMessage(message, sender);
@@ -1520,11 +1594,30 @@ const handleMessage = async (message, sender) => {
       activeBatchDownloads.add(tabId);
       try {
         if (useZip) {
+          emitDownloadStatus(tabId, {
+            active: true,
+            mode: "zip",
+            phase: "zip_prepare",
+            current: 0,
+            total: selected.length,
+            partIndex: 0,
+            partCount: 0,
+            error: ""
+          });
           return await downloadBatchAsZip(tabId, selected, {
             convertToJpg,
             preferHD: config.enableHD
           });
         }
+
+        emitDownloadStatus(tabId, {
+          active: true,
+          mode: "direct",
+          phase: "direct_prepare",
+          current: 0,
+          total: selected.length,
+          error: ""
+        });
 
         const results = [];
         for (let i = 0; i < selected.length; i += 1) {
@@ -1539,21 +1632,42 @@ const handleMessage = async (message, sender) => {
           }
           results.push({ imageId: image.id, ...result });
 
-          chrome.runtime.sendMessage({
-            type: MSG.DOWNLOAD_PROGRESS,
-            payload: { tabId, current: i + 1, total: selected.length, result }
-          }).catch(() => {});
+          emitDownloadStatus(tabId, {
+            active: true,
+            mode: "direct",
+            phase: "direct",
+            current: i + 1,
+            total: selected.length,
+            result
+          });
 
           if (i < selected.length - 1) {
             await timeout(120);
           }
         }
 
+        emitDownloadStatus(tabId, {
+          active: false,
+          mode: "direct",
+          phase: "completed",
+          current: selected.length,
+          total: selected.length,
+          error: ""
+        });
+
         return {
           success: true,
           results,
           zipped: false
         };
+      } catch (error) {
+        emitDownloadStatus(tabId, {
+          active: false,
+          mode: useZip ? "zip" : "direct",
+          phase: "failed",
+          error: error?.message || "批量下载失败"
+        });
+        throw error;
       } finally {
         activeBatchDownloads.delete(tabId);
       }
@@ -1608,12 +1722,31 @@ const handleMessage = async (message, sender) => {
         }
       }
 
+      if (Object.prototype.hasOwnProperty.call(payload, "enableAutoScroll")) {
+        const autoScrollResult = await syncAutoScrollForTab(tabId, config.enableAutoScroll);
+        if (!autoScrollResult.success) {
+          const restoredConfig = stateManager.setConfig(tabId, {
+            enableAutoScroll: previousConfig.enableAutoScroll === true
+          });
+          return {
+            success: false,
+            error: autoScrollResult.error,
+            config: restoredConfig
+          };
+        }
+      }
+
       return { success: true, config };
     }
 
     case MSG.GET_CONFIG: {
       if (!tabId) return { success: false, error: "No active tab id" };
       return { success: true, config: stateManager.getConfig(tabId) };
+    }
+
+    case MSG.GET_DOWNLOAD_STATUS: {
+      if (!tabId) return { success: false, error: "No active tab id" };
+      return { success: true, status: getDownloadStatus(tabId) };
     }
 
     case MSG.TOGGLE_RIGHT_CLICK: {
@@ -1648,6 +1781,18 @@ const handleMessage = async (message, sender) => {
       return { success: result?.success !== false };
     }
 
+    case MSG.START_AUTO_SCROLL: {
+      if (!tabId) return { success: false, error: "No active tab id" };
+      const result = await sendMessageToTab(tabId, { type: MSG.START_AUTO_SCROLL });
+      return { success: result?.success !== false };
+    }
+
+    case MSG.STOP_AUTO_SCROLL: {
+      if (!tabId) return { success: false, error: "No active tab id" };
+      const result = await sendMessageToTab(tabId, { type: MSG.STOP_AUTO_SCROLL });
+      return { success: result?.success !== false };
+    }
+
     default:
       return { success: false, error: `Unknown message type: ${message?.type}` };
   }
@@ -1667,6 +1812,8 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
 
 chrome.tabs.onRemoved.addListener((tabId) => {
   stateManager.removeTabState(tabId);
+  batchDownloadStatusByTab.delete(tabId);
+  activeBatchDownloads.delete(tabId);
 });
 
 const handleTabUpdated = async (tabId, changeInfo) => {
@@ -1686,10 +1833,14 @@ const handleTabUpdated = async (tabId, changeInfo) => {
     await syncRightClickForTab(tabId, true);
   }
 
-  if (!config.enableAutoScan) return;
+  if (config.enableAutoScan) {
+    await runScanForTab(tabId).catch(() => ({ success: false }));
+    await sendMessageToTab(tabId, { type: MSG.START_AUTO_SCAN }, { retryOnNoReceiver: false });
+  }
 
-  await runScanForTab(tabId).catch(() => ({ success: false }));
-  await sendMessageToTab(tabId, { type: MSG.START_AUTO_SCAN }, { retryOnNoReceiver: false });
+  if (config.enableAutoScroll) {
+    await sendMessageToTab(tabId, { type: MSG.START_AUTO_SCROLL }, { retryOnNoReceiver: false });
+  }
 };
 
 chrome.tabs.onUpdated.addListener((tabId, changeInfo) => {
