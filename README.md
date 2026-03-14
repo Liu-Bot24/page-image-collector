@@ -148,28 +148,6 @@
 6. 点击“加载已解压的扩展程序”
 7. 选择解压后的扩展目录
 
-### 开发模式加载
-
-1. 打开 `chrome://extensions/`
-2. 开启“开发者模式”
-3. 点击“加载已解压的扩展程序”
-4. 选择项目根目录 `Page Image Collector`
-
-### 本地打包为 `.crx`（可选）
-
-1. 打开 `chrome://extensions/`
-2. 开启“开发者模式”
-3. 点击“打包扩展程序”
-4. 选择扩展根目录 `Page Image Collector`
-5. 生成可分发的 `.crx` 安装包
-
-说明：部分 Chrome 版本或系统环境会限制本地 `.crx` 直接安装。对于 GitHub Releases 场景，推荐优先提供和使用“解压后加载”的 ZIP 包。
-
-### 发布包说明
-
-- `page-image-collector-1.1.0-unpacked.zip`：面向 GitHub Releases 用户，下载后解压并通过“加载已解压的扩展程序”安装
-- `page-image-collector-1.1.0-webstore-*.zip`：面向 Chrome Web Store 后台上传，不作为普通用户安装包
-
 ## 快速开始
 
 1. 打开目标网页
