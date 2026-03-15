@@ -39,6 +39,7 @@ const elements = {
   toggleWebP: document.getElementById("toggle-webp"),
   toggleBatchZipDownload: document.getElementById("toggle-batch-zip-download"),
   btnSelectAll: document.getElementById("btn-select-all"),
+  btnHideToggle: document.getElementById("btn-hide-toggle"),
   btnDownloadBatch: document.getElementById("btn-download-batch"),
   btnCopyBatch: document.getElementById("btn-copy-batch"),
   btnOpenDownloadDir: document.getElementById("btn-open-download-dir"),
@@ -93,6 +94,7 @@ const elements = {
 let sourceTabId = null;
 let currentImages = [];
 let selectedIds = new Set();
+const hiddenImageIds = new Set();
 let lightboxImage = null;
 let lightboxMode = "preview";
 let lightboxCurrentSrc = "";
@@ -137,6 +139,7 @@ const COMIC_PAGINATION_LIMIT_STORAGE_KEY = "comic_pagination_limit";
 const COMIC_PAGINATION_WAIT_STORAGE_KEY = "comic_pagination_wait_seconds";
 const clipboardPayloadCache = new Map();
 const CLIPBOARD_CACHE_TTL = 5 * 60 * 1000;
+const resolvedHdUrlMap = new Map();
 const imageDimensionCache = new Map();
 const cardDimensionCache = new Map();
 const cardDimensionPending = new Set();
@@ -159,6 +162,7 @@ let transientActionStatusTitle = "";
 let pinnedActionStatus = "";
 let pinnedActionStatusTitle = "";
 const FULLSCREEN_PRELOAD_RADIUS = 4;
+const DIMENSION_PROBE_CONCURRENCY = 8;
 const DRAG_SELECT_MOVE_THRESHOLD = 6;
 const DRAG_CLICK_SUPPRESS_MS = 260;
 const FORMAT_GROUPS = [
@@ -319,6 +323,11 @@ const canWriteClipboardImage = () =>
   navigator.clipboard &&
   typeof navigator.clipboard.write === "function";
 
+const getEffectiveHdSrc = (image) => {
+  if (!image?.hdSrc) return image?.hdSrc || "";
+  return resolvedHdUrlMap.get(image.id) || image.hdSrc;
+};
+
 const getImageDimensions = async (url) => {
   const normalizedUrl = String(url || "").trim();
   if (!normalizedUrl) return { width: 0, height: 0 };
@@ -350,6 +359,7 @@ const getImageDimensions = async (url) => {
           height: Number(response.height) || 0
         };
       }
+      setTimeout(() => imageDimensionCache.delete(normalizedUrl), 30000);
       return { width: 0, height: 0 };
     }
     return await domProbe();
@@ -406,6 +416,19 @@ const updateCardMetaInDom = (imageId, meta) => {
   }
 };
 
+const runWithConcurrency = async (tasks, concurrency) => {
+  const results = new Array(tasks.length);
+  let next = 0;
+  const run = async () => {
+    while (next < tasks.length) {
+      const idx = next++;
+      results[idx] = await tasks[idx]();
+    }
+  };
+  await Promise.all(Array.from({ length: Math.min(concurrency, tasks.length) }, () => run()));
+  return results;
+};
+
 const resolveCardMaxDimensions = async (image) => {
   if (!image?.id) return getCardMeta(image);
 
@@ -415,19 +438,35 @@ const resolveCardMaxDimensions = async (image) => {
   const pendingTask = cardDimensionTasks.get(image.id);
   if (pendingTask) return await pendingTask;
 
-  const hasHdCandidate = Boolean(image.hdSrc && image.hdSrc !== image.src);
+  const effectiveHd = getEffectiveHdSrc(image);
+  const hasHdCandidate = Boolean(effectiveHd && effectiveHd !== image.src);
 
   const task = (async () => {
     cardDimensionPending.add(image.id);
     try {
       const probes = [getImageDimensions(image.src)];
       if (hasHdCandidate) {
-        probes.push(getImageDimensions(image.hdSrc));
+        probes.push(getImageDimensions(effectiveHd));
       }
       const [srcDim, hdDim = { width: 0, height: 0 }] = await Promise.all(probes);
 
       const srcArea = computeArea(srcDim.width, srcDim.height);
-      const hdArea = computeArea(hdDim.width, hdDim.height);
+      let hdArea = computeArea(hdDim.width, hdDim.height);
+      let bestHdDim = hdDim;
+
+      if (hasHdCandidate && hdArea === 0 && /\.webp(?:\?|$)/i.test(effectiveHd)) {
+        const jpgAlt = effectiveHd.replace(/\.webp(?=\?|$)/i, ".jpg");
+        if (jpgAlt !== effectiveHd) {
+          const jpgDim = await getImageDimensions(jpgAlt);
+          const jpgArea = computeArea(jpgDim.width, jpgDim.height);
+          if (jpgArea > 0) {
+            bestHdDim = jpgDim;
+            hdArea = jpgArea;
+            resolvedHdUrlMap.set(image.id, jpgAlt);
+          }
+        }
+      }
+
       const baseWidth = Number(image.width) || 0;
       const baseHeight = Number(image.height) || 0;
       const baseArea = Math.max(Number(image.area) || 0, computeArea(baseWidth, baseHeight));
@@ -442,13 +481,17 @@ const resolveCardMaxDimensions = async (image) => {
         area = srcArea;
       }
       if (hdArea >= area) {
-        width = hdDim.width;
-        height = hdDim.height;
+        width = bestHdDim.width;
+        height = bestHdDim.height;
         area = hdArea;
       }
 
       const resolved = { width, height, area };
+      const hdResolved = hasHdCandidate && hdArea > 0;
       cardDimensionCache.set(image.id, resolved);
+      if (hasHdCandidate && !hdResolved) {
+        setTimeout(() => cardDimensionCache.delete(image.id), 30000);
+      }
       updateCardMetaInDom(image.id, resolved);
       return resolved;
     } finally {
@@ -611,9 +654,11 @@ const buildFormatOptions = (stats = {}) => {
     assigned += count;
   }
 
+  const hiddenCount = normalized["_hidden"] || 0;
   const total = Object.values(normalized).reduce((sum, count) => sum + count, 0);
-  const otherCount = Math.max(0, total - assigned);
+  const otherCount = Math.max(0, total - assigned - hiddenCount);
   options.push({ value: "other", label: "其他", count: otherCount });
+  options.push({ value: "_hidden", label: "隐藏", count: hiddenCount });
 
   return options;
 };
@@ -703,6 +748,11 @@ const applyComicSequenceOrder = async (images = []) => {
 
 const updateComicBanner = () => {
   if (!elements.comicBanner) return;
+  if (!shouldComicModeOnOpen) {
+    elements.comicBanner.hidden = true;
+    return;
+  }
+  elements.comicBanner.hidden = false;
   elements.comicBanner.classList.toggle("is-active", comicModeEnabled);
   if (elements.toggleComicMode) {
     elements.toggleComicMode.checked = comicModeEnabled;
@@ -930,17 +980,22 @@ const setComicModeEnabled = async (enabled, options = {}) => {
 };
 
 const renderFormatFilters = (stats = {}) => {
+  const existing = elements.formatFilters.querySelectorAll("input[type=\"checkbox\"]");
+  const isFirstRender = existing.length === 0;
   const selected = new Set(
-    Array.from(elements.formatFilters.querySelectorAll("input[type=\"checkbox\"]:checked")).map((input) => input.value)
+    Array.from(existing).filter((cb) => cb.checked).map((cb) => cb.value)
   );
   const options = buildFormatOptions(stats);
   elements.formatFilters.innerHTML = "";
   const fragment = document.createDocumentFragment();
 
   for (const option of options) {
+    const checked = isFirstRender
+      ? option.value !== "_hidden"
+      : selected.has(option.value);
     const label = document.createElement("label");
     label.innerHTML = `
-      <input type="checkbox" value="${option.value}" ${selected.has(option.value) ? "checked" : ""}>
+      <input type="checkbox" value="${option.value}" ${checked ? "checked" : ""}>
       <span class="format-name">${option.label}</span>
       <span class="format-count">${option.count}</span>
     `;
@@ -1162,18 +1217,29 @@ const passesOrientationFilter = (image) => {
 const passesFormatFilters = (image, selectedFormats = []) => {
   if (!Array.isArray(selectedFormats) || selectedFormats.length === 0) return true;
   const formatSet = new Set(selectedFormats.map((item) => String(item).toLowerCase()));
-  const format = resolveImageFormat(image) || "unknown";
 
-  if (formatSet.has(format)) return true;
-  if (formatSet.has("jpg") && format === "jpeg") return true;
-  if (formatSet.has("jpeg") && format === "jpg") return true;
-  if (formatSet.has("other") && !PRIMARY_FORMATS.has(format)) return true;
+  if (hiddenImageIds.has(image.id)) {
+    return formatSet.has("_hidden");
+  }
+
+  const nonHidden = new Set([...formatSet].filter((f) => f !== "_hidden"));
+  if (nonHidden.size === 0) return false;
+
+  const format = resolveImageFormat(image) || "unknown";
+  if (nonHidden.has(format)) return true;
+  if (nonHidden.has("jpg") && format === "jpeg") return true;
+  if (nonHidden.has("jpeg") && format === "jpg") return true;
+  if (nonHidden.has("other") && !PRIMARY_FORMATS.has(format)) return true;
   return false;
 };
 
 const computeFormatStatsFromImages = (images = []) => {
   const stats = {};
   for (const image of images) {
+    if (hiddenImageIds.has(image.id)) {
+      stats["_hidden"] = (stats["_hidden"] || 0) + 1;
+      continue;
+    }
     const key = resolveImageFormat(image) || "unknown";
     stats[key] = (stats[key] || 0) + 1;
   }
@@ -1182,8 +1248,40 @@ const computeFormatStatsFromImages = (images = []) => {
 
 const fallbackImageError = (imgElement, fallbackUrl, image = null) => {
   if (!fallbackUrl) return;
-  if (imgElement.dataset.fallbackApplied && imgElement.dataset.fallbackApplied !== "0") return;
-  imgElement.dataset.fallbackApplied = "1";
+  const stage = imgElement.dataset.fallbackApplied || "0";
+
+  if (stage === "0") {
+    const currentSrc = imgElement.src || "";
+    if (currentSrc !== fallbackUrl) {
+      const jpgAlt = currentSrc.replace(/\.webp(?=\?|$)/i, ".jpg");
+      if (jpgAlt !== currentSrc) {
+        imgElement.dataset.fallbackApplied = "1";
+        const prevOnload = imgElement.onload;
+        imgElement.onload = () => {
+          if (image?.id) {
+            resolvedHdUrlMap.set(image.id, jpgAlt);
+            const nw = imgElement.naturalWidth || 0;
+            const nh = imgElement.naturalHeight || 0;
+            if (nw > 0 && nh > 0) {
+              const area = nw * nh;
+              const prev = cardDimensionCache.get(image.id);
+              if (!prev || area > (prev.area || 0)) {
+                const updated = { width: nw, height: nh, area };
+                cardDimensionCache.set(image.id, updated);
+                updateCardMetaInDom(image.id, updated);
+              }
+            }
+          }
+          if (typeof prevOnload === "function") prevOnload();
+        };
+        imgElement.src = jpgAlt;
+        return;
+      }
+    }
+  }
+
+  if (stage !== "0" && stage !== "1") return;
+  imgElement.dataset.fallbackApplied = "2";
   imgElement.src = fallbackUrl;
   if (!image) return;
   const candidate = String(fallbackUrl || "");
@@ -1194,7 +1292,7 @@ const fallbackImageError = (imgElement, fallbackUrl, image = null) => {
     preferHD: currentConfig.enableHD
   }).then((response) => {
     if (!response?.success || !response.dataUrl) return;
-    imgElement.dataset.fallbackApplied = "2";
+    imgElement.dataset.fallbackApplied = "3";
     imgElement.src = response.dataUrl;
   }).catch(() => {});
 };
@@ -1231,11 +1329,12 @@ const formatFromUrl = (url) => {
 const resolveImageFormat = (image) => {
   const raw = String(image?.format || "").toLowerCase();
   if (raw && raw !== "unknown") return raw;
-  return formatFromUrl(image?.displaySrc || image?.hdSrc || image?.src || image?.originalSrc || "");
+  const effectiveHd = getEffectiveHdSrc(image);
+  return formatFromUrl(image?.displaySrc || effectiveHd || image?.src || image?.originalSrc || "");
 };
 
 const getViewSources = (image) => {
-  const hdCandidate = image?.hdSrc || "";
+  const hdCandidate = getEffectiveHdSrc(image);
   if (/twimg\.com/i.test(hdCandidate) && /name=orig/i.test(hdCandidate)) {
     return {
       previewSrc: hdCandidate.replace(/name=orig/i, "name=large"),
@@ -1246,7 +1345,7 @@ const getViewSources = (image) => {
   const base = image?.src || image?.originalSrc || image?.displaySrc || hdCandidate || "";
   if (!base) return { previewSrc: "", originalSrc: "" };
 
-  const originalSrc = image?.hdSrc && image.hdSrc !== base ? image.hdSrc : "";
+  const originalSrc = hdCandidate && hdCandidate !== base ? hdCandidate : "";
   return { previewSrc: base, originalSrc };
 };
 
@@ -1497,17 +1596,70 @@ const renderFullscreenImage = async () => {
   const source = getFullscreenSourceForImage(image);
   if (!source) return;
   elements.fullscreenImage.dataset.source = source;
+  elements.fullscreenImage.dataset.fsFallbackStage = "0";
   setFullscreenLoading(true, "加载原图...");
-  const { displayUrl } = await ensureFullscreenCache(source);
+
+  let loadUrl = source;
+  const { displayUrl, cached } = await ensureFullscreenCache(source);
   if (!fullscreenActive) return;
   if (elements.fullscreenImage.dataset.source !== source) return;
-  elements.fullscreenImage.src = displayUrl || source;
+
+  if (!cached && /\.webp(?:\?|$)/i.test(source)) {
+    const jpgAlt = source.replace(/\.webp(?=\?|$)/i, ".jpg");
+    if (jpgAlt !== source) {
+      const { displayUrl: jpgDisplay, cached: jpgCached } = await ensureFullscreenCache(jpgAlt);
+      if (jpgCached) {
+        loadUrl = jpgAlt;
+        if (image?.id) resolvedHdUrlMap.set(image.id, jpgAlt);
+      }
+    }
+  }
+  if (!fullscreenActive) return;
+  if (elements.fullscreenImage.dataset.source !== source) return;
+
+  const finalDisplay = loadUrl === source ? (displayUrl || source) : (fullscreenCache.get(loadUrl)?.objectUrl || loadUrl);
+  elements.fullscreenImage.src = finalDisplay;
+
+  const thumbFallback = image?.src || image?.originalSrc || "";
   elements.fullscreenImage.onerror = () => {
-    elements.fullscreenImage.src = source;
+    const stage = elements.fullscreenImage.dataset.fsFallbackStage || "0";
+    if (stage === "0") {
+      const curSrc = elements.fullscreenImage.src || "";
+      const jpgAlt = curSrc.replace(/\.webp(?=\?|$)/i, ".jpg");
+      if (jpgAlt !== curSrc) {
+        elements.fullscreenImage.dataset.fsFallbackStage = "0.5";
+        elements.fullscreenImage.src = jpgAlt;
+        return;
+      }
+    }
+    if (stage === "0" || stage === "0.5") {
+      if (thumbFallback && thumbFallback !== elements.fullscreenImage.src) {
+        elements.fullscreenImage.dataset.fsFallbackStage = "1";
+        elements.fullscreenImage.src = thumbFallback;
+        return;
+      }
+    }
     setFullscreenLoading(false);
     requestAnimationFrame(updateFullscreenZoomCapability);
   };
   elements.fullscreenImage.onload = () => {
+    if (image?.id) {
+      const loadedSrc = elements.fullscreenImage.src || "";
+      const nw = elements.fullscreenImage.naturalWidth || 0;
+      const nh = elements.fullscreenImage.naturalHeight || 0;
+      if (nw > 0 && nh > 0) {
+        const loadedArea = nw * nh;
+        const prev = cardDimensionCache.get(image.id);
+        if (!prev || loadedArea > (prev.area || 0)) {
+          const updated = { width: nw, height: nh, area: loadedArea };
+          cardDimensionCache.set(image.id, updated);
+          updateCardMetaInDom(image.id, updated);
+        }
+        if (loadedSrc && loadedSrc !== thumbFallback && !loadedSrc.startsWith("blob:")) {
+          resolvedHdUrlMap.set(image.id, loadedSrc);
+        }
+      }
+    }
     setFullscreenLoading(false);
     requestAnimationFrame(updateFullscreenZoomCapability);
   };
@@ -1640,6 +1792,23 @@ const setLightboxSource = (src, mode) => {
   elements.lightboxImage.dataset.fallbackApplied = "0";
   elements.lightboxImage.src = src;
   elements.lightboxImage.onload = () => {
+    if (mode === "original" && lightboxImage?.id) {
+      const nw = elements.lightboxImage.naturalWidth || 0;
+      const nh = elements.lightboxImage.naturalHeight || 0;
+      if (nw > 0 && nh > 0) {
+        const loadedArea = nw * nh;
+        const prev = cardDimensionCache.get(lightboxImage.id);
+        if (!prev || loadedArea > (prev.area || 0)) {
+          const updated = { width: nw, height: nh, area: loadedArea };
+          cardDimensionCache.set(lightboxImage.id, updated);
+          updateCardMetaInDom(lightboxImage.id, updated);
+        }
+        const loadedSrc = elements.lightboxImage.src || src;
+        if (loadedSrc && !loadedSrc.startsWith("blob:")) {
+          resolvedHdUrlMap.set(lightboxImage.id, loadedSrc);
+        }
+      }
+    }
     syncLightboxMeta(src);
     updateOneToOneCapabilityFromCurrentDisplay();
     updateOriginalButton();
@@ -1722,8 +1891,38 @@ const syncSelectAllButtonLabel = () => {
   elements.btnSelectAll.textContent = allVisibleSelected ? UNSELECT_ALL_LABEL : SELECT_ALL_LABEL;
 };
 
+const syncHideToggleButton = () => {
+  const btn = elements.btnHideToggle;
+  if (!btn) return;
+  if (selectedIds.size === 0) {
+    btn.disabled = true;
+    btn.textContent = "隐藏";
+    return;
+  }
+  btn.disabled = false;
+  const allHidden = [...selectedIds].every((id) => hiddenImageIds.has(id));
+  btn.textContent = allHidden ? "显示" : "隐藏";
+};
+
+const toggleHideSelected = async () => {
+  if (selectedIds.size === 0) return;
+  const allHidden = [...selectedIds].every((id) => hiddenImageIds.has(id));
+
+  if (allHidden) {
+    for (const id of selectedIds) hiddenImageIds.delete(id);
+  } else {
+    for (const id of selectedIds) hiddenImageIds.add(id);
+  }
+
+  const ids = [...selectedIds];
+  await sendMessage(MSG.SET_SELECTION, { imageIds: ids, selected: false });
+  selectedIds.clear();
+  await renderGallery();
+};
+
 const createCard = (image, index) => {
-  const displaySrc = image.displaySrc || image.src;
+  const resolved = resolvedHdUrlMap.get(image.id);
+  const displaySrc = resolved || image.displaySrc || image.src;
   const ext = String(resolveImageFormat(image) || formatFromUrl(displaySrc) || "unknown").toUpperCase();
   const isSelected = selectedIds.has(image.id);
   const meta = getCardMeta(image);
@@ -1788,7 +1987,15 @@ const renderGallery = async () => {
     );
 
   if (needsDimensionHydration) {
-    await Promise.all(allImages.map((image) => resolveCardMaxDimensions(image)));
+    const uncached = allImages.filter((img) => !cardDimensionCache.has(img.id));
+    const cached = allImages.filter((img) => cardDimensionCache.has(img.id));
+    cached.forEach((img) => resolveCardMaxDimensions(img));
+    if (uncached.length > 0) {
+      await runWithConcurrency(
+        uncached.map((img) => () => resolveCardMaxDimensions(img)),
+        DIMENSION_PROBE_CONCURRENCY
+      );
+    }
   }
 
   const metricAndOrientationFiltered = allImages
@@ -1843,6 +2050,7 @@ const renderGallery = async () => {
     elements.emptyState.style.display = "flex";
     elements.gallery.appendChild(elements.emptyState);
     elements.btnSelectAll.textContent = SELECT_ALL_LABEL;
+    syncHideToggleButton();
     await updateStats({ visibleImages: currentImages, facetStats });
     hasScannedOnce = hasScannedOnce || allImages.length > 0;
     syncScanButtonLabel();
@@ -1857,6 +2065,7 @@ const renderGallery = async () => {
   elements.gallery.appendChild(fragment);
 
   syncSelectAllButtonLabel();
+  syncHideToggleButton();
   await updateStats({ visibleImages: currentImages, facetStats });
   hasScannedOnce = true;
   syncScanButtonLabel();
@@ -2261,6 +2470,7 @@ const clearImages = async () => {
   resetComicPaginationState();
   currentImages = [];
   selectedIds = new Set();
+  hiddenImageIds.clear();
   hasScannedOnce = false;
   await renderGallery();
   setActionStatus("已清理采集结果", 1400);
@@ -2372,6 +2582,7 @@ const bindEvents = () => {
   elements.btnScan.addEventListener("click", scanImages);
   elements.btnClear.addEventListener("click", clearImages);
   elements.btnSelectAll.addEventListener("click", toggleSelectAll);
+  elements.btnHideToggle.addEventListener("click", toggleHideSelected);
   elements.btnDownloadBatch.addEventListener("click", downloadBatch);
   elements.btnCopyBatch.addEventListener("click", copyBatch);
   elements.btnOpenDownloadDir.addEventListener("click", openDownloadDirectory);
@@ -2410,9 +2621,18 @@ const bindEvents = () => {
   });
 
   elements.formatFilters.addEventListener("change", (event) => {
-    if (event.target instanceof HTMLInputElement && event.target.type === "checkbox") {
-      renderGallery();
+    if (!(event.target instanceof HTMLInputElement) || event.target.type !== "checkbox") return;
+    const value = event.target.value;
+    const checked = event.target.checked;
+    if (value === "_hidden") {
+      elements.formatFilters.querySelectorAll("input[type=\"checkbox\"]").forEach((cb) => {
+        if (cb.value !== "_hidden") cb.checked = !checked;
+      });
+    } else if (checked) {
+      const hiddenCb = elements.formatFilters.querySelector("input[value=\"_hidden\"]");
+      if (hiddenCb) hiddenCb.checked = false;
     }
+    renderGallery();
   });
 
   const applyConfigToggle = async (configKey, checked, failurePrefix = "设置失败") => {

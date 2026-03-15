@@ -76,12 +76,12 @@ const HD_RULES = [
     }
   },
   {
-    test: /-\d{2,4}x\d{2,4}\.(jpg|jpeg|png|webp|gif)(\?.*)?$/i,
-    replace: (url) => url.replace(/-\d{2,4}x\d{2,4}(\.[a-z]+(\?.*)?)$/i, "$1")
+    test: /-\d{1,5}x\d{1,5}\.(jpg|jpeg|png|webp|gif)(\?.*)?$/i,
+    replace: (url) => url.replace(/-\d{1,5}x\d{1,5}(\.[a-z]+(\?.*)?)$/i, "$1")
   },
   {
-    test: /_(\d{2,4})x(\d{2,4})\.(jpg|jpeg|png|webp)(\?.*)?$/i,
-    replace: (url) => url.replace(/_(\d{2,4})x(\d{2,4})(\.[a-z]+(\?.*)?)$/i, "$3")
+    test: /_\d{1,5}x\d{1,5}\.(jpg|jpeg|png|webp)(\?.*)?$/i,
+    replace: (url) => url.replace(/_\d{1,5}x\d{1,5}(\.[a-z]+(\?.*)?)$/i, "$1")
   },
   {
     test: /cdn\.discordapp\.com.*\.(jpg|jpeg|png|webp|gif)\?size=\d+/i,
@@ -1767,8 +1767,11 @@ const scorePaginationContainer = (container) => {
     const text = String(anchor.textContent || "").trim();
     const page = extractPageNumber(text);
     const sig = `${readNodeSignature(container)} ${readNodeSignature(anchor)}`;
-    const isNext = anchor.rel?.includes?.("next") === true || /\b(next|nxt)\b/i.test(sig) || NEXT_LABEL_RE.test(text);
-    const isPrev = anchor.rel?.includes?.("prev") === true || /\b(prev|previous)\b/i.test(sig) || PREV_LABEL_RE.test(text);
+    const innerMarkup = anchor.innerHTML || "";
+    const isNext = anchor.rel?.includes?.("next") === true || /\b(next|nxt)\b/i.test(sig) || NEXT_LABEL_RE.test(text)
+      || /\b(?:angle-right|arrow-right|chevron-right|right-arrow|icon-right|icon-next)\b/i.test(innerMarkup);
+    const isPrev = anchor.rel?.includes?.("prev") === true || /\b(prev|previous)\b/i.test(sig) || PREV_LABEL_RE.test(text)
+      || /\b(?:angle-left|arrow-left|chevron-left|left-arrow|icon-left|icon-prev)\b/i.test(innerMarkup);
     const hasPagerSig = /\b(pager|pagination|page-numbers|pg|pages?)\b/i.test(sig);
     const hasTransition = currentUrl ? isLikelyPaginationTransition(currentUrl, href) : false;
 
@@ -1850,6 +1853,13 @@ const buildComicPagination = () => {
   }
   if (nextUrl && !seenUrls.has(nextUrl)) {
     pageUrls.push({ url: nextUrl, pageNumber: null });
+  }
+
+  if (!nextUrl && pageUrls.length > 0) {
+    const sorted = pageUrls
+      .filter(p => p.pageNumber !== null && (currentPage === null || p.pageNumber > currentPage))
+      .sort((a, b) => a.pageNumber - b.pageNumber);
+    if (sorted.length > 0) nextUrl = sorted[0].url;
   }
 
   const forwardUrls = [...new Set([...pageUrls.map((i) => i.url), nextUrl].filter(Boolean))];

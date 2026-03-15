@@ -5,7 +5,16 @@
 ## 文档
 
 - 隐私政策：[PRIVACY.md](./PRIVACY.md)
-- GitHub Releases 推荐安装包：`page-image-collector-1.2.0-unpacked.zip`
+- GitHub Releases 推荐安装包：`page-image-collector-1.2.1-unpacked.zip`
+
+## 1.2.1 更新
+
+- 新增隐藏/显示图片功能：选中图片后可手动隐藏，格式筛选栏新增「隐藏」分类
+- 通用防盗链兼容：自动为外部图床设置正确的请求头，支持更多有防盗链机制的网站
+- 大图获取增强：改进 HD 规则匹配和 .webp → .jpg 自动回退，全屏查看与灯箱表现一致
+- 图片尺寸动态更新：灯箱和全屏成功加载大图后自动更新网格中的尺寸显示
+- 分页检测增强：支持图标类翻页按钮识别
+- 修复漫画模式横幅在基础模式下误显示的问题
 
 ## 1.2.0 更新
 
@@ -91,7 +100,7 @@
 
 ### 筛选能力
 
-- 格式：`JPG / PNG / WebP / GIF / SVG / AVIF / 其他`
+- 格式：`JPG / PNG / WebP / GIF / SVG / AVIF / 其他 / 隐藏`
 - 分辨率预设：`全部 / ≥720P / ≥1080P / ≥2K / ≥4K`
 - 自定义阈值：
   - 最小短边
@@ -153,7 +162,7 @@
 ### 从 GitHub Releases 安装（推荐）
 
 1. 进入项目的 `Releases` 页面
-2. 下载对应版本的解压包，例如 `page-image-collector-1.2.0-unpacked.zip`
+2. 下载对应版本的解压包，例如 `page-image-collector-1.2.1-unpacked.zip`
 3. 打开 `chrome://extensions/`
 4. 开启“开发者模式”
 5. 解压下载的 ZIP 文件
@@ -205,5 +214,5 @@
 
 ## 版本信息
 
-- 版本：`1.2.0`
+- 版本：`1.2.1`
 - Manifest：`MV3`

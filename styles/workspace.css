@@ -82,6 +82,10 @@ body {
   gap: 10px;
 }
 
+.comic-banner[hidden] {
+  display: none;
+}
+
 .comic-banner {
   display: flex;
   align-items: center;
@@ -646,6 +650,16 @@ input[type="number"]::-webkit-inner-spin-button {
 
 #btn-select-all:hover:not(:disabled) {
   background: rgba(59, 130, 246, 0.3);
+}
+
+.btn-hide {
+  background: rgba(245, 158, 11, 0.14);
+  color: #fbbf60;
+  border: 1px solid rgba(245, 158, 11, 0.4);
+}
+
+.btn-hide:hover:not(:disabled) {
+  background: rgba(245, 158, 11, 0.25);
 }
 
 .btn-success {

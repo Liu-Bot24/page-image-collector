@@ -342,6 +342,7 @@ const createState = () => {
   return {
     images: new Map(),
     imagesByNormalized: new Map(),
+    imagesByHdSrc: new Map(),
     selectedIds: new Set(),
     config: defaults.config,
     lastScanTime: null,
@@ -453,6 +454,8 @@ export const createTabStateManager = () => {
             if (!normalizedImage) continue;
             state.images.set(normalizedImage.id, normalizedImage);
             state.imagesByNormalized.set(normalizedImage.normalized, normalizedImage.id);
+            const hdK = normalizedImage.hdSrc && normalizedImage.hdSrc !== normalizedImage.src ? normalizedImage.hdSrc : "";
+            if (hdK) state.imagesByHdSrc.set(hdK, normalizedImage.id);
           }
 
           const selectedIds = Array.isArray(rawState.selectedIds) ? rawState.selectedIds : [];
@@ -481,12 +484,15 @@ export const createTabStateManager = () => {
       const image = sanitizeImage(rawImage);
       if (!image) continue;
 
+      const hdKey = image.hdSrc && image.hdSrc !== image.src ? image.hdSrc : "";
       const existingId =
         state.imagesByNormalized.get(image.normalized) ||
+        (hdKey && state.imagesByHdSrc.get(hdKey)) ||
         findTelegramEquivalentId(state, image);
       if (!existingId) {
         state.images.set(image.id, image);
         state.imagesByNormalized.set(image.normalized, image.id);
+        if (hdKey) state.imagesByHdSrc.set(hdKey, image.id);
         added += 1;
         continue;
       }
@@ -495,6 +501,7 @@ export const createTabStateManager = () => {
       if (!existing) {
         state.images.set(image.id, image);
         state.imagesByNormalized.set(image.normalized, image.id);
+        if (hdKey) state.imagesByHdSrc.set(hdKey, image.id);
         added += 1;
         continue;
       }
@@ -502,6 +509,7 @@ export const createTabStateManager = () => {
       if (image.normalized && image.normalized !== existing.normalized) {
         state.imagesByNormalized.set(image.normalized, existingId);
       }
+      if (hdKey) state.imagesByHdSrc.set(hdKey, existingId);
 
       const shouldReplace =
         image.area > existing.area ||

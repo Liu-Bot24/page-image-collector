@@ -168,6 +168,81 @@ const ensureSinaimgRefererRule = async () => {
   }
 };
 
+const IMAGE_REFERER_RULE_ID_START = 20000;
+const IMAGE_REFERER_RULE_ID_MAX = 20200;
+const imageRefererRuleMap = new Map();
+let imageRefererNextId = IMAGE_REFERER_RULE_ID_START;
+
+const cleanupStaleImageRefererRules = async () => {
+  if (!chrome.declarativeNetRequest?.getDynamicRules) return;
+  try {
+    const rules = await chrome.declarativeNetRequest.getDynamicRules();
+    const staleIds = rules
+      .filter(r => r.id >= IMAGE_REFERER_RULE_ID_START && r.id < IMAGE_REFERER_RULE_ID_MAX)
+      .map(r => r.id);
+    if (staleIds.length > 0) {
+      await chrome.declarativeNetRequest.updateDynamicRules({ removeRuleIds: staleIds });
+    }
+  } catch { /* ignore */ }
+  imageRefererRuleMap.clear();
+  imageRefererNextId = IMAGE_REFERER_RULE_ID_START;
+};
+
+const ensureImageHostRefererRule = async (imageHostname, sourceOrigin) => {
+  if (!chrome.declarativeNetRequest?.updateDynamicRules) return;
+  if (!imageHostname || !sourceOrigin) return;
+  if (imageRefererRuleMap.has(imageHostname)) return;
+
+  const ruleId = imageRefererNextId++;
+  if (ruleId >= IMAGE_REFERER_RULE_ID_MAX) return;
+
+  try {
+    await chrome.declarativeNetRequest.updateDynamicRules({
+      removeRuleIds: [ruleId],
+      addRules: [{
+        id: ruleId,
+        priority: 1,
+        action: {
+          type: "modifyHeaders",
+          requestHeaders: [{ header: "referer", operation: "set", value: sourceOrigin + "/" }]
+        },
+        condition: {
+          urlFilter: `||${imageHostname}/`,
+          resourceTypes: ["image", "xmlhttprequest", "media", "other"]
+        }
+      }]
+    });
+    imageRefererRuleMap.set(imageHostname, ruleId);
+  } catch { /* ignore */ }
+};
+
+const updateImageRefererRulesForTab = async (tabId) => {
+  let sourceOrigin, sourceHostname;
+  try {
+    const tab = await chrome.tabs.get(tabId);
+    if (!tab?.url) return;
+    const parsed = new URL(tab.url);
+    if (!/^https?:$/.test(parsed.protocol)) return;
+    sourceOrigin = parsed.origin;
+    sourceHostname = parsed.hostname;
+  } catch { return; }
+
+  const images = stateManager.getAllImages(tabId);
+  const seen = new Set();
+  for (const img of images) {
+    for (const url of [img.src, img.hdSrc, img.originalSrc]) {
+      if (!url) continue;
+      try {
+        const hostname = new URL(url).hostname;
+        if (hostname !== sourceHostname && !seen.has(hostname)) {
+          seen.add(hostname);
+          await ensureImageHostRefererRule(hostname, sourceOrigin);
+        }
+      } catch { /* ignore */ }
+    }
+  }
+};
+
 const timeout = (ms) =>
   new Promise((resolve) => {
     setTimeout(resolve, ms);
@@ -623,6 +698,7 @@ const loadComicPaginationPages = async (sourceTabId, startUrl, options = {}) => 
         nextUrl = paginationResult.pagination.nextUrl;
       }
 
+      await updateImageRefererRulesForTab(sourceTabId).catch(() => {});
       notifyImagesUpdated(sourceTabId);
     } catch (error) {
       results.push({ url, success: false, error: error?.message || "加载失败" });
@@ -862,7 +938,16 @@ const buildZipBlob = (entries) => {
 const getDownloadCandidates = (image, preferHD = true, preferredUrl = null) => {
   const first = preferHD ? image?.hdSrc || image?.src : image?.src || image?.hdSrc;
   const second = preferHD ? image?.src : image?.hdSrc;
-  return [...new Set([preferredUrl, first, second, image?.originalSrc].filter(Boolean))];
+  const base = [preferredUrl, first, second, image?.originalSrc].filter(Boolean);
+  const expanded = [];
+  for (const url of base) {
+    expanded.push(url);
+    if (/\.webp(?:\?|$)/i.test(url)) {
+      const jpgAlt = url.replace(/\.webp(?=\?|$)/i, ".jpg");
+      if (jpgAlt !== url) expanded.push(jpgAlt);
+    }
+  }
+  return [...new Set(expanded)];
 };
 
 const isNoReceiverError = (message) =>
@@ -1001,32 +1086,94 @@ const convertBlobToPng = async (blob) => {
   }
 };
 
+const PROBE_HEADER_BYTES = 131072;
+
+const parseJpegDims = (view) => {
+  let o = 2;
+  while (o < view.byteLength - 8) {
+    if (view.getUint8(o) !== 0xFF) { o++; continue; }
+    const m = view.getUint8(o + 1);
+    if (m >= 0xC0 && m <= 0xCF && m !== 0xC4 && m !== 0xCC) {
+      return o + 8 < view.byteLength
+        ? { width: view.getUint16(o + 7), height: view.getUint16(o + 5) }
+        : null;
+    }
+    if (m === 0xFF) { o++; continue; }
+    if (m === 0x00 || m === 0x01 || (m >= 0xD0 && m <= 0xD9)) { o += 2; continue; }
+    if (o + 3 < view.byteLength) { o += 2 + view.getUint16(o + 2); } else break;
+  }
+  return null;
+};
+
+const parseWebpDims = (view) => {
+  if (view.byteLength < 30) return null;
+  const c = (i) => String.fromCharCode(view.getUint8(i));
+  const chunk = c(12) + c(13) + c(14) + c(15);
+  if (chunk === "VP8 ") return { width: view.getUint16(26, true) & 0x3FFF, height: view.getUint16(28, true) & 0x3FFF };
+  if (chunk === "VP8L" && view.byteLength >= 25) {
+    const b = view.getUint32(21, true);
+    return { width: (b & 0x3FFF) + 1, height: ((b >> 14) & 0x3FFF) + 1 };
+  }
+  if (chunk === "VP8X") return {
+    width: (view.getUint8(24) | (view.getUint8(25) << 8) | (view.getUint8(26) << 16)) + 1,
+    height: (view.getUint8(27) | (view.getUint8(28) << 8) | (view.getUint8(29) << 16)) + 1
+  };
+  return null;
+};
+
+const parseDimsFromHeader = (buf) => {
+  if (!buf || buf.byteLength < 30) return null;
+  const v = new DataView(buf);
+  const b0 = v.getUint8(0), b1 = v.getUint8(1);
+  if (b0 === 0xFF && b1 === 0xD8) return parseJpegDims(v);
+  if (b0 === 0x89 && b1 === 0x50 && buf.byteLength >= 24) return { width: v.getUint32(16), height: v.getUint32(20) };
+  if (b0 === 0x52 && b1 === 0x49 && v.getUint8(8) === 0x57) return parseWebpDims(v);
+  return null;
+};
+
 const probeImageDimensions = async (url) => {
   if (!url || typeof url !== "string") {
     return { success: false, error: "Invalid image URL" };
   }
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), 10000);
   try {
-    const blob = await fetchBlob(url);
-    if (!blob) {
-      return { success: false, error: "Empty blob" };
+    const resp = await fetch(url, { signal: controller.signal, cache: "no-store", redirect: "follow" });
+    if (!resp.ok) return { success: false, error: `HTTP ${resp.status}` };
+
+    const reader = resp.body.getReader();
+    const chunks = [];
+    let total = 0;
+    while (total < PROBE_HEADER_BYTES) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      chunks.push(value);
+      total += value.length;
     }
-    const bitmap = await createImageBitmap(blob);
+    reader.cancel().catch(() => {});
+
+    const merged = new Uint8Array(total);
+    let off = 0;
+    for (const ch of chunks) { merged.set(ch, off); off += ch.length; }
+
+    const dims = parseDimsFromHeader(merged.buffer);
+    if (dims && dims.width > 0 && dims.height > 0) {
+      return { success: true, width: dims.width, height: dims.height };
+    }
+
+    const blob = new Blob([merged]);
     try {
-      return {
-        success: true,
-        width: Number(bitmap.width) || 0,
-        height: Number(bitmap.height) || 0
-      };
-    } finally {
+      const bitmap = await createImageBitmap(blob);
+      const w = bitmap.width || 0, h = bitmap.height || 0;
       bitmap.close();
-    }
+      if (w > 0 && h > 0) return { success: true, width: w, height: h };
+    } catch (_) {}
+
+    return { success: false, error: "Header parse failed", width: 0, height: 0 };
   } catch (error) {
-    return {
-      success: false,
-      error: error?.message || "Probe failed",
-      width: 0,
-      height: 0
-    };
+    return { success: false, error: error?.message || "Probe failed", width: 0, height: 0 };
+  } finally {
+    clearTimeout(timer);
   }
 };
 
@@ -1550,6 +1697,7 @@ const runScanForTab = async (tabId) => {
     }
 
     const merge = stateManager.mergeImages(tabId, response.images || []);
+    await updateImageRefererRulesForTab(tabId).catch(() => {});
     notifyImagesUpdated(tabId);
     return {
       success: true,
@@ -1658,6 +1806,7 @@ const handleMessage = async (message, sender) => {
       }
       const merged = stateManager.mergeImages(tabId, images);
       if ((merged.added || 0) > 0 || (merged.updated || 0) > 0) {
+        await updateImageRefererRulesForTab(tabId).catch(() => {});
         notifyImagesUpdated(tabId);
       }
       return { success: true, ...merged };
@@ -2156,11 +2305,13 @@ const createContextMenu = async () => {
 
 chrome.runtime.onInstalled.addListener(() => {
   ensureSinaimgRefererRule().catch(() => {});
+  cleanupStaleImageRefererRules().catch(() => {});
   createContextMenu().catch(() => {});
 });
 
 chrome.runtime.onStartup.addListener(() => {
   ensureSinaimgRefererRule().catch(() => {});
+  cleanupStaleImageRefererRules().catch(() => {});
   createContextMenu().catch(() => {});
 });
 
