@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "图片采集查看器",
-  "version": "1.2.1",
+  "version": "1.2.2",
   "description": "一款基于 Chrome Manifest V3 的生产力级网页视觉资产采集器",
   "permissions": [
     "activeTab",
