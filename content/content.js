@@ -1661,7 +1661,7 @@ const scanImages = () => {
 // NEVER be reported as paginated.
 
 const COMIC_PAGINATION_SELECTORS =
-  ".pager, .pagination, .pg, .pgs, .page-links, .wp-pagenavi, " +
+  ".pager, .pagination, .pg, .pgs, .page-link, .page-links, .wp-pagenavi, " +
   "[class*='page-numbers'], [id*='pager'], [id*='pagination'], " +
   "nav[aria-label*='page' i], nav[aria-label*='next' i]";
 
@@ -1822,8 +1822,12 @@ const buildComicPagination = () => {
       NEXT_LABEL_RE.test(text) || PREV_LABEL_RE.test(text) ||
       /\b(next|prev|pager|pagination|page-numbers|pg)\b/i.test(sig)
     ) {
-      const parent = (() => { try { return anchor.closest(COMIC_PAGINATION_SELECTORS); } catch { return null; } })()
-        || anchor.parentElement;
+      const parent = (() => {
+        try {
+          const found = anchor.closest(COMIC_PAGINATION_SELECTORS);
+          return found && found !== anchor ? found : null;
+        } catch { return null; }
+      })() || anchor.parentElement;
       if (parent instanceof Element) containers.add(parent);
     }
   }
