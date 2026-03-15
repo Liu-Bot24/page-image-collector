@@ -11,8 +11,15 @@ const MSG = {
   COPY_TO_CLIPBOARD: "COPY_TO_CLIPBOARD",
   SET_CONFIG: "SET_CONFIG",
   GET_CONFIG: "GET_CONFIG",
+  GET_COMIC_SEQUENCE: "GET_COMIC_SEQUENCE",
+  GET_COMIC_PAGINATION: "GET_COMIC_PAGINATION",
+  LOAD_COMIC_PAGINATION_PAGES: "LOAD_COMIC_PAGINATION_PAGES",
   START_AUTO_SCAN: "START_AUTO_SCAN",
   STOP_AUTO_SCAN: "STOP_AUTO_SCAN",
+  START_AUTO_SCROLL: "START_AUTO_SCROLL",
+  STOP_AUTO_SCROLL: "STOP_AUTO_SCROLL",
+  AUTO_SCROLL_STATE_CHANGED: "AUTO_SCROLL_STATE_CHANGED",
+  FOCUS_SOURCE_TAB_AND_START_AUTO_SCROLL: "FOCUS_SOURCE_TAB_AND_START_AUTO_SCROLL",
   IMAGES_UPDATED: "IMAGES_UPDATED",
   DOWNLOAD_PROGRESS: "DOWNLOAD_PROGRESS",
   PROBE_IMAGE_DIMENSIONS: "PROBE_IMAGE_DIMENSIONS",
@@ -27,6 +34,7 @@ const elements = {
   toggleAutoScan: document.getElementById("toggle-auto-scan"),
   toggleHd: document.getElementById("toggle-hd"),
   toggleSortSize: document.getElementById("toggle-sort-size"),
+  toggleComicMode: document.getElementById("toggle-comic-mode"),
   togglePortraitOnly: document.getElementById("toggle-portrait-only"),
   toggleWebP: document.getElementById("toggle-webp"),
   toggleBatchZipDownload: document.getElementById("toggle-batch-zip-download"),
@@ -38,6 +46,17 @@ const elements = {
   filterMinShort: document.getElementById("filter-min-short"),
   filterMinLong: document.getElementById("filter-min-long"),
   filterMinMp: document.getElementById("filter-min-mp"),
+  comicBanner: document.getElementById("comic-banner"),
+  comicBannerTitle: document.getElementById("comic-banner-title"),
+  comicBannerDescription: document.getElementById("comic-banner-description"),
+  comicBannerDescriptionText: document.getElementById("comic-banner-description-text"),
+  comicBannerDescriptionNote: document.getElementById("comic-banner-description-note"),
+  comicBannerAutoScrollLink: document.getElementById("comic-banner-autoscroll-link"),
+  comicBannerPagination: document.getElementById("comic-banner-pagination"),
+  comicBannerPaginationText: document.getElementById("comic-banner-pagination-text"),
+  comicBannerPaginationLimit: document.getElementById("comic-banner-pagination-limit"),
+  comicBannerPaginationWait: document.getElementById("comic-banner-pagination-wait"),
+  comicBannerPaginationGo: document.getElementById("comic-banner-pagination-go"),
   formatFilters: document.getElementById("format-filters"),
   actionStatus: document.getElementById("action-status"),
   statTotal: document.getElementById("stat-total"),
@@ -97,13 +116,25 @@ let fullscreenScrollLock = {
 let activePreset = "all";
 let currentConfig = {
   enableHD: true,
-  enableSizeSort: true,
+  enableSizeSort: false,
   enablePortraitOnly: false,
   enableAutoScan: false,
+  enableAutoScroll: false,
   enableWebPConvert: false,
   enableBatchZipDownload: false
 };
 let hasScannedOnce = false;
+let comicModeEnabled = false;
+let comicSequenceCache = null;
+let comicSequenceTask = null;
+let comicAssistState = {
+  ownedAutoScan: false
+};
+let comicPaginationInfo = null;
+let comicPaginationLoading = false;
+const COMIC_PAGINATION_DETECT_TIMEOUT_MS = 8000;
+const COMIC_PAGINATION_LIMIT_STORAGE_KEY = "comic_pagination_limit";
+const COMIC_PAGINATION_WAIT_STORAGE_KEY = "comic_pagination_wait_seconds";
 const clipboardPayloadCache = new Map();
 const CLIPBOARD_CACHE_TTL = 5 * 60 * 1000;
 const imageDimensionCache = new Map();
@@ -152,18 +183,48 @@ const UNSELECT_ALL_LABEL = "取消全选";
 
 const workspaceQueryParams = new URLSearchParams(location.search);
 const shouldAutoScanOnOpen = workspaceQueryParams.get("autoScan") === "1";
+const shouldComicModeOnOpen = workspaceQueryParams.get("comicMode") === "1";
+const sourceTabIdFromQuery = (() => {
+  const urlTabId = workspaceQueryParams.get("tabId");
+  const numeric = Number(urlTabId);
+  return Number.isInteger(numeric) ? numeric : null;
+})();
+
+const withPromiseTimeout = (promise, timeoutMs, errorMessage) =>
+  new Promise((resolve, reject) => {
+    let settled = false;
+    const timer = setTimeout(() => {
+      if (settled) return;
+      settled = true;
+      reject(new Error(errorMessage));
+    }, timeoutMs);
+
+    Promise.resolve(promise)
+      .then((value) => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        resolve(value);
+      })
+      .catch((error) => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        reject(error);
+      });
+  });
 
 const getSourceTabId = async () => {
-  const urlTabId = workspaceQueryParams.get("tabId");
-  if (urlTabId && Number.isInteger(Number(urlTabId))) {
-    return Number(urlTabId);
-  }
-  const tabs = await chrome.tabs.query({ active: true, currentWindow: true });
-  return tabs[0]?.id ?? null;
+  return sourceTabIdFromQuery;
 };
 
 const sendMessage = async (type, payload = {}) => {
-  if (!sourceTabId) sourceTabId = await getSourceTabId();
+  if (!Number.isInteger(sourceTabId)) {
+    sourceTabId = await getSourceTabId();
+  }
+  if (!Number.isInteger(sourceTabId)) {
+    return { success: false, error: "未绑定原网页标签页，请从原网页重新打开 Workspace" };
+  }
   return new Promise((resolve) => {
     chrome.runtime.sendMessage(
       { type, payload, tabId: sourceTabId },
@@ -192,6 +253,28 @@ const syncAutoScanRuntime = async (enabled) => {
   if (!response?.success) {
     const action = enabled ? "开启自动采集" : "关闭自动采集";
     setActionStatus(`${action}失败: ${response?.error || "未知错误"}`, 3200);
+    return false;
+  }
+  return true;
+};
+
+const syncAutoScrollRuntime = async (enabled, options = {}) => {
+  const response = await sendMessage(
+    enabled ? MSG.START_AUTO_SCROLL : MSG.STOP_AUTO_SCROLL,
+    enabled && options.profile ? { profile: options.profile } : {}
+  );
+  if (!response?.success) {
+    const action = enabled ? "开启自动滚动" : "关闭自动滚动";
+    setActionStatus(`${action}失败: ${response?.error || "未知错误"}`, 3200);
+    return false;
+  }
+  return true;
+};
+
+const focusSourceTabAndStartAutoScroll = async () => {
+  const response = await sendMessage(MSG.FOCUS_SOURCE_TAB_AND_START_AUTO_SCROLL);
+  if (!response?.success) {
+    setActionStatus(`切换原网页失败: ${response?.error || "未知错误"}`, 3200);
     return false;
   }
   return true;
@@ -535,6 +618,317 @@ const buildFormatOptions = (stats = {}) => {
   return options;
 };
 
+// Experimental comic mode: workspace-local only. It never changes popup flow,
+// background state shape, or the normal image collection path.
+// Once enabled, the DOM-order sequence is intentionally frozen as a baseline.
+// Later images are appended after the baseline instead of reordering the whole
+// gallery again on every incremental update.
+const invalidateComicSequenceCache = () => {
+  comicSequenceCache = null;
+  comicSequenceTask = null;
+};
+
+const fetchComicSequence = async () => {
+  if (comicSequenceCache) return comicSequenceCache;
+  if (comicSequenceTask) return await comicSequenceTask;
+
+  const task = (async () => {
+    const response = await sendMessage(MSG.GET_COMIC_SEQUENCE);
+    if (!response?.success) {
+      throw new Error(response?.error || "获取漫画顺序失败");
+    }
+    const sequence = Array.isArray(response.sequence) ? response.sequence : [];
+    comicSequenceCache = sequence;
+    return sequence;
+  })();
+
+  comicSequenceTask = task;
+  try {
+    return await task;
+  } finally {
+    if (comicSequenceTask === task) {
+      comicSequenceTask = null;
+    }
+  }
+};
+
+const applyComicSequenceOrder = async (images = []) => {
+  if (!comicModeEnabled || !Array.isArray(images) || images.length <= 1) {
+    return images;
+  }
+
+  let sequence = [];
+  try {
+    const baselineSequence = await fetchComicSequence();
+    sequence = baselineSequence;
+  } catch (error) {
+    setActionStatus(`漫画模式顺序分析失败: ${error?.message || "未知错误"}`, 3200);
+    return images;
+  }
+
+  if (!Array.isArray(sequence) || sequence.length === 0) {
+    return images;
+  }
+
+  const byNormalized = new Map();
+  for (const image of images) {
+    const normalized = String(image?.normalized || "");
+    if (!normalized || byNormalized.has(normalized)) continue;
+    byNormalized.set(normalized, image);
+  }
+
+  const ordered = [];
+  const usedIds = new Set();
+
+  for (const item of sequence) {
+    const candidate =
+      (item?.hdNormalized && byNormalized.get(item.hdNormalized)) ||
+      (item?.normalized && byNormalized.get(item.normalized));
+    if (!candidate || usedIds.has(candidate.id)) continue;
+    ordered.push(candidate);
+    usedIds.add(candidate.id);
+  }
+
+  if (ordered.length === 0) {
+    return images;
+  }
+
+  for (const image of images) {
+    if (usedIds.has(image.id)) continue;
+    ordered.push(image);
+  }
+
+  return ordered;
+};
+
+const updateComicBanner = () => {
+  if (!elements.comicBanner) return;
+  elements.comicBanner.classList.toggle("is-active", comicModeEnabled);
+  if (elements.toggleComicMode) {
+    elements.toggleComicMode.checked = comicModeEnabled;
+  }
+  if (elements.comicBannerTitle) {
+    elements.comicBannerTitle.textContent = comicModeEnabled
+      ? "当前处于漫画模式（实验性）"
+      : "漫画模式（实验性）";
+  }
+  if (elements.comicBannerDescription) {
+    if (elements.comicBannerDescriptionText) {
+      elements.comicBannerDescriptionText.textContent = "图片结果会按原网页中的阅读顺序排列。";
+    } else {
+      elements.comicBannerDescription.textContent = "图片结果会按原网页中的阅读顺序排列。";
+    }
+  }
+  if (elements.comicBannerDescriptionNote) {
+    elements.comicBannerDescriptionNote.hidden = !comicModeEnabled;
+  }
+  updateComicPaginationUi();
+};
+
+const getComicPaginationLimit = () => {
+  const el = elements.comicBannerPaginationLimit;
+  return el ? Math.max(1, Math.min(48, parseInt(el.value, 10) || 48)) : 48;
+};
+
+const getComicPaginationWaitSeconds = () => {
+  const el = elements.comicBannerPaginationWait;
+  return el ? Math.max(1, Math.min(30, parseInt(el.value, 10) || 6)) : 6;
+};
+
+const persistComicPaginationSettings = () => {
+  try {
+    chrome.storage.local.set({
+      [COMIC_PAGINATION_LIMIT_STORAGE_KEY]: getComicPaginationLimit(),
+      [COMIC_PAGINATION_WAIT_STORAGE_KEY]: getComicPaginationWaitSeconds()
+    });
+  } catch { /* ignore */ }
+};
+
+const restoreComicPaginationSettings = async () => {
+  try {
+    const stored = await chrome.storage.local.get([
+      COMIC_PAGINATION_LIMIT_STORAGE_KEY,
+      COMIC_PAGINATION_WAIT_STORAGE_KEY
+    ]);
+    const limit = Number(stored[COMIC_PAGINATION_LIMIT_STORAGE_KEY]);
+    const wait = Number(stored[COMIC_PAGINATION_WAIT_STORAGE_KEY]);
+    if (elements.comicBannerPaginationLimit && limit >= 1 && limit <= 48) {
+      elements.comicBannerPaginationLimit.value = String(limit);
+    }
+    if (elements.comicBannerPaginationWait && wait >= 1 && wait <= 30) {
+      elements.comicBannerPaginationWait.value = String(wait);
+    }
+  } catch { /* ignore */ }
+};
+
+const updateComicPaginationUi = () => {
+  const el = elements.comicBannerPagination;
+  if (!el) return;
+
+  if (!comicModeEnabled || !comicPaginationInfo?.supported) {
+    el.hidden = true;
+    return;
+  }
+
+  el.hidden = false;
+
+  if (elements.comicBannerPaginationGo) {
+    elements.comicBannerPaginationGo.disabled = comicPaginationLoading;
+  }
+  if (elements.comicBannerPaginationLimit) {
+    elements.comicBannerPaginationLimit.disabled = comicPaginationLoading;
+  }
+  if (elements.comicBannerPaginationWait) {
+    elements.comicBannerPaginationWait.disabled = comicPaginationLoading;
+  }
+};
+
+const refreshComicPaginationInfo = async () => {
+  if (!comicModeEnabled || !Number.isInteger(sourceTabId)) {
+    comicPaginationInfo = null;
+    updateComicPaginationUi();
+    return;
+  }
+
+  try {
+    const response = await withPromiseTimeout(
+      sendMessage(MSG.GET_COMIC_PAGINATION),
+      COMIC_PAGINATION_DETECT_TIMEOUT_MS,
+      "分页检测超时"
+    );
+    if (response?.success && response.pagination?.supported) {
+      comicPaginationInfo = response.pagination;
+    } else {
+      comicPaginationInfo = null;
+    }
+  } catch {
+    comicPaginationInfo = null;
+  }
+
+  updateComicPaginationUi();
+};
+
+const resetComicPaginationState = () => {
+  comicPaginationInfo = null;
+  comicPaginationLoading = false;
+  updateComicPaginationUi();
+};
+
+const loadComicPaginationPages = async () => {
+  if (!comicPaginationInfo?.supported || comicPaginationLoading) return;
+  if (!comicPaginationInfo.nextUrl) return;
+
+  const limit = getComicPaginationLimit();
+  const waitSeconds = getComicPaginationWaitSeconds();
+
+  comicPaginationLoading = true;
+  updateComicPaginationUi();
+  persistComicPaginationSettings();
+  setActionStatus("正在获取后续分页图片，请稍候…", 0);
+
+  try {
+    const response = await sendMessage(MSG.LOAD_COMIC_PAGINATION_PAGES, {
+      nextUrl: comicPaginationInfo.nextUrl,
+      limit,
+      waitSeconds
+    });
+
+    if (response?.success) {
+      const loaded = response.loadedPages || 0;
+      const added = (response.results || []).reduce((sum, r) => sum + (r.added || 0), 0);
+      setActionStatus(`分页加载完成，共加载 ${loaded} 页，新增 ${added} 张图片`, 8000);
+      invalidateComicSequenceCache();
+      await renderGallery();
+    } else {
+      setActionStatus(`分页加载失败: ${response?.error || "未知错误"}`, 8000);
+    }
+  } catch (error) {
+    setActionStatus(`分页加载出错: ${error?.message || "未知错误"}`, 8000);
+  } finally {
+    comicPaginationLoading = false;
+    updateComicPaginationUi();
+  }
+};
+
+const releaseComicRuntimeAssist = async () => {
+  const ownedAutoScan = comicAssistState.ownedAutoScan === true;
+  const configResponse = await sendMessage(MSG.GET_CONFIG);
+  const runtimeConfig = configResponse?.success ? (configResponse.config || {}) : {};
+
+  comicAssistState = {
+    ownedAutoScan: false
+  };
+
+  if (ownedAutoScan && runtimeConfig.enableAutoScan !== true) {
+    await syncAutoScanRuntime(false);
+  }
+};
+
+const ensureComicRuntimeAssist = async () => {
+  if (comicAssistState.ownedAutoScan) {
+    return true;
+  }
+
+  const configResponse = await sendMessage(MSG.GET_CONFIG);
+  const runtimeConfig = configResponse?.success ? (configResponse.config || {}) : {};
+
+  const owned = {
+    ownedAutoScan: false
+  };
+
+  if (runtimeConfig.enableAutoScan !== true) {
+    const ok = await syncAutoScanRuntime(true);
+    if (!ok) {
+      return false;
+    }
+    owned.ownedAutoScan = true;
+  }
+
+  comicAssistState = owned;
+  return true;
+};
+
+const setComicModeEnabled = async (enabled, options = {}) => {
+  const nextValue = enabled === true;
+  if (comicModeEnabled === nextValue) {
+    updateComicBanner();
+    return true;
+  }
+
+  if (nextValue && !Number.isInteger(sourceTabId)) {
+    setActionStatus("未绑定原网页，无法开启漫画模式", 2400);
+    updateComicBanner();
+    return false;
+  }
+
+  if (nextValue) {
+    const assistReady = await ensureComicRuntimeAssist();
+    if (!assistReady) {
+      updateComicBanner();
+      return false;
+    }
+  } else {
+    await releaseComicRuntimeAssist();
+  }
+
+  comicModeEnabled = nextValue;
+  invalidateComicSequenceCache();
+  updateComicBanner();
+
+  if (nextValue) {
+    refreshComicPaginationInfo().catch(() => {});
+  } else {
+    resetComicPaginationState();
+  }
+
+  if (options.showStatus !== false) {
+    setActionStatus(comicModeEnabled ? "已开启漫画模式（实验性）" : "已关闭漫画模式", 1800);
+  }
+
+  await renderGallery();
+  return true;
+};
+
 const renderFormatFilters = (stats = {}) => {
   const selected = new Set(
     Array.from(elements.formatFilters.querySelectorAll("input[type=\"checkbox\"]:checked")).map((input) => input.value)
@@ -699,20 +1093,20 @@ const restoreDownloadStatus = async () => {
 
 const scheduleRenderRefresh = () => {
   if (autoRefreshTimer) return;
-  const preserveDownloadStatus = hasActiveDownloadTask();
-  if (!preserveDownloadStatus) {
+  const preservePersistentStatus = hasActiveDownloadTask() || comicPaginationLoading;
+  if (!preservePersistentStatus) {
     setActionStatus("采集中...", -1);
   }
   autoRefreshTimer = setTimeout(() => {
     autoRefreshTimer = null;
     renderGallery()
       .then(() => {
-        if (!preserveDownloadStatus) {
+        if (!preservePersistentStatus) {
           setActionStatus("采集完成", 1200);
         }
       })
       .catch(() => {
-        if (!preserveDownloadStatus) {
+        if (!preservePersistentStatus) {
           setActionStatus("刷新失败，请重试", 2400);
         }
       });
@@ -1405,7 +1799,9 @@ const renderGallery = async () => {
   currentImages = metricAndOrientationFiltered
     .filter((image) => passesFormatFilters(image, filters.formats));
 
-  if (currentConfig.enableSizeSort) {
+  if (comicModeEnabled) {
+    currentImages = await applyComicSequenceOrder(currentImages);
+  } else if (currentConfig.enableSizeSort) {
     currentImages = currentImages.sort((a, b) => {
       const aMeta = getImageMetaForFilters(a);
       const bMeta = getImageMetaForFilters(b);
@@ -1569,20 +1965,38 @@ const hitTestSelectionCards = (rect) => {
   return hitIds;
 };
 
-const applyDragSelection = async (hitIds, appendMode) => {
+const applyDragSelection = async (hitIds, replaceMode) => {
   const targetIds = Array.from(hitIds);
-  if (appendMode) {
+  if (!replaceMode) {
+    if (targetIds.length === 0) return;
+
     const addIds = targetIds.filter((id) => !selectedIds.has(id));
-    if (addIds.length === 0) return;
-    const addResp = await sendMessage(MSG.SET_SELECTION, {
-      imageIds: addIds,
-      selected: true
-    });
-    if (!addResp.success) {
-      setActionStatus(`框选失败: ${addResp.error || "未知错误"}`, 2800);
-      return;
+    const removeIds = targetIds.filter((id) => selectedIds.has(id));
+
+    if (removeIds.length > 0) {
+      const removeResp = await sendMessage(MSG.SET_SELECTION, {
+        imageIds: removeIds,
+        selected: false
+      });
+      if (!removeResp.success) {
+        setActionStatus(`框选失败: ${removeResp.error || "未知错误"}`, 2800);
+        return;
+      }
+      selectedIds = new Set(removeResp.selectedIds || []);
     }
-    selectedIds = new Set(addResp.selectedIds || []);
+
+    if (addIds.length > 0) {
+      const addResp = await sendMessage(MSG.SET_SELECTION, {
+        imageIds: addIds,
+        selected: true
+      });
+      if (!addResp.success) {
+        setActionStatus(`框选失败: ${addResp.error || "未知错误"}`, 2800);
+        return;
+      }
+      selectedIds = new Set(addResp.selectedIds || []);
+    }
+
     await renderGallery();
     return;
   }
@@ -1650,15 +2064,14 @@ const onGalleryPointerCancel = () => {
 const onGalleryPointerUp = async (event) => {
   if (!dragSelectState) return;
   const replaceMode = dragSelectState.replaceMode || event.ctrlKey || event.metaKey;
-  const appendMode = !replaceMode;
   const moved = dragSelectState.moved;
   const hitIds = new Set(dragPreviewIds);
   teardownDragSelect();
   if (!moved) return;
 
   suppressLightboxClickUntil = Date.now() + DRAG_CLICK_SUPPRESS_MS;
-  await applyDragSelection(hitIds, appendMode);
-  setActionStatus(appendMode ? `框选追加 ${hitIds.size} 张` : `框选覆盖 ${hitIds.size} 张`, 1200);
+  await applyDragSelection(hitIds, replaceMode);
+  setActionStatus(replaceMode ? `框选覆盖 ${hitIds.size} 张` : `框选切换 ${hitIds.size} 张`, 1200);
 };
 
 const onGalleryPointerDown = (event) => {
@@ -1810,8 +2223,12 @@ const scanImages = async ({ syncAutoScanAfterScan = true } = {}) => {
       setActionStatus(`扫描失败: ${response.error || "未知错误"}`, 3200);
       return false;
     }
+    invalidateComicSequenceCache();
     hasScannedOnce = true;
     await renderGallery();
+    if (comicModeEnabled) {
+      refreshComicPaginationInfo().catch(() => {});
+    }
     if (currentConfig.enableAutoScan && syncAutoScanAfterScan) {
       const synced = await syncAutoScanRuntime(true);
       if (!synced) {
@@ -1840,6 +2257,8 @@ const clearImages = async () => {
   if (fullscreenActive) {
     closeFullscreenViewer();
   }
+  invalidateComicSequenceCache();
+  resetComicPaginationState();
   currentImages = [];
   selectedIds = new Set();
   hasScannedOnce = false;
@@ -2030,13 +2449,26 @@ const bindEvents = () => {
 
     currentConfig.enableAutoScan = checked;
     if (checked) {
+      comicAssistState.ownedAutoScan = false;
+    } else if (comicModeEnabled) {
+      const preserved = await syncAutoScanRuntime(true);
+      if (preserved) {
+        comicAssistState.ownedAutoScan = true;
+      }
+    }
+
+    if (checked) {
       if (!hasScannedOnce && currentImages.length === 0) {
         const scanned = await scanImages({ syncAutoScanAfterScan: false });
         if (!scanned) return;
       }
       setActionStatus("已开启自动采集");
     } else {
-      setActionStatus("已关闭自动采集");
+      setActionStatus(
+        comicModeEnabled && comicAssistState.ownedAutoScan
+          ? "已关闭自动采集，漫画模式仍会在后台继续采集"
+          : "已关闭自动采集"
+      );
     }
   });
 
@@ -2049,6 +2481,32 @@ const bindEvents = () => {
     }
     await renderGallery();
   });
+
+  elements.toggleComicMode.addEventListener("change", async (event) => {
+    const ok = await setComicModeEnabled(event.target.checked === true);
+    if (!ok) {
+      event.target.checked = false;
+      updateComicBanner();
+    }
+  });
+  if (elements.comicBannerAutoScrollLink) {
+    elements.comicBannerAutoScrollLink.addEventListener("click", async (event) => {
+      event.preventDefault();
+      await focusSourceTabAndStartAutoScroll();
+    });
+  }
+
+  if (elements.comicBannerPaginationGo) {
+    elements.comicBannerPaginationGo.addEventListener("click", () => {
+      loadComicPaginationPages().catch(() => {});
+    });
+  }
+  if (elements.comicBannerPaginationLimit) {
+    elements.comicBannerPaginationLimit.addEventListener("change", persistComicPaginationSettings);
+  }
+  if (elements.comicBannerPaginationWait) {
+    elements.comicBannerPaginationWait.addEventListener("change", persistComicPaginationSettings);
+  }
 
   elements.togglePortraitOnly.addEventListener("change", async (event) => {
     const checked = event.target.checked;
@@ -2211,18 +2669,24 @@ const bindEvents = () => {
     teardownDragSelect();
     unlockFullscreenPageScroll();
     clearFullscreenCache();
+    if (comicAssistState.ownedAutoScan) {
+      chrome.runtime.sendMessage({ type: MSG.STOP_AUTO_SCAN, tabId: sourceTabId }).catch(() => {});
+    }
   });
 };
 
 const init = async () => {
   sourceTabId = await getSourceTabId();
+  if (!Number.isInteger(sourceTabId)) {
+    setActionStatus("未绑定原网页标签页，请从原网页重新打开 Workspace", 4800);
+  }
   bindEvents();
 
   const configResponse = await sendMessage(MSG.GET_CONFIG);
   if (configResponse.success) {
     elements.toggleAutoScan.checked = configResponse.config.enableAutoScan === true;
     elements.toggleHd.checked = configResponse.config.enableHD !== false;
-    elements.toggleSortSize.checked = configResponse.config.enableSizeSort !== false;
+    elements.toggleSortSize.checked = configResponse.config.enableSizeSort === true;
     elements.togglePortraitOnly.checked = configResponse.config.enablePortraitOnly === true;
     elements.toggleWebP.checked = configResponse.config.enableWebPConvert === true;
     elements.toggleBatchZipDownload.checked = false;
@@ -2230,8 +2694,22 @@ const init = async () => {
     currentConfig.enableHD = elements.toggleHd.checked;
     currentConfig.enableSizeSort = elements.toggleSortSize.checked;
     currentConfig.enablePortraitOnly = elements.togglePortraitOnly.checked;
+    currentConfig.enableAutoScroll = configResponse.config.enableAutoScroll === true;
     currentConfig.enableWebPConvert = elements.toggleWebP.checked;
     currentConfig.enableBatchZipDownload = false;
+  }
+  if (elements.toggleComicMode) {
+    elements.toggleComicMode.checked = false;
+  }
+  updateComicBanner();
+
+  await restoreComicPaginationSettings();
+
+  if (shouldComicModeOnOpen) {
+    const enabled = await setComicModeEnabled(true, { showStatus: false });
+    if (!enabled) {
+      setActionStatus("漫画模式启动失败", 3200);
+    }
   }
 
   setMetricInputs(RESOLUTION_PRESETS.all);
@@ -2258,6 +2736,13 @@ chrome.runtime.onMessage.addListener((message) => {
     const downloadTabId = Number(message?.payload?.tabId);
     if (!Number.isInteger(downloadTabId) || downloadTabId !== sourceTabId) return;
     applyDownloadStatus(message.payload || null);
+    return;
+  }
+
+  if (message?.type === MSG.AUTO_SCROLL_STATE_CHANGED) {
+    const updatedTabId = Number(message?.payload?.tabId);
+    if (!Number.isInteger(updatedTabId) || updatedTabId !== sourceTabId) return;
+    currentConfig.enableAutoScroll = message?.payload?.enabled === true;
     return;
   }
 

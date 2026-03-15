@@ -14,6 +14,7 @@ const MSG = {
   START_AUTO_SCAN: "START_AUTO_SCAN",
   STOP_AUTO_SCAN: "STOP_AUTO_SCAN",
   IMAGES_UPDATED: "IMAGES_UPDATED",
+  AUTO_SCROLL_STATE_CHANGED: "AUTO_SCROLL_STATE_CHANGED",
   DOWNLOAD_PROGRESS: "DOWNLOAD_PROGRESS",
   PROBE_IMAGE_DIMENSIONS: "PROBE_IMAGE_DIMENSIONS",
   OPEN_DOWNLOAD_DIRECTORY: "OPEN_DOWNLOAD_DIRECTORY",
@@ -25,6 +26,7 @@ const elements = {
   btnScan: document.getElementById("btn-scan"),
   btnClear: document.getElementById("btn-clear"),
   btnWorkspace: document.getElementById("btn-workspace"),
+  btnComicMode: document.getElementById("btn-comic-mode"),
   btnAutoScroll: document.getElementById("btn-auto-scroll"),
   btnSelectAll: document.getElementById("btn-select-all"),
   btnDownloadSelected: document.getElementById("btn-download-selected"),
@@ -88,7 +90,7 @@ const cardDimensionTasks = new Map();
 
 let currentConfig = {
   enableHD: true,
-  enableSizeSort: true,
+  enableSizeSort: false,
   enablePortraitOnly: false,
   enableAutoScan: false,
   enableAutoScroll: false,
@@ -1183,10 +1185,17 @@ const openWorkspace = async () => {
   await chrome.tabs.create({ url: workspaceUrl });
 };
 
+const openComicMode = async () => {
+  if (!sourceTabId) sourceTabId = await getCurrentTabId();
+  const workspaceUrl = chrome.runtime.getURL(`workspace/workspace.html?tabId=${sourceTabId}&autoScan=1&comicMode=1`);
+  await chrome.tabs.create({ url: workspaceUrl });
+};
+
 const bindEvents = () => {
   elements.btnScan.addEventListener("click", scanImages);
   elements.btnClear.addEventListener("click", clearImages);
   elements.btnWorkspace.addEventListener("click", openWorkspace);
+  elements.btnComicMode.addEventListener("click", openComicMode);
   elements.btnSelectAll.addEventListener("click", toggleSelectAll);
   elements.btnDownloadSelected.addEventListener("click", downloadSelected);
   elements.btnCopySelected.addEventListener("click", copySelected);
@@ -1402,7 +1411,7 @@ const init = async () => {
   if (configResponse.success) {
     elements.toggleHd.checked = configResponse.config.enableHD !== false;
     elements.toggleAutoScan.checked = configResponse.config.enableAutoScan === true;
-    elements.toggleSortSize.checked = configResponse.config.enableSizeSort !== false;
+    elements.toggleSortSize.checked = configResponse.config.enableSizeSort === true;
     elements.togglePortraitOnly.checked = configResponse.config.enablePortraitOnly === true;
     elements.toggleWebP.checked = configResponse.config.enableWebPConvert === true;
     elements.toggleBatchZipDownload.checked = false;
@@ -1449,6 +1458,17 @@ chrome.runtime.onMessage.addListener((message) => {
     if (!Number.isInteger(updatedTabId) || updatedTabId !== sourceTabId) return;
     if (manualScanInProgress) return;
     scheduleRenderRefresh();
+    return;
+  }
+
+  if (message?.type === MSG.AUTO_SCROLL_STATE_CHANGED) {
+    const updatedTabId = Number(message?.payload?.tabId);
+    if (!Number.isInteger(updatedTabId) || updatedTabId !== sourceTabId) return;
+    const enabled = message?.payload?.enabled === true;
+    setAutoScrollButtonState(enabled);
+    if (!enabled && message?.payload?.finished === true) {
+      setActionStatus("当前页面已无新增内容，自动滚动已停止", 2200);
+    }
   }
 });
 

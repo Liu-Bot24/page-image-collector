@@ -7,11 +7,14 @@ globalThis.__PIC_COLLECTOR_CONTENT_READY__ = true;
 const MSG = {
   SCAN_IMAGES: "SCAN_IMAGES",
   INCREMENTAL_SCAN: "INCREMENTAL_SCAN",
+  GET_COMIC_SEQUENCE: "GET_COMIC_SEQUENCE",
+  GET_COMIC_PAGINATION: "GET_COMIC_PAGINATION",
   TOGGLE_RIGHT_CLICK: "TOGGLE_RIGHT_CLICK",
   START_AUTO_SCAN: "START_AUTO_SCAN",
   STOP_AUTO_SCAN: "STOP_AUTO_SCAN",
   START_AUTO_SCROLL: "START_AUTO_SCROLL",
   STOP_AUTO_SCROLL: "STOP_AUTO_SCROLL",
+  AUTO_SCROLL_STOPPED: "AUTO_SCROLL_STOPPED",
   COPY_IMAGE_DATA_URL: "COPY_IMAGE_DATA_URL",
   CLEAR_RUNTIME_CACHE: "CLEAR_RUNTIME_CACHE"
 };
@@ -1651,6 +1654,271 @@ const scanImages = () => {
   return merged.sort((a, b) => (Number(b.area) || 0) - (Number(a.area) || 0));
 };
 
+// === Comic Pagination Detection (Experimental, Isolated) ===
+// Detection is deliberately conservative: it only flags pagination when there is
+// unambiguous structural evidence inside a dedicated pagination container. Pages
+// that lack a real pagination widget (plain text, single-page sites, etc.) must
+// NEVER be reported as paginated.
+
+const COMIC_PAGINATION_SELECTORS =
+  ".pager, .pagination, .pg, .pgs, .page-links, .wp-pagenavi, " +
+  "[class*='page-numbers'], [id*='pager'], [id*='pagination'], " +
+  "nav[aria-label*='page' i], nav[aria-label*='next' i]";
+
+const PAGINATION_QUERY_KEY_RE = /^(?:p|pg|pn|page|page_no|pageno|pageid|chapter|chap|ch|index|paged)$/i;
+
+const NEXT_LABEL_RE = /^(?:下一页|下页|next|›|»|>|→)$/i;
+const PREV_LABEL_RE = /^(?:上一页|上页|prev|previous|‹|«|<|←)$/i;
+
+const normalizePaginationHref = (url) => {
+  if (!url) return null;
+  try {
+    const parsed = new URL(url, location.href);
+    if (!/^https?:$/i.test(parsed.protocol)) return null;
+    parsed.hash = "";
+    return parsed.toString();
+  } catch {
+    return null;
+  }
+};
+
+const normalizePaginationPath = (pathname) =>
+  String(pathname || "").replace(/\/+/g, "/").replace(/\/$/, "").replace(/\.(?:html?|php|aspx?|jsp)$/i, "");
+
+const extractPageNumber = (text) => {
+  const raw = String(text || "").replace(/\s+/g, " ").trim();
+  if (!raw) return null;
+  if (/^\d{1,6}$/.test(raw)) return Number(raw);
+  if (NEXT_LABEL_RE.test(raw) || PREV_LABEL_RE.test(raw)) return null;
+  const contextual = raw.match(/(?:^|[^\d])(\d{1,6})(?:\s*页)?\s*$/u);
+  return contextual ? Number(contextual[1]) : null;
+};
+
+const extractPathPaginationToken = (pathname) => {
+  const normalized = normalizePaginationPath(pathname);
+  if (!normalized) return null;
+  const explicit = normalized.match(/^(.*?)(?:\/|_|-)(?:page|pg|p|chapter|chap|ch|index)(?:\/|_|-)?(\d{1,6})$/i);
+  if (explicit) return { base: explicit[1], page: Number(explicit[2]) };
+  const separated = normalized.match(/^(.*?)(?:\/|_|-)(\d{1,6})$/);
+  if (separated) return { base: separated[1], page: Number(separated[2]) };
+  return null;
+};
+
+const hasPaginationQueryTransition = (currentParsed, candidateParsed) => {
+  const keys = new Set([
+    ...Array.from(currentParsed.searchParams.keys()),
+    ...Array.from(candidateParsed.searchParams.keys())
+  ]);
+  for (const key of keys) {
+    if (!PAGINATION_QUERY_KEY_RE.test(key)) continue;
+    const cv = currentParsed.searchParams.get(key);
+    const nv = candidateParsed.searchParams.get(key);
+    if (nv === null || !/^\d{1,6}$/.test(nv)) continue;
+    if (cv === null || Number(nv) > Number(cv)) return true;
+  }
+  return false;
+};
+
+const isLikelyPaginationTransition = (currentHref, candidateHref) => {
+  try {
+    const cur = new URL(currentHref, location.href);
+    const can = new URL(candidateHref, location.href);
+    if (cur.origin !== can.origin) return false;
+    if (cur.toString() === can.toString()) return false;
+    if (hasPaginationQueryTransition(cur, can)) return true;
+    const ct = extractPathPaginationToken(cur.pathname);
+    const nt = extractPathPaginationToken(can.pathname);
+    if (ct && nt && ct.base === nt.base) return nt.page > ct.page;
+    if (!ct && nt) {
+      if (nt.base === normalizePaginationPath(cur.pathname)) return true;
+    }
+    return false;
+  } catch {
+    return false;
+  }
+};
+
+const readNodeSignature = (node) => {
+  if (!(node instanceof Element)) return "";
+  const cls = typeof node.className === "string" ? node.className : String(node.className?.baseVal || "");
+  return [node.tagName || "", cls, node.id || "", node.getAttribute?.("rel") || "",
+    node.getAttribute?.("aria-label") || "", node.getAttribute?.("title") || ""].join(" ").toLowerCase();
+};
+
+const scorePaginationContainer = (container) => {
+  if (!(container instanceof Element)) return null;
+  const currentUrl = normalizePaginationHref(location.href);
+  const anchors = Array.from(container.querySelectorAll("a[href]"));
+  const links = [];
+  const seen = new Set();
+  let score = 0;
+  let numericCount = 0;
+  let nextCount = 0;
+  let prevCount = 0;
+  let pagerSignalCount = 0;
+
+  for (const anchor of anchors) {
+    const href = normalizePaginationHref(anchor.getAttribute("href") || anchor.href);
+    if (!href || seen.has(href) || isLikelyImageHref(href)) continue;
+    let parsed;
+    try { parsed = new URL(href, location.href); } catch { continue; }
+    if (parsed.origin !== location.origin) continue;
+
+    const text = String(anchor.textContent || "").trim();
+    const page = extractPageNumber(text);
+    const sig = `${readNodeSignature(container)} ${readNodeSignature(anchor)}`;
+    const isNext = anchor.rel?.includes?.("next") === true || /\b(next|nxt)\b/i.test(sig) || NEXT_LABEL_RE.test(text);
+    const isPrev = anchor.rel?.includes?.("prev") === true || /\b(prev|previous)\b/i.test(sig) || PREV_LABEL_RE.test(text);
+    const hasPagerSig = /\b(pager|pagination|page-numbers|pg|pages?)\b/i.test(sig);
+    const hasTransition = currentUrl ? isLikelyPaginationTransition(currentUrl, href) : false;
+
+    if (!isNext && !isPrev && page === null && !hasPagerSig) continue;
+
+    let s = 0;
+    if (hasPagerSig) s += 4;
+    if (page !== null) s += 4;
+    if (isNext || isPrev) s += 5;
+    if (hasTransition) s += 5;
+    if (href === currentUrl) s += 1;
+
+    seen.add(href);
+    links.push({ url: href, label: text, pageNumber: page, isNext, isPrev, hasTransition,
+      isCurrent: anchor.matches(".current, [aria-current='page']") });
+    if (page !== null) numericCount++;
+    if (isNext) nextCount++;
+    if (isPrev) prevCount++;
+    if (hasPagerSig) pagerSignalCount++;
+    score += s;
+  }
+
+  if (links.length === 0) return null;
+
+  const currentPageNode = container.querySelector(
+    ".current, [aria-current='page'], strong, em, .pager-num.current, .page-numbers.current"
+  );
+  const currentPage = currentPageNode ? extractPageNumber(currentPageNode.textContent || "") : null;
+
+  return { score, links, currentPage, numericCount, nextCount, prevCount, pagerSignalCount };
+};
+
+const buildComicPagination = () => {
+  const currentUrl = normalizePaginationHref(location.href);
+  if (!currentUrl) return { supported: false, currentUrl: location.href };
+
+  const containers = new Set();
+  try {
+    for (const node of document.querySelectorAll(COMIC_PAGINATION_SELECTORS)) {
+      if (node instanceof Element) containers.add(node);
+    }
+  } catch { /* ignore */ }
+
+  for (const anchor of document.querySelectorAll("a[href]")) {
+    const text = String(anchor.textContent || "").trim();
+    const sig = readNodeSignature(anchor);
+    if (
+      NEXT_LABEL_RE.test(text) || PREV_LABEL_RE.test(text) ||
+      /\b(next|prev|pager|pagination|page-numbers|pg)\b/i.test(sig)
+    ) {
+      const parent = (() => { try { return anchor.closest(COMIC_PAGINATION_SELECTORS); } catch { return null; } })()
+        || anchor.parentElement;
+      if (parent instanceof Element) containers.add(parent);
+    }
+  }
+
+  let best = null;
+  for (const container of containers) {
+    const candidate = scorePaginationContainer(container);
+    if (!candidate || candidate.links.length === 0) continue;
+    if (!best || candidate.score > best.score) best = candidate;
+  }
+
+  if (!best || best.links.length === 0) return { supported: false, currentUrl };
+
+  const currentPage = best.currentPage;
+  const pageUrls = [];
+  const seenUrls = new Set();
+  let nextUrl = "";
+
+  for (const link of best.links) {
+    if (!link?.url || link.url === currentUrl || seenUrls.has(link.url)) continue;
+    const fwdByNum = currentPage !== null && link.pageNumber !== null && link.pageNumber > currentPage;
+    const fwdByUnknown = currentPage === null && link.pageNumber !== null;
+    if (link.isNext && !nextUrl) nextUrl = link.url;
+    if (!link.isNext && !fwdByNum && !fwdByUnknown) continue;
+    seenUrls.add(link.url);
+    pageUrls.push({ url: link.url, pageNumber: link.pageNumber });
+  }
+  if (nextUrl && !seenUrls.has(nextUrl)) {
+    pageUrls.push({ url: nextUrl, pageNumber: null });
+  }
+
+  const forwardUrls = [...new Set([...pageUrls.map((i) => i.url), nextUrl].filter(Boolean))];
+  const transitionCount = forwardUrls.filter((u) => isLikelyPaginationTransition(currentUrl, u)).length;
+  const numericFwdCount = pageUrls.reduce((c, i) => c + (Number.isInteger(i.pageNumber) ? 1 : 0), 0);
+  const hasStructural = best.pagerSignalCount >= 1 || best.numericCount >= 2 ||
+    (best.nextCount > 0 && best.prevCount > 0);
+  const hasReliableFlow = currentPage !== null
+    ? numericFwdCount > 0 && (hasStructural || transitionCount > 0)
+    : numericFwdCount >= 2 && transitionCount > 0;
+  const supported = best.score >= 6 && hasReliableFlow;
+
+  return {
+    supported,
+    currentUrl,
+    currentPage,
+    totalPages: null,
+    nextUrl,
+    candidates: forwardUrls
+  };
+};
+
+// Comic mode is experimental and intentionally isolated from the normal scan path.
+// It only builds a DOM-order sequence hint for Workspace to reorder already collected images.
+const isLikelyComicImage = (record) => {
+  const width = Number(record?.width) || 0;
+  const height = Number(record?.height) || 0;
+  const area = Math.max(Number(record?.area) || 0, width * height);
+  if (width <= 0 || height <= 0) return false;
+  if (width >= 180 || height >= 180) return true;
+  return area >= 50000;
+};
+
+const buildComicSequence = () => {
+  const sequence = [];
+  const seen = new Set();
+  const scopes = collectShadowRoots(document);
+
+  for (const scope of scopes) {
+    const imageElements = [];
+    if (scope instanceof Element && scope.matches("img, picture")) {
+      imageElements.push(scope);
+    }
+    imageElements.push(...scope.querySelectorAll("img, picture"));
+
+    for (const element of imageElements) {
+      const extracted =
+        element.tagName === "PICTURE"
+          ? extractFromPicture(element)
+          : extractFromImg(element);
+      const record = normalizeImageRecord(extracted);
+      if (!record || !isLikelyComicImage(record)) continue;
+      if (seen.has(record.normalized)) continue;
+      seen.add(record.normalized);
+
+      const hdNormalized = normalizeUrl(record.hdSrc);
+      sequence.push({
+        normalized: record.normalized,
+        hdNormalized: hdNormalized && hdNormalized !== record.normalized ? hdNormalized : "",
+        width: Number(record.width) || 0,
+        height: Number(record.height) || 0,
+        sourceUrl: record.sourceUrl || ""
+      });
+    }
+  }
+
+  return sequence;
+};
+
 let rightClickEnabled = false;
 let unlockStyleNode = null;
 let unlockInterval = null;
@@ -1728,7 +1996,18 @@ const autoScanMutationRoots = new Set();
 let autoScrollEnabled = false;
 let autoScrollTimer = null;
 let autoScrollStallCount = 0;
+let autoScrollIdleCount = 0;
 let autoScrollLastHeight = 0;
+let autoScrollLastObservedCount = 0;
+let autoScrollProfile = "normal";
+let autoScrollStartedAt = 0;
+let autoScrollLastGrowthAt = 0;
+let autoScrollStableHeight = 0;
+let autoScrollStableCount = 0;
+let autoScrollStableSince = 0;
+let autoScrollExpectedTop = 0;
+let autoScrollProgrammaticUntil = 0;
+let autoScrollUserIntentUntil = 0;
 const AUTO_SCROLL_INTERVAL_MS = 680;
 const AUTO_SCROLL_SETTLE_INTERVAL_MS = 980;
 const AUTO_SCROLL_STEP_MIN = 280;
@@ -1737,6 +2016,15 @@ const AUTO_SCROLL_STEP_RATIO = 0.72;
 const AUTO_SCROLL_STALL_RETRY_EVERY = 5;
 const AUTO_SCROLL_NUDGE_BACK_MAX = 220;
 const AUTO_SCROLL_HEIGHT_GROWTH_THRESHOLD = 24;
+const AUTO_SCROLL_BOTTOM_THRESHOLD = 8;
+const AUTO_SCROLL_IDLE_STOP_TICKS = 8;
+const AUTO_SCROLL_COMIC_INTERVAL_MS = 430;
+const AUTO_SCROLL_COMIC_SETTLE_INTERVAL_MS = 620;
+const AUTO_SCROLL_COMIC_STEP_MIN = 360;
+const AUTO_SCROLL_COMIC_STEP_MAX = 820;
+const AUTO_SCROLL_COMIC_STEP_RATIO = 0.82;
+const AUTO_SCROLL_COMIC_EARLY_STOP_MS = 12000;
+const AUTO_SCROLL_COMIC_HEIGHT_GROWTH_THRESHOLD = 96;
 
 const recordKnownImages = (images) => {
   for (const image of images) {
@@ -1928,25 +2216,140 @@ const getScrollMetrics = () => {
   };
 };
 
-const scheduleAutoScrollTick = (delayMs = AUTO_SCROLL_INTERVAL_MS) => {
+const getAutoScrollObservedCount = () => {
+  if (autoScrollProfile === "comic") {
+    return buildComicSequence().length;
+  }
+  if (autoScanEnabled) {
+    return knownNormalizedUrls.size;
+  }
+  return Number(document.images?.length) || 0;
+};
+
+const hasPendingAutoScrollGrowthSignals = () => {
+  if (!autoScanEnabled) return false;
+  return autoScanDirty || autoScanMutationRoots.size > 0 || autoScanTimer !== null;
+};
+
+const getAutoScrollProfileConfig = () => {
+  if (autoScrollProfile === "comic") {
+    return {
+      intervalMs: AUTO_SCROLL_COMIC_INTERVAL_MS,
+      settleIntervalMs: AUTO_SCROLL_COMIC_SETTLE_INTERVAL_MS,
+      stepMin: AUTO_SCROLL_COMIC_STEP_MIN,
+      stepMax: AUTO_SCROLL_COMIC_STEP_MAX,
+      stepRatio: AUTO_SCROLL_COMIC_STEP_RATIO,
+      earlyStopMs: AUTO_SCROLL_COMIC_EARLY_STOP_MS,
+      heightGrowthThreshold: AUTO_SCROLL_COMIC_HEIGHT_GROWTH_THRESHOLD
+    };
+  }
+
+  return {
+    intervalMs: AUTO_SCROLL_INTERVAL_MS,
+    settleIntervalMs: AUTO_SCROLL_SETTLE_INTERVAL_MS,
+    stepMin: AUTO_SCROLL_STEP_MIN,
+    stepMax: AUTO_SCROLL_STEP_MAX,
+    stepRatio: AUTO_SCROLL_STEP_RATIO,
+    earlyStopMs: 0,
+    heightGrowthThreshold: AUTO_SCROLL_HEIGHT_GROWTH_THRESHOLD
+  };
+};
+
+const reportAutoScrollStopped = (reason = "complete") => {
+  chrome.runtime.sendMessage({
+    type: MSG.AUTO_SCROLL_STOPPED,
+    payload: { reason }
+  }).catch(() => {});
+};
+
+const completeAutoScroll = (reason = "complete") => {
+  stopAutoScroll();
+  reportAutoScrollStopped(reason);
+};
+
+const markAutoScrollUserIntent = (durationMs = 1400) => {
+  if (!autoScrollEnabled) return;
+  autoScrollUserIntentUntil = Date.now() + Math.max(300, Number(durationMs) || 1400);
+};
+
+const updateAutoScrollIdleState = (metrics, options = {}) => {
+  const {
+    heightGrewBefore = false,
+    heightGrewAfter = false,
+    imageCountGrew = false
+  } = options;
+  const now = Date.now();
+  const profile = getAutoScrollProfileConfig();
+  if (heightGrewBefore || heightGrewAfter || imageCountGrew) {
+    autoScrollLastGrowthAt = now;
+  }
+  const nearBottom = metrics.scrollTop >= metrics.maxTop - AUTO_SCROLL_BOTTOM_THRESHOLD;
+  const pendingGrowthSignals = hasPendingAutoScrollGrowthSignals();
+  const noMeasuredGrowth =
+    !heightGrewBefore &&
+    !heightGrewAfter &&
+    !imageCountGrew;
+  const shouldIdle =
+    nearBottom &&
+    noMeasuredGrowth &&
+    !pendingGrowthSignals;
+
+  if (shouldIdle) {
+    autoScrollIdleCount += 1;
+    if (autoScrollIdleCount >= AUTO_SCROLL_IDLE_STOP_TICKS) {
+      completeAutoScroll("complete");
+      return true;
+    }
+    return false;
+  }
+
+  if (
+    autoScrollProfile === "comic" &&
+    profile.earlyStopMs > 0
+  ) {
+    const meaningfulHeightGrowth = metrics.scrollHeight > autoScrollStableHeight + profile.heightGrowthThreshold;
+    const meaningfulCountGrowth = getAutoScrollObservedCount() > autoScrollStableCount;
+
+    if (meaningfulHeightGrowth || meaningfulCountGrowth) {
+      autoScrollStableHeight = Math.max(autoScrollStableHeight, metrics.scrollHeight);
+      autoScrollStableCount = Math.max(autoScrollStableCount, getAutoScrollObservedCount());
+      autoScrollStableSince = now;
+    } else if ((now - autoScrollStableSince) >= profile.earlyStopMs) {
+      completeAutoScroll("complete");
+      return true;
+    }
+  }
+
+  autoScrollIdleCount = 0;
+  return false;
+};
+
+const scheduleAutoScrollTick = (delayMs = getAutoScrollProfileConfig().intervalMs) => {
   if (!autoScrollEnabled || autoScrollTimer) return;
   autoScrollTimer = setTimeout(() => {
     autoScrollTimer = null;
     if (!autoScrollEnabled) return;
 
+    const profile = getAutoScrollProfileConfig();
     const metrics = getScrollMetrics();
     if (metrics.maxTop <= 0) {
+      const observedCount = getAutoScrollObservedCount();
+      const imageCountGrew = observedCount > autoScrollLastObservedCount;
+      autoScrollLastObservedCount = observedCount;
       autoScrollLastHeight = metrics.scrollHeight;
-      scheduleAutoScrollTick(AUTO_SCROLL_SETTLE_INTERVAL_MS);
+      if (updateAutoScrollIdleState(metrics, { imageCountGrew })) {
+        return;
+      }
+      scheduleAutoScrollTick(profile.settleIntervalMs);
       return;
     }
 
     const heightGrewSinceLastTick =
-      metrics.scrollHeight > autoScrollLastHeight + AUTO_SCROLL_HEIGHT_GROWTH_THRESHOLD;
-    const stepRatio = heightGrewSinceLastTick ? 0.62 : AUTO_SCROLL_STEP_RATIO;
+      metrics.scrollHeight > autoScrollLastHeight + profile.heightGrowthThreshold;
+    const stepRatio = heightGrewSinceLastTick ? 0.62 : profile.stepRatio;
     const step = Math.min(
-      AUTO_SCROLL_STEP_MAX,
-      Math.max(AUTO_SCROLL_STEP_MIN, Math.round(metrics.viewportHeight * stepRatio))
+      profile.stepMax,
+      Math.max(profile.stepMin, Math.round(metrics.viewportHeight * stepRatio))
     );
     const nearBottom = metrics.scrollTop >= metrics.maxTop - 4;
     let targetTop = Math.min(metrics.maxTop, metrics.scrollTop + step);
@@ -1960,6 +2363,8 @@ const scheduleAutoScrollTick = (delayMs = AUTO_SCROLL_INTERVAL_MS) => {
       targetTop = metrics.maxTop;
     }
 
+    autoScrollExpectedTop = targetTop;
+    autoScrollProgrammaticUntil = Date.now() + 900;
     window.scrollTo({
       top: targetTop,
       behavior: "auto"
@@ -1968,9 +2373,11 @@ const scheduleAutoScrollTick = (delayMs = AUTO_SCROLL_INTERVAL_MS) => {
     requestAnimationFrame(() => {
       if (!autoScrollEnabled) return;
       const nextMetrics = getScrollMetrics();
+      const observedCount = getAutoScrollObservedCount();
       const heightGrewAfterScroll =
         nextMetrics.scrollHeight >
-        Math.max(autoScrollLastHeight, metrics.scrollHeight) + AUTO_SCROLL_HEIGHT_GROWTH_THRESHOLD;
+        Math.max(autoScrollLastHeight, metrics.scrollHeight) + profile.heightGrowthThreshold;
+      const imageCountGrew = observedCount > autoScrollLastObservedCount;
       const moved = Math.abs(nextMetrics.scrollTop - metrics.scrollTop) > 4;
       const stillNearBottom = nextMetrics.scrollTop >= nextMetrics.maxTop - 4;
 
@@ -1981,32 +2388,97 @@ const scheduleAutoScrollTick = (delayMs = AUTO_SCROLL_INTERVAL_MS) => {
       }
 
       autoScrollLastHeight = nextMetrics.scrollHeight;
+      autoScrollLastObservedCount = observedCount;
+      if (updateAutoScrollIdleState(nextMetrics, {
+        heightGrewBefore: heightGrewSinceLastTick,
+        heightGrewAfter: heightGrewAfterScroll,
+        imageCountGrew
+      })) {
+        return;
+      }
       const nextDelay =
         heightGrewSinceLastTick || heightGrewAfterScroll
-          ? AUTO_SCROLL_SETTLE_INTERVAL_MS
-          : AUTO_SCROLL_INTERVAL_MS;
+          ? profile.settleIntervalMs
+          : profile.intervalMs;
       scheduleAutoScrollTick(nextDelay);
     });
-  }, Math.max(80, Number(delayMs) || AUTO_SCROLL_INTERVAL_MS));
+  }, Math.max(80, Number(delayMs) || getAutoScrollProfileConfig().intervalMs));
 };
 
-const startAutoScroll = () => {
+const startAutoScroll = (profile = "normal") => {
+  const nextProfile = profile === "comic" ? "comic" : "normal";
+  autoScrollProfile = nextProfile;
   if (autoScrollEnabled) return;
   autoScrollEnabled = true;
   autoScrollStallCount = 0;
+  autoScrollIdleCount = 0;
+  autoScrollStartedAt = Date.now();
+  autoScrollLastGrowthAt = autoScrollStartedAt;
   autoScrollLastHeight = getScrollMetrics().scrollHeight;
-  scheduleAutoScrollTick(180);
+  autoScrollLastObservedCount = getAutoScrollObservedCount();
+  autoScrollStableHeight = autoScrollLastHeight;
+  autoScrollStableCount = autoScrollLastObservedCount;
+  autoScrollStableSince = autoScrollStartedAt;
+  autoScrollExpectedTop = getScrollMetrics().scrollTop;
+  autoScrollProgrammaticUntil = 0;
+  autoScrollUserIntentUntil = 0;
+  scheduleAutoScrollTick(autoScrollProfile === "comic" ? 120 : 180);
 };
 
 const stopAutoScroll = () => {
   autoScrollEnabled = false;
   autoScrollStallCount = 0;
+  autoScrollIdleCount = 0;
   autoScrollLastHeight = 0;
+  autoScrollLastObservedCount = 0;
+  autoScrollProfile = "normal";
+  autoScrollStartedAt = 0;
+  autoScrollLastGrowthAt = 0;
+  autoScrollStableHeight = 0;
+  autoScrollStableCount = 0;
+  autoScrollStableSince = 0;
+  autoScrollExpectedTop = 0;
+  autoScrollProgrammaticUntil = 0;
+  autoScrollUserIntentUntil = 0;
   if (autoScrollTimer) {
     clearTimeout(autoScrollTimer);
     autoScrollTimer = null;
   }
 };
+
+window.addEventListener("wheel", (event) => {
+  if (!autoScrollEnabled || !event.isTrusted) return;
+  if (Math.abs(Number(event.deltaY) || 0) < 4) return;
+  completeAutoScroll("manual_interrupt");
+}, { passive: true, capture: true });
+
+window.addEventListener("mousedown", (event) => {
+  if (!autoScrollEnabled || !event.isTrusted) return;
+  markAutoScrollUserIntent(1600);
+}, true);
+
+window.addEventListener("touchstart", (event) => {
+  if (!autoScrollEnabled || !event.isTrusted) return;
+  markAutoScrollUserIntent(1800);
+}, { passive: true, capture: true });
+
+window.addEventListener("keydown", (event) => {
+  if (!autoScrollEnabled || !event.isTrusted) return;
+  if (!["ArrowUp", "ArrowDown", "PageUp", "PageDown", "Home", "End", " ", "Spacebar"].includes(event.key)) {
+    return;
+  }
+  completeAutoScroll("manual_interrupt");
+}, true);
+
+window.addEventListener("scroll", () => {
+  if (!autoScrollEnabled) return;
+  const now = Date.now();
+  if (now <= autoScrollProgrammaticUntil) return;
+  if (now > autoScrollUserIntentUntil) return;
+  const currentTop = getScrollMetrics().scrollTop;
+  if (Math.abs(currentTop - autoScrollExpectedTop) <= 56) return;
+  completeAutoScroll("manual_interrupt");
+}, { passive: true, capture: true });
 
 chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
   switch (message?.type) {
@@ -2014,6 +2486,16 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
       const images = scanImages();
       recordKnownImages(images);
       sendResponse({ success: true, images, count: images.length });
+      break;
+    }
+
+    case MSG.GET_COMIC_SEQUENCE: {
+      sendResponse({ success: true, sequence: buildComicSequence() });
+      break;
+    }
+
+    case MSG.GET_COMIC_PAGINATION: {
+      sendResponse({ success: true, pagination: buildComicPagination() });
       break;
     }
 
@@ -2036,7 +2518,7 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
     }
 
     case MSG.START_AUTO_SCROLL: {
-      startAutoScroll();
+      startAutoScroll(message?.payload?.profile || message?.profile || "normal");
       sendResponse({ success: true });
       break;
     }
