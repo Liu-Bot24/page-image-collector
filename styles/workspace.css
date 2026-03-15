@@ -82,6 +82,199 @@ body {
   gap: 10px;
 }
 
+.comic-banner {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+  padding: 14px 20px;
+  background:
+    linear-gradient(90deg, rgba(8, 47, 73, 0.92), rgba(17, 24, 39, 0.92)),
+    linear-gradient(180deg, rgba(6, 182, 212, 0.08), rgba(59, 130, 246, 0.03));
+  border-top: 1px solid rgba(14, 165, 233, 0.18);
+  border-bottom: 1px solid rgba(51, 65, 85, 0.95);
+}
+
+.comic-banner.is-active {
+  background:
+    linear-gradient(90deg, rgba(12, 74, 110, 0.96), rgba(9, 27, 44, 0.96)),
+    linear-gradient(180deg, rgba(34, 211, 238, 0.14), rgba(59, 130, 246, 0.05));
+  border-top-color: rgba(34, 211, 238, 0.38);
+}
+
+.comic-banner-copy {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  min-width: 0;
+}
+
+.comic-banner-title {
+  font-size: 14px;
+  font-weight: 700;
+  color: #d8f5ff;
+}
+
+.comic-banner-description {
+  font-size: 12px;
+  line-height: 1.5;
+  color: #9cc6db;
+}
+
+.comic-banner-description-note {
+  color: inherit;
+}
+
+.comic-banner-description-note .comic-banner-link {
+  color: inherit;
+  text-decoration: underline;
+  text-underline-offset: 2px;
+  font-weight: 700;
+}
+
+.comic-banner-description-note .comic-banner-link:hover,
+.comic-banner-description-note .comic-banner-link:active {
+  color: #cfe6f2;
+}
+
+.comic-banner.is-active .comic-banner-title {
+  color: #eefcff;
+}
+
+.comic-banner.is-active .comic-banner-description {
+  color: #c7e8f7;
+}
+
+.comic-banner-toggle {
+  flex: 0 0 auto;
+}
+
+.comic-banner-pagination {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+  margin-top: 4px;
+  font-size: 12px;
+  line-height: 1.5;
+  color: #f6b782;
+}
+
+.comic-banner-pagination[hidden] {
+  display: none;
+}
+
+.comic-banner-pagination-text {
+  color: #f6b782;
+}
+
+.comic-banner-pagination-label,
+.comic-banner-pagination-suffix {
+  color: #f0b98d;
+}
+
+.comic-banner-pagination-select {
+  appearance: none;
+  -webkit-appearance: none;
+  min-width: 48px;
+  height: 24px;
+  padding: 0 16px;
+  text-align: center;
+  text-align-last: center;
+  border: 1px solid rgba(246, 183, 130, 0.4);
+  border-radius: 999px;
+  background-color: #111b2b;
+  background-image:
+    linear-gradient(180deg, rgba(255, 255, 255, 0.03), rgba(255, 255, 255, 0));
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.03);
+  color: #f7c79a;
+  font-size: 12px;
+  font-weight: 600;
+  line-height: 22px;
+  cursor: pointer;
+  transition: var(--transition);
+  color-scheme: dark;
+  vertical-align: middle;
+}
+
+.comic-banner-pagination-select:hover,
+.comic-banner-pagination-select:focus {
+  border-color: rgba(246, 183, 130, 0.58);
+  outline: none;
+  background-color: #132032;
+}
+
+.comic-banner-pagination-select option,
+.comic-banner-pagination-select optgroup {
+  background: #111b2b;
+  color: #f7c79a;
+  text-align: center;
+}
+
+.comic-banner-pagination-input {
+  width: 42px;
+  height: 24px;
+  padding: 0 8px;
+  border: 1px solid rgba(246, 183, 130, 0.4);
+  border-radius: 999px;
+  background-color: #111b2b;
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.03);
+  color: #f7c79a;
+  font: inherit;
+  line-height: 24px;
+  text-align: center;
+}
+
+.comic-banner-pagination-input:hover,
+.comic-banner-pagination-input:focus {
+  border-color: rgba(246, 183, 130, 0.58);
+  outline: none;
+  background-color: #132032;
+}
+
+.comic-banner-pagination-input::-webkit-outer-spin-button,
+.comic-banner-pagination-input::-webkit-inner-spin-button {
+  margin: 0;
+}
+
+.comic-banner-pagination-go {
+  appearance: none;
+  -webkit-appearance: none;
+  width: 42px;
+  height: 24px;
+  padding: 0 2px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  border: 1px solid rgba(246, 183, 130, 0.42);
+  background: linear-gradient(180deg, rgba(246, 183, 130, 0.24), rgba(246, 183, 130, 0.16));
+  color: #ffe0c1;
+  border-radius: 8px;
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.06);
+  cursor: pointer;
+  transition: var(--transition);
+  vertical-align: middle;
+}
+
+.comic-banner-pagination-go svg {
+  width: 28px;
+  height: 14px;
+}
+
+.comic-banner-pagination-go:hover,
+.comic-banner-pagination-go:active {
+  border-color: rgba(246, 183, 130, 0.68);
+  background: linear-gradient(180deg, rgba(246, 183, 130, 0.34), rgba(246, 183, 130, 0.24));
+  color: #fff0e0;
+}
+
+.comic-banner-pagination-go:disabled,
+.comic-banner-pagination-select:disabled,
+.comic-banner-pagination-input:disabled {
+  opacity: 0.65;
+  cursor: default;
+}
+
 .top-left {
   display: flex;
   align-items: center;
@@ -951,6 +1144,11 @@ input[type="number"]::-webkit-inner-spin-button {
   .row-top,
   .row-resolution {
     justify-content: flex-start;
+  }
+
+  .comic-banner {
+    flex-wrap: wrap;
+    align-items: flex-start;
   }
 
   .row-actions {

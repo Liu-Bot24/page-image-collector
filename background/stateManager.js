@@ -18,7 +18,7 @@ const NOISE_QUERY_KEYS = new Set([
 
 const DEFAULT_CONFIG = Object.freeze({
   enableHD: true,
-  enableSizeSort: true,
+  enableSizeSort: false,
   enablePortraitOnly: false,
   enableAutoScan: false,
   enableAutoScroll: false,
@@ -363,7 +363,7 @@ const normalizeConfig = (config = {}, partial = false) => {
     next.enableHD = config.enableHD !== false;
   }
   if (!partial || Object.prototype.hasOwnProperty.call(config, "enableSizeSort")) {
-    next.enableSizeSort = config.enableSizeSort !== false;
+    next.enableSizeSort = config.enableSizeSort === true;
   }
   if (!partial || Object.prototype.hasOwnProperty.call(config, "enablePortraitOnly")) {
     next.enablePortraitOnly = config.enablePortraitOnly === true;

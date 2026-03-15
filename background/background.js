@@ -5,6 +5,7 @@ const MSG = {
   SCAN_IMAGES: "SCAN_IMAGES",
   INCREMENTAL_SCAN: "INCREMENTAL_SCAN",
   IMAGES_UPDATED: "IMAGES_UPDATED",
+  AUTO_SCROLL_STATE_CHANGED: "AUTO_SCROLL_STATE_CHANGED",
   GET_IMAGES: "GET_IMAGES",
   TOGGLE_SELECT: "TOGGLE_SELECT",
   SET_SELECTION: "SET_SELECTION",
@@ -16,11 +17,16 @@ const MSG = {
   COPY_TO_CLIPBOARD: "COPY_TO_CLIPBOARD",
   SET_CONFIG: "SET_CONFIG",
   GET_CONFIG: "GET_CONFIG",
+  GET_COMIC_SEQUENCE: "GET_COMIC_SEQUENCE",
+  GET_COMIC_PAGINATION: "GET_COMIC_PAGINATION",
+  LOAD_COMIC_PAGINATION_PAGES: "LOAD_COMIC_PAGINATION_PAGES",
   TOGGLE_RIGHT_CLICK: "TOGGLE_RIGHT_CLICK",
   START_AUTO_SCAN: "START_AUTO_SCAN",
   STOP_AUTO_SCAN: "STOP_AUTO_SCAN",
   START_AUTO_SCROLL: "START_AUTO_SCROLL",
   STOP_AUTO_SCROLL: "STOP_AUTO_SCROLL",
+  AUTO_SCROLL_STOPPED: "AUTO_SCROLL_STOPPED",
+  FOCUS_SOURCE_TAB_AND_START_AUTO_SCROLL: "FOCUS_SOURCE_TAB_AND_START_AUTO_SCROLL",
   DOWNLOAD_PROGRESS: "DOWNLOAD_PROGRESS",
   COPY_IMAGE_DATA_URL: "COPY_IMAGE_DATA_URL",
   PROBE_IMAGE_DIMENSIONS: "PROBE_IMAGE_DIMENSIONS",
@@ -32,6 +38,7 @@ const MSG = {
 
 const CONTEXT_MENU_IDS = {
   SCAN_OPEN_WORKSPACE: "pic-collector-scan-open-workspace",
+  SCAN_OPEN_WORKSPACE_COMIC: "pic-collector-scan-open-workspace-comic",
   IMAGE_ACTIONS_PARENT: "pic-collector-image-actions-parent",
   VIEW_ORIGINAL_IMAGE: "pic-collector-view-original-image",
   COPY_ORIGINAL_IMAGE: "pic-collector-copy-original-image",
@@ -546,18 +553,129 @@ const copyOriginalImageByUrl = async (tabId, url) => {
   };
 };
 
-const openWorkspaceAndScan = async (tabId) => {
+const openWorkspaceAndScan = async (tabId, options = {}) => {
   if (!tabId) return { success: false, error: "No active tab id" };
-  const workspaceUrl = chrome.runtime.getURL(`workspace/workspace.html?tabId=${tabId}&autoScan=1`);
+  const params = new URLSearchParams({
+    tabId: String(tabId),
+    autoScan: "1"
+  });
+  if (options.comicMode === true) {
+    params.set("comicMode", "1");
+  }
+  const workspaceUrl = chrome.runtime.getURL(`workspace/workspace.html?${params.toString()}`);
   await chrome.tabs.create({ url: workspaceUrl });
   return { success: true };
 };
+
+// === Comic Pagination Page Loading (Experimental, Isolated) ===
+
+const COMIC_PAGE_GRACE_MS = 500;
+
+const waitForTabComplete = (tabId, timeoutMs = 30000) =>
+  new Promise((resolve) => {
+    let settled = false;
+    const cleanup = () => {
+      if (settled) return;
+      settled = true;
+      try { chrome.tabs.onUpdated.removeListener(onUpdated); } catch { /* ignore */ }
+      clearTimeout(timer);
+    };
+    const onUpdated = (id, info) => {
+      if (id !== tabId || info.status !== "complete") return;
+      cleanup();
+      resolve();
+    };
+    const timer = setTimeout(() => { cleanup(); resolve(); }, Math.max(5000, timeoutMs));
+    chrome.tabs.onUpdated.addListener(onUpdated);
+    chrome.tabs.get(tabId)
+      .then((tab) => { if (tab?.status === "complete" && !settled) { cleanup(); resolve(); } })
+      .catch(() => { cleanup(); resolve(); });
+  });
+
+const loadComicPaginationPages = async (sourceTabId, startUrl, options = {}) => {
+  const maxPages = Math.max(1, Math.min(48, Number(options.limit) || 48));
+  const waitMs = Math.max(1000, Math.min(30000, (Number(options.waitSeconds) || 6) * 1000));
+  const results = [];
+  const seen = new Set();
+  let nextUrl = startUrl;
+
+  while (nextUrl && results.length < maxPages) {
+    if (seen.has(nextUrl)) break;
+    seen.add(nextUrl);
+    const url = nextUrl;
+    nextUrl = null;
+    let tab = null;
+    try {
+      tab = await chrome.tabs.create({ url, active: false });
+      await waitForTabComplete(tab.id, waitMs);
+      await new Promise((r) => setTimeout(r, COMIC_PAGE_GRACE_MS));
+
+      const scan = await sendMessageToTab(tab.id, { type: MSG.SCAN_IMAGES });
+      if (scan?.success && Array.isArray(scan.images) && scan.images.length > 0) {
+        const merge = stateManager.mergeImages(sourceTabId, scan.images);
+        results.push({ url, success: true, added: merge.added || 0 });
+      } else {
+        results.push({ url, success: true, added: 0 });
+      }
+
+      const paginationResult = await sendMessageToTab(tab.id, { type: MSG.GET_COMIC_PAGINATION });
+      if (paginationResult?.success && paginationResult.pagination?.supported && paginationResult.pagination.nextUrl) {
+        nextUrl = paginationResult.pagination.nextUrl;
+      }
+
+      notifyImagesUpdated(sourceTabId);
+    } catch (error) {
+      results.push({ url, success: false, error: error?.message || "加载失败" });
+    } finally {
+      if (tab?.id) { try { await chrome.tabs.remove(tab.id); } catch { /* ignore */ } }
+    }
+  }
+
+  notifyImagesUpdated(sourceTabId);
+  return { success: true, results, loadedPages: results.length };
+};
+
+const delay = (ms) => new Promise((resolve) => setTimeout(resolve, Math.max(0, Number(ms) || 0)));
+const withTimeout = (promise, timeoutMs, errorMessage) =>
+  new Promise((resolve, reject) => {
+    let settled = false;
+    const timer = setTimeout(() => {
+      if (settled) return;
+      settled = true;
+      reject(new Error(errorMessage || "操作超时"));
+    }, Math.max(0, Number(timeoutMs) || 0));
+
+    Promise.resolve(promise)
+      .then((value) => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        resolve(value);
+      })
+      .catch((error) => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        reject(error);
+      });
+  });
 
 const notifyImagesUpdated = (tabId) => {
   if (!Number.isInteger(tabId)) return;
   chrome.runtime.sendMessage({
     type: MSG.IMAGES_UPDATED,
     payload: { tabId }
+  }).catch(() => {});
+};
+
+const notifyAutoScrollStateChanged = (tabId, payload = {}) => {
+  if (!Number.isInteger(tabId)) return;
+  chrome.runtime.sendMessage({
+    type: MSG.AUTO_SCROLL_STATE_CHANGED,
+    payload: {
+      tabId,
+      ...payload
+    }
   }).catch(() => {});
 };
 
@@ -1455,11 +1573,47 @@ const syncRightClickForTab = async (tabId, enabled, options = {}) => {
 
 const syncAutoScrollForTab = async (tabId, enabled, options = {}) => {
   const result = await sendMessageToTab(tabId, {
-    type: enabled === true ? MSG.START_AUTO_SCROLL : MSG.STOP_AUTO_SCROLL
+    type: enabled === true ? MSG.START_AUTO_SCROLL : MSG.STOP_AUTO_SCROLL,
+    payload: enabled === true && options.profile ? { profile: options.profile } : {}
   }, options);
   return {
     success: result?.success === true,
     error: result?.error || "同步自动滚动状态失败"
+  };
+};
+
+const focusSourceTabAndStartAutoScroll = async (tabId) => {
+  if (!Number.isInteger(tabId)) {
+    return { success: false, error: "No active tab id" };
+  }
+
+  try {
+    await chrome.tabs.update(tabId, { active: true });
+  } catch (error) {
+    return { success: false, error: error?.message || "切换原网页失败" };
+  }
+
+  const autoScanResult = await sendMessageToTab(tabId, {
+    type: MSG.START_AUTO_SCAN
+  }, { retryOnNoReceiver: false });
+
+  const autoScrollResult = await sendMessageToTab(tabId, {
+    type: MSG.START_AUTO_SCROLL,
+    payload: { profile: "comic" }
+  }, { retryOnNoReceiver: false });
+
+  if (autoScrollResult?.success !== false) {
+    notifyAutoScrollStateChanged(tabId, {
+      enabled: true,
+      reason: "workspace_jump",
+      finished: false
+    });
+  }
+
+  return {
+    success: autoScrollResult?.success !== false,
+    autoScanSuccess: autoScanResult?.success !== false,
+    error: autoScrollResult?.error || ""
   };
 };
 
@@ -1487,6 +1641,10 @@ const handleMessage = async (message, sender) => {
       return await openSourceUrlInTab(tabId, sourceUrl);
     }
 
+    case MSG.FOCUS_SOURCE_TAB_AND_START_AUTO_SCROLL: {
+      return await focusSourceTabAndStartAutoScroll(tabId);
+    }
+
     case MSG.SCAN: {
       if (!tabId) return { success: false, error: "No active tab id" };
       return await runScanForTab(tabId);
@@ -1503,6 +1661,20 @@ const handleMessage = async (message, sender) => {
         notifyImagesUpdated(tabId);
       }
       return { success: true, ...merged };
+    }
+
+    case MSG.AUTO_SCROLL_STOPPED: {
+      if (!tabId) return { success: false, error: "No active tab id" };
+      const config = stateManager.getConfig(tabId);
+      if (config.enableAutoScroll === true) {
+        stateManager.setConfig(tabId, { enableAutoScroll: false });
+      }
+      notifyAutoScrollStateChanged(tabId, {
+        enabled: false,
+        reason: String(payload.reason || "complete"),
+        finished: true
+      });
+      return { success: true };
     }
 
     case MSG.GET_IMAGES: {
@@ -1734,6 +1906,11 @@ const handleMessage = async (message, sender) => {
             config: restoredConfig
           };
         }
+        notifyAutoScrollStateChanged(tabId, {
+          enabled: config.enableAutoScroll === true,
+          reason: config.enableAutoScroll === true ? "manual_start" : "manual_stop",
+          finished: false
+        });
       }
 
       return { success: true, config };
@@ -1742,6 +1919,37 @@ const handleMessage = async (message, sender) => {
     case MSG.GET_CONFIG: {
       if (!tabId) return { success: false, error: "No active tab id" };
       return { success: true, config: stateManager.getConfig(tabId) };
+    }
+
+    case MSG.GET_COMIC_SEQUENCE: {
+      if (!tabId) return { success: false, error: "No active tab id" };
+      const result = await sendMessageToTab(tabId, { type: MSG.GET_COMIC_SEQUENCE });
+      if (!result?.success) {
+        return { success: false, error: result?.error || "获取漫画顺序失败" };
+      }
+      return {
+        success: true,
+        sequence: Array.isArray(result.sequence) ? result.sequence : []
+      };
+    }
+
+    case MSG.GET_COMIC_PAGINATION: {
+      if (!tabId) return { success: false, error: "No active tab id" };
+      const result = await sendMessageToTab(tabId, { type: MSG.GET_COMIC_PAGINATION });
+      if (!result?.success) {
+        return { success: false, error: result?.error || "获取分页信息失败" };
+      }
+      return { success: true, pagination: result.pagination || { supported: false } };
+    }
+
+    case MSG.LOAD_COMIC_PAGINATION_PAGES: {
+      if (!tabId) return { success: false, error: "No active tab id" };
+      const startUrl = payload.nextUrl;
+      if (!startUrl) return { success: false, error: "No next URL provided" };
+      return await loadComicPaginationPages(tabId, startUrl, {
+        limit: payload.limit,
+        waitSeconds: payload.waitSeconds
+      });
     }
 
     case MSG.GET_DOWNLOAD_STATUS: {
@@ -1783,7 +1991,10 @@ const handleMessage = async (message, sender) => {
 
     case MSG.START_AUTO_SCROLL: {
       if (!tabId) return { success: false, error: "No active tab id" };
-      const result = await sendMessageToTab(tabId, { type: MSG.START_AUTO_SCROLL });
+      const result = await sendMessageToTab(tabId, {
+        type: MSG.START_AUTO_SCROLL,
+        payload: payload.profile ? { profile: payload.profile } : {}
+      });
       return { success: result?.success !== false };
     }
 
@@ -1901,6 +2112,12 @@ const createContextMenu = async () => {
     });
 
     await upsertContextMenuItem({
+      id: CONTEXT_MENU_IDS.SCAN_OPEN_WORKSPACE_COMIC,
+      title: "扫描当前页面图片（漫画模式）",
+      contexts: ["page"]
+    });
+
+    await upsertContextMenuItem({
       id: CONTEXT_MENU_IDS.IMAGE_ACTIONS_PARENT,
       title: "图片操作",
       contexts: ["image"]
@@ -1952,6 +2169,11 @@ chrome.contextMenus.onClicked.addListener(async (info, tab) => {
 
   if (info.menuItemId === CONTEXT_MENU_IDS.SCAN_OPEN_WORKSPACE) {
     await openWorkspaceAndScan(tab.id);
+    return;
+  }
+
+  if (info.menuItemId === CONTEXT_MENU_IDS.SCAN_OPEN_WORKSPACE_COMIC) {
+    await openWorkspaceAndScan(tab.id, { comicMode: true });
     return;
   }
 
