@@ -88,13 +88,18 @@ const elements = {
   fullscreenLoading: document.getElementById("fullscreen-loading"),
   fullscreenPrev: document.getElementById("fullscreen-prev"),
   fullscreenNext: document.getElementById("fullscreen-next"),
-  fullscreenClose: document.getElementById("fullscreen-close")
+  fullscreenClose: document.getElementById("fullscreen-close"),
+  layoutMode: document.getElementById("layout-mode"),
+  zoomSlider: document.getElementById("zoom-slider"),
+  zoomValue: document.getElementById("zoom-value")
 };
 
 let sourceTabId = null;
 let currentImages = [];
 let selectedIds = new Set();
 const hiddenImageIds = new Set();
+let currentLayoutMode = "grid";
+let currentZoom = 100;
 let lightboxImage = null;
 let lightboxMode = "preview";
 let lightboxCurrentSrc = "";
@@ -1920,6 +1925,81 @@ const toggleHideSelected = async () => {
   await renderGallery();
 };
 
+const BASE_ROW_HEIGHT = 220;
+
+const getImageAspectRatio = (image) => {
+  const cached = cardDimensionCache.get(image.id);
+  const w = cached?.width || Number(image.width) || 0;
+  const h = cached?.height || Number(image.height) || 0;
+  return w > 0 && h > 0 ? w / h : 1;
+};
+
+const applyGalleryLayout = () => {
+  const gallery = elements.gallery;
+  const isWaterfall = currentLayoutMode === "waterfall";
+  gallery.classList.toggle("layout-waterfall", isWaterfall);
+
+  const scale = currentZoom / 100;
+  if (!isWaterfall) {
+    const baseMin = 220;
+    const minWidth = Math.round(baseMin * scale);
+    gallery.style.gridTemplateColumns = `repeat(auto-fill, minmax(${minWidth}px, 1fr))`;
+    gallery.style.removeProperty("--wf-row-height");
+    for (const card of gallery.querySelectorAll(".gallery-card")) {
+      card.style.removeProperty("width");
+      card.style.removeProperty("height");
+    }
+    return;
+  }
+
+  gallery.style.removeProperty("grid-template-columns");
+  const rowHeight = Math.round(BASE_ROW_HEIGHT * scale);
+  const gap = 12;
+  const padding = 24;
+  const containerWidth = gallery.clientWidth - padding * 2;
+  if (containerWidth <= 0) return;
+
+  const cards = Array.from(gallery.querySelectorAll(".gallery-card"));
+  const images = currentImages;
+  let idx = 0;
+
+  while (idx < cards.length) {
+    let rowWidth = 0;
+    let rowEnd = idx;
+
+    while (rowEnd < cards.length) {
+      const ratio = getImageAspectRatio(images[rowEnd]);
+      const cardWidth = rowHeight * ratio;
+      const prospective = rowWidth + cardWidth + (rowEnd > idx ? gap : 0);
+      if (rowEnd > idx && prospective > containerWidth * 1.15) break;
+      rowWidth = prospective;
+      rowEnd++;
+      if (rowWidth >= containerWidth * 0.85) break;
+    }
+
+    if (rowEnd === idx) rowEnd = idx + 1;
+
+    const rowCards = cards.slice(idx, rowEnd);
+    const totalGap = (rowCards.length - 1) * gap;
+    const availableWidth = containerWidth - totalGap;
+    const sumRatios = rowCards.reduce((s, _, i) => s + getImageAspectRatio(images[idx + i]), 0);
+    let finalHeight = Math.round(availableWidth / sumRatios);
+    const maxHeight = Math.round(rowHeight * 1.5);
+    const isLastRow = rowEnd >= cards.length;
+    if (finalHeight > maxHeight) finalHeight = isLastRow ? rowHeight : maxHeight;
+
+    const footerHeight = 36;
+    for (let i = 0; i < rowCards.length; i++) {
+      const ratio = getImageAspectRatio(images[idx + i]);
+      const w = Math.round(finalHeight * ratio);
+      rowCards[i].style.width = `${w}px`;
+      rowCards[i].style.height = `${finalHeight + footerHeight}px`;
+    }
+
+    idx = rowEnd;
+  }
+};
+
 const createCard = (image, index) => {
   const resolved = resolvedHdUrlMap.get(image.id);
   const displaySrc = resolved || image.displaySrc || image.src;
@@ -2063,6 +2143,7 @@ const renderGallery = async () => {
     fragment.appendChild(createCard(image, index));
   }
   elements.gallery.appendChild(fragment);
+  applyGalleryLayout();
 
   syncSelectAllButtonLabel();
   syncHideToggleButton();
@@ -2587,6 +2668,21 @@ const bindEvents = () => {
   elements.btnCopyBatch.addEventListener("click", copyBatch);
   elements.btnOpenDownloadDir.addEventListener("click", openDownloadDirectory);
   elements.gallery.addEventListener("pointerdown", onGalleryPointerDown);
+
+  elements.layoutMode.addEventListener("change", () => {
+    currentLayoutMode = elements.layoutMode.value;
+    applyGalleryLayout();
+  });
+
+  elements.zoomSlider.addEventListener("input", () => {
+    currentZoom = Number(elements.zoomSlider.value) || 100;
+    elements.zoomValue.textContent = `${currentZoom}%`;
+    applyGalleryLayout();
+  });
+
+  window.addEventListener("resize", () => {
+    if (currentLayoutMode === "waterfall") applyGalleryLayout();
+  });
 
   elements.resolutionPresets.addEventListener("click", (event) => {
     const target = event.target;

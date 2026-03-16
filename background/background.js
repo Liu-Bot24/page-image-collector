@@ -42,7 +42,8 @@ const CONTEXT_MENU_IDS = {
   IMAGE_ACTIONS_PARENT: "pic-collector-image-actions-parent",
   VIEW_ORIGINAL_IMAGE: "pic-collector-view-original-image",
   COPY_ORIGINAL_IMAGE: "pic-collector-copy-original-image",
-  DOWNLOAD_ORIGINAL_IMAGE: "pic-collector-download-original-image"
+  DOWNLOAD_ORIGINAL_IMAGE: "pic-collector-download-original-image",
+  TOGGLE_UNLOCK_RIGHT_CLICK: "pic-collector-toggle-unlock-right-click"
 };
 const SINAIMG_REFERER_RULE_ID = 10086;
 const JPG_CONVERT_QUALITY = 1.0;
@@ -2025,6 +2026,10 @@ const handleMessage = async (message, sender) => {
             config: restoredConfig
           };
         }
+        try {
+          chrome.contextMenus.update(CONTEXT_MENU_IDS.TOGGLE_UNLOCK_RIGHT_CLICK,
+            { checked: config.enableRightClick === true }, () => chrome.runtime.lastError);
+        } catch { /* ignore */ }
       }
 
       if (Object.prototype.hasOwnProperty.call(payload, "enableAutoScan")) {
@@ -2123,6 +2128,10 @@ const handleMessage = async (message, sender) => {
         };
       }
 
+      try {
+        chrome.contextMenus.update(CONTEXT_MENU_IDS.TOGGLE_UNLOCK_RIGHT_CLICK,
+          { checked: config.enableRightClick === true }, () => chrome.runtime.lastError);
+      } catch { /* ignore */ }
       return { success: true, enabled: config.enableRightClick };
     }
 
@@ -2192,6 +2201,10 @@ const handleTabUpdated = async (tabId, changeInfo) => {
   if (config.enableRightClick) {
     await syncRightClickForTab(tabId, true);
   }
+  try {
+    chrome.contextMenus.update(CONTEXT_MENU_IDS.TOGGLE_UNLOCK_RIGHT_CLICK,
+      { checked: config.enableRightClick === true }, () => chrome.runtime.lastError);
+  } catch { /* ignore */ }
 
   if (config.enableAutoScan) {
     await runScanForTab(tabId).catch(() => ({ success: false }));
@@ -2264,6 +2277,14 @@ const createContextMenu = async () => {
       id: CONTEXT_MENU_IDS.SCAN_OPEN_WORKSPACE_COMIC,
       title: "扫描当前页面图片（漫画模式）",
       contexts: ["page"]
+    });
+
+    await upsertContextMenuItem({
+      id: CONTEXT_MENU_IDS.TOGGLE_UNLOCK_RIGHT_CLICK,
+      title: "解锁右键",
+      contexts: ["page"],
+      type: "checkbox",
+      checked: false
     });
 
     await upsertContextMenuItem({
@@ -2343,6 +2364,21 @@ chrome.contextMenus.onClicked.addListener(async (info, tab) => {
   if (info.menuItemId === CONTEXT_MENU_IDS.DOWNLOAD_ORIGINAL_IMAGE) {
     const contextUrl = pickContextImageUrl(info);
     await downloadOriginalImageByUrl(tab.id, contextUrl);
+    return;
+  }
+
+  if (info.menuItemId === CONTEXT_MENU_IDS.TOGGLE_UNLOCK_RIGHT_CLICK) {
+    const enabled = info.checked === true;
+    const previousConfig = stateManager.getConfig(tab.id);
+    const config = stateManager.setConfig(tab.id, { enableRightClick: enabled });
+    const result = await syncRightClickForTab(tab.id, config.enableRightClick);
+    if (!result.success) {
+      stateManager.setConfig(tab.id, { enableRightClick: previousConfig.enableRightClick === true });
+      try {
+        chrome.contextMenus.update(CONTEXT_MENU_IDS.TOGGLE_UNLOCK_RIGHT_CLICK,
+          { checked: previousConfig.enableRightClick === true }, () => chrome.runtime.lastError);
+      } catch { /* ignore */ }
+    }
   }
 });
 

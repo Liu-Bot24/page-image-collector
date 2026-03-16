@@ -60,6 +60,36 @@ body {
   justify-content: flex-start;
 }
 
+.metric-filter select {
+  padding: 4px 8px;
+  background: var(--bg);
+  border: 1px solid var(--border-color);
+  border-radius: 8px;
+  color: var(--text-primary);
+  font-size: 12px;
+}
+
+.metric-filter select:focus {
+  outline: none;
+  border-color: var(--primary-color);
+}
+
+.zoom-control input[type="range"] {
+  width: 100px;
+  height: 4px;
+  accent-color: var(--primary-color);
+  cursor: pointer;
+  border-radius: 2px;
+}
+
+.zoom-val {
+  font-size: 11px;
+  min-width: 32px;
+  text-align: right;
+  font-variant-numeric: tabular-nums;
+  color: var(--text-primary);
+}
+
 .row-formats {
   justify-content: flex-start;
 }
@@ -690,6 +720,28 @@ input[type="number"]::-webkit-inner-spin-button {
   align-content: start;
   position: relative;
   overflow-y: auto;
+}
+
+.gallery.layout-waterfall {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: flex-start;
+  align-content: flex-start;
+  gap: 12px;
+}
+
+.gallery.layout-waterfall .gallery-card {
+  flex: none;
+}
+
+.gallery.layout-waterfall .card-image {
+  aspect-ratio: unset;
+}
+
+.gallery.layout-waterfall .card-image img {
+  width: 100%;
+  height: auto;
+  object-fit: contain;
 }
 
 .gallery.drag-select-active {

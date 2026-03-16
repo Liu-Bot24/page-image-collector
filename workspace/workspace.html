@@ -57,6 +57,21 @@
           </label>
       </div>
 
+      <div class="console-row row-resolution">
+        <label class="metric-filter">
+          <span>布局</span>
+          <select id="layout-mode">
+            <option value="grid">网格</option>
+            <option value="waterfall">瀑布流</option>
+          </select>
+        </label>
+        <label class="metric-filter zoom-control">
+          <span>缩放</span>
+          <input type="range" id="zoom-slider" min="50" max="200" value="100" step="10">
+          <span id="zoom-value" class="zoom-val">100%</span>
+        </label>
+      </div>
+
       <div class="console-row row-formats">
         <div class="filter-formats compact" id="format-filters">
           <span class="format-loading">格式统计中...</span>
@@ -84,6 +99,7 @@
             <span>最小像素</span>
             <select id="filter-min-mp">
               <option value="0">不限</option>
+              <option value="70000">≥ 0.07 MP</option>
               <option value="500000">≥ 0.50 MP</option>
               <option value="921600">≥ 0.92 MP</option>
               <option value="1000000">≥ 1.00 MP</option>

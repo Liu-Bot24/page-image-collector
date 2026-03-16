@@ -5,7 +5,12 @@
 ## 文档
 
 - 隐私政策：[PRIVACY.md](./PRIVACY.md)
-- GitHub Releases 推荐安装包：`page-image-collector-1.2.2-unpacked.zip`
+- GitHub Releases 推荐安装包：`page-image-collector-1.2.3-unpacked.zip`
+
+## 1.2.3 更新
+
+- 右键菜单新增「解锁右键」入口，与 Popup 开关状态联动
+- Workspace 新增布局模式切换：网格（默认）/ 瀑布流，瀑布流按原始比例完整展示图片
 
 ## 1.2.2 更新
 
@@ -75,6 +80,7 @@
 - 全屏查看与切换
 - 批量下载与 ZIP 打包
 - 漫画模式：阅读顺序排列、自动分页检测与加载
+- 布局切换：支持网格与瀑布流两种浏览模式
 - 承接 Popup 已采集结果，继续筛选与处理
 
 ## 使用方式
@@ -115,7 +121,7 @@
   - 批量下载 ZIP
   - 自动滚动（Popup）
   - 自动采集
-  - 解锁右键（Popup）
+  - 解锁右键（Popup / 右键菜单）
 
 ## 下载与复制
 
@@ -153,6 +159,7 @@
 - 页面空白处（子菜单）：
   - 扫描当前页面图片
   - 扫描当前页面图片（漫画模式）
+  - 解锁右键
 - 图片元素上（子菜单）：
   - 查看原图
   - 复制原图
@@ -163,7 +170,7 @@
 ### 从 GitHub Releases 安装（推荐）
 
 1. 进入项目的 `Releases` 页面
-2. 下载对应版本的解压包，例如 `page-image-collector-1.2.2-unpacked.zip`
+2. 下载对应版本的解压包，例如 `page-image-collector-1.2.3-unpacked.zip`
 3. 打开 `chrome://extensions/`
 4. 开启“开发者模式”
 5. 解压下载的 ZIP 文件
@@ -215,5 +222,5 @@
 
 ## 版本信息
 
-- 版本：`1.2.2`
+- 版本：`1.2.3`
 - Manifest：`MV3`
