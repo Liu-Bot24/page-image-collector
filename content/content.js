@@ -270,6 +270,8 @@ const isLikelyWeiboContentUrl = (url) => {
   }
 };
 
+const IMAGE_EXT_RE = /\.(jpg|jpeg|png|webp|gif|svg|avif|bmp)(?:$|[?#])/i;
+
 const sourceQualityScore = (url, order = 0) => {
   try {
     const parsed = new URL(url, location.href);
@@ -284,8 +286,10 @@ const sourceQualityScore = (url, order = 0) => {
     if (/xhscdn\.com$/i.test(host)) score += 90;
 
     if (/\/(large|original|orj360)\//i.test(path)) score += 70;
+    if (/(^|[/_-])(origin|original|orig|large|full|raw|source)(?:[/_-]|$)/i.test(path)) score += 52;
+    if (/(^|[/_-])(small|thumb|thumbnail|preview|avatar|icon|tiny|mini)(?:[/_-]|$)/i.test(path)) score -= 56;
     if (/\/mw\d+\//i.test(path)) score += 42;
-    if (/\.(jpg|jpeg|png|webp|gif|svg|avif|bmp)(?:$|\?)/i.test(url)) score += 18;
+    if (IMAGE_EXT_RE.test(url)) score += 18;
     if (/[?&](Expires|ssig|KID)=/i.test(query)) score -= 32;
     else score += 22;
 
@@ -325,12 +329,147 @@ const chooseBestSource = (candidates = []) => {
   return ranked[0].url;
 };
 
+const EMBEDDED_IMAGE_URL_RE = /(?:https?:)?\/\/[^\s"'<>`\\]+?\.(?:jpg|jpeg|png|webp|gif|svg|avif|bmp)(?:[?#][^\s"'<>`\\]*)?/gi;
+const QUOTED_IMAGE_PATH_RE = /['"`]([^'"`<>]+?\.(?:jpg|jpeg|png|webp|gif|svg|avif|bmp)(?:[?#][^'"`<>]*)?)['"`]/gi;
+
+const decodeCandidateText = (value) => {
+  let text = String(value || "").trim();
+  if (!text) return "";
+  text = text
+    .replace(/\\u002F/gi, "/")
+    .replace(/\\u003A/gi, ":")
+    .replace(/\\u003F/gi, "?")
+    .replace(/\\u003D/gi, "=")
+    .replace(/\\u0026/gi, "&")
+    .replace(/\\\//g, "/")
+    .replace(/&amp;/gi, "&");
+
+  for (let i = 0; i < 2; i += 1) {
+    try {
+      const decoded = decodeURIComponent(text);
+      if (!decoded || decoded === text) break;
+      text = decoded;
+    } catch {
+      break;
+    }
+  }
+  return text;
+};
+
+const stripWrappedPunctuation = (value) =>
+  String(value || "")
+    .trim()
+    .replace(/^[('"`\[\s]+/, "")
+    .replace(/[)'"\]`,.;\s]+$/g, "");
+
+const toImageCandidateUrl = (value) => {
+  const cleaned = stripWrappedPunctuation(value);
+  if (!cleaned) return null;
+  const absolute = absoluteUrl(cleaned);
+  if (!absolute || isInvalidSource(absolute)) return null;
+  if (!isLikelyImageHref(absolute)) return null;
+  return absolute;
+};
+
+const looksLikeStandaloneImageText = (value) => {
+  const text = stripWrappedPunctuation(value);
+  if (!text) return false;
+  if (/\s/.test(text)) return false;
+  if (/^(?:https?:\/\/|\/\/|\/(?!\/)|\.\.?\/)/i.test(text)) return true;
+  if (/[=&]/.test(text)) return false;
+  return IMAGE_EXT_RE.test(text);
+};
+
+const extractImageUrlsFromText = (value) => {
+  if (!value) return [];
+
+  const seen = new Set();
+  const picked = [];
+  const push = (candidate) => {
+    const normalized = toImageCandidateUrl(candidate);
+    if (!normalized || seen.has(normalized)) return;
+    seen.add(normalized);
+    picked.push(normalized);
+  };
+
+  const raw = String(value || "");
+  const decoded = decodeCandidateText(raw);
+
+  for (const text of [raw, decoded]) {
+    if (!text) continue;
+    if (looksLikeStandaloneImageText(text)) {
+      push(text);
+    }
+
+    EMBEDDED_IMAGE_URL_RE.lastIndex = 0;
+    let absMatch;
+    while ((absMatch = EMBEDDED_IMAGE_URL_RE.exec(text)) !== null) {
+      push(absMatch[0]);
+    }
+
+    QUOTED_IMAGE_PATH_RE.lastIndex = 0;
+    let quotedMatch;
+    while ((quotedMatch = QUOTED_IMAGE_PATH_RE.exec(text)) !== null) {
+      push(quotedMatch[1]);
+    }
+  }
+
+  return picked;
+};
+
+const extractImageCandidatesFromLinkLikeValue = (value) => {
+  const rawText = String(value || "");
+  if (!rawText) return [];
+
+  const seen = new Set();
+  const candidates = [];
+  const push = (url) => {
+    if (!url || seen.has(url)) return;
+    seen.add(url);
+    candidates.push(url);
+  };
+
+  for (const extracted of extractImageUrlsFromText(rawText)) {
+    push(extracted);
+  }
+
+  const absolute = absoluteUrl(rawText);
+  if (!absolute) return candidates;
+  if (!isInvalidSource(absolute) && isLikelyImageHref(absolute)) {
+    push(absolute);
+  }
+
+  try {
+    const parsed = new URL(absolute, location.href);
+    if (!/^https?:$/i.test(parsed.protocol)) {
+      return candidates;
+    }
+    const textCandidates = [
+      parsed.search ? parsed.search.slice(1) : "",
+      parsed.hash ? parsed.hash.slice(1) : ""
+    ];
+    for (const [key, val] of parsed.searchParams.entries()) {
+      textCandidates.push(key);
+      textCandidates.push(val);
+    }
+    for (const text of textCandidates) {
+      for (const extracted of extractImageUrlsFromText(text)) {
+        push(extracted);
+      }
+    }
+  } catch {
+    // Ignore parse failures and keep text-extracted candidates.
+  }
+
+  return candidates;
+};
+
 const isLikelyImageHref = (url) => {
   if (!url) return false;
   try {
     const parsed = new URL(url, location.href);
     const pathname = parsed.pathname || "";
-    if (/\.(jpg|jpeg|png|webp|gif|svg|avif|bmp)(?:$|[?#])/i.test(pathname)) return true;
+    if (IMAGE_EXT_RE.test(pathname)) return true;
 
     const format = parsed.searchParams.get("format");
     if (format && /^(jpg|jpeg|png|webp|gif|svg|avif|bmp)$/i.test(format)) return true;
@@ -1064,14 +1203,83 @@ const resolveSourceUrl = (element) => {
   return picked || getCurrentPageSourceUrl();
 };
 
-const getAnchorImageCandidate = (element) => {
-  const anchor = element?.closest?.("a[href]");
-  if (!anchor) return null;
+const IMAGE_LINK_HINT_ATTRIBUTES = [
+  "href",
+  "data-href",
+  "data-url",
+  "data-src",
+  "data-original",
+  "data-original-src",
+  "data-lazy-src",
+  "data-actualsrc",
+  "data-image",
+  "data-img",
+  "data-pic",
+  "data-large-image",
+  "data-zoom-image",
+  "data-full",
+  "data-full-src",
+  "data-fullsrc",
+  "data-highres",
+  "data-lightbox",
+  "data-fancybox",
+  "data-fancybox-href",
+  "onclick",
+  "data-onclick"
+];
 
-  const href = absoluteUrl(anchor.getAttribute("href") || anchor.href);
-  if (!href || isInvalidSource(href)) return null;
-  if (!isLikelyImageHref(href)) return null;
-  return href;
+const collectNodeImageCandidates = (node) => {
+  if (!node || typeof node.getAttribute !== "function") return [];
+  const values = [];
+  for (const attr of IMAGE_LINK_HINT_ATTRIBUTES) {
+    const value = node.getAttribute(attr);
+    if (value) values.push(value);
+  }
+  if (node.tagName === "A" && node.href) {
+    values.push(node.href);
+  }
+
+  const candidates = [];
+  for (const value of values) {
+    candidates.push(...extractImageCandidatesFromLinkLikeValue(value));
+  }
+  return candidates;
+};
+
+const getAnchorImageCandidate = (element) => {
+  if (!element) return null;
+
+  const candidates = [];
+  const pushFromNode = (node) => {
+    if (!(node instanceof Element)) return;
+    candidates.push(...collectNodeImageCandidates(node));
+  };
+
+  const anchor = element.closest?.("a");
+  if (anchor) {
+    pushFromNode(anchor);
+  }
+
+  let node = element;
+  for (let depth = 0; node && depth < 5; depth += 1) {
+    const hasImageHints =
+      node.hasAttribute?.("onclick") ||
+      node.hasAttribute?.("data-href") ||
+      node.hasAttribute?.("data-url") ||
+      node.hasAttribute?.("data-src") ||
+      node.hasAttribute?.("data-original") ||
+      node.hasAttribute?.("data-image") ||
+      node.hasAttribute?.("data-lightbox") ||
+      node.hasAttribute?.("data-fancybox");
+
+    if (hasImageHints) {
+      pushFromNode(node);
+    }
+    node = node.parentElement;
+  }
+
+  const picked = chooseBestSource(candidates);
+  return picked || null;
 };
 
 const measureElement = (element) => {
