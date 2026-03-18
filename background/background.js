@@ -695,7 +695,7 @@ const loadComicPaginationPages = async (sourceTabId, startUrl, options = {}) => 
       }
 
       const paginationResult = await sendMessageToTab(tab.id, { type: MSG.GET_COMIC_PAGINATION });
-      if (paginationResult?.success && paginationResult.pagination?.supported && paginationResult.pagination.nextUrl) {
+      if (paginationResult?.success && paginationResult.pagination?.nextUrl) {
         nextUrl = paginationResult.pagination.nextUrl;
       }
 

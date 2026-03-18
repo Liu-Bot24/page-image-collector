@@ -2079,9 +2079,12 @@ const buildComicPagination = () => {
   const numericFwdCount = pageUrls.reduce((c, i) => c + (Number.isInteger(i.pageNumber) ? 1 : 0), 0);
   const hasStructural = best.pagerSignalCount >= 1 || best.numericCount >= 2 ||
     (best.nextCount > 0 && best.prevCount > 0);
+  const hasUnknownPageFlow =
+    (numericFwdCount >= 2 && transitionCount > 0) ||
+    (numericFwdCount >= 1 && best.nextCount > 0 && (hasStructural || transitionCount > 0));
   const hasReliableFlow = currentPage !== null
     ? numericFwdCount > 0 && (hasStructural || transitionCount > 0)
-    : numericFwdCount >= 2 && transitionCount > 0;
+    : hasUnknownPageFlow;
   const supported = best.score >= 6 && hasReliableFlow;
 
   return {
