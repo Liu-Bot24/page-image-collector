@@ -1874,6 +1874,7 @@ const COMIC_PAGINATION_SELECTORS =
   "nav[aria-label*='page' i], nav[aria-label*='next' i]";
 
 const PAGINATION_QUERY_KEY_RE = /^(?:p|pg|pn|page|page_no|pageno|pageid|chapter|chap|ch|index|paged)$/i;
+const MAX_GENERIC_SLASH_PAGE_NUMBER = 999;
 
 const NEXT_LABEL_RE = /^(?:下一页|下页|next|›|»|>|→)$/i;
 const PREV_LABEL_RE = /^(?:上一页|上页|prev|previous|‹|«|<|←)$/i;
@@ -1907,8 +1908,14 @@ const extractPathPaginationToken = (pathname) => {
   if (!normalized) return null;
   const explicit = normalized.match(/^(.*?)(?:\/|_|-)(?:page|pg|p|chapter|chap|ch|index)(?:\/|_|-)?(\d{1,6})$/i);
   if (explicit) return { base: explicit[1], page: Number(explicit[2]) };
-  const separated = normalized.match(/^(.*?)(?:\/|_|-)(\d{1,6})$/);
-  if (separated) return { base: separated[1], page: Number(separated[2]) };
+  const separated = normalized.match(/^(.*?)(\/|_|-)(\d{1,6})$/);
+  if (separated) {
+    const page = Number(separated[3]);
+    if (!Number.isFinite(page) || page <= 0) return null;
+    // A plain `/123456` tail is often a content id, not a page suffix.
+    if (separated[2] === "/" && page > MAX_GENERIC_SLASH_PAGE_NUMBER) return null;
+    return { base: separated[1], page };
+  }
   return null;
 };
 
@@ -1956,9 +1963,12 @@ const readNodeSignature = (node) => {
 const scorePaginationContainer = (container) => {
   if (!(container instanceof Element)) return null;
   const currentUrl = normalizePaginationHref(location.href);
-  const anchors = Array.from(container.querySelectorAll("a[href]"));
+  const anchors = [
+    ...(container.matches("a[href]") ? [container] : []),
+    ...Array.from(container.querySelectorAll("a[href]"))
+  ];
+  const linkByUrl = new Map();
   const links = [];
-  const seen = new Set();
   let score = 0;
   let numericCount = 0;
   let nextCount = 0;
@@ -1967,7 +1977,7 @@ const scorePaginationContainer = (container) => {
 
   for (const anchor of anchors) {
     const href = normalizePaginationHref(anchor.getAttribute("href") || anchor.href);
-    if (!href || seen.has(href) || isLikelyImageHref(href)) continue;
+    if (!href || isLikelyImageHref(href)) continue;
     let parsed;
     try { parsed = new URL(href, location.href); } catch { continue; }
     if (parsed.origin !== location.origin) continue;
@@ -1982,27 +1992,52 @@ const scorePaginationContainer = (container) => {
       || /\b(?:angle-left|arrow-left|chevron-left|left-arrow|icon-left|icon-prev)\b/i.test(innerMarkup);
     const hasPagerSig = /\b(pager|pagination|page-numbers|pg|pages?)\b/i.test(sig);
     const hasTransition = currentUrl ? isLikelyPaginationTransition(currentUrl, href) : false;
+    const isCurrent = anchor.matches(".current, [aria-current='page']");
+    const hasSignal = isNext || isPrev || page !== null || hasPagerSig;
 
-    if (!isNext && !isPrev && page === null && !hasPagerSig) continue;
+    let entry = linkByUrl.get(href);
+    if (!entry && !hasSignal) continue;
+    if (!entry) {
+      entry = {
+        url: href,
+        label: text,
+        pageNumber: page,
+        isNext,
+        isPrev,
+        hasTransition,
+        hasPagerSig,
+        isCurrent
+      };
+      linkByUrl.set(href, entry);
+      continue;
+    }
 
-    let s = 0;
-    if (hasPagerSig) s += 4;
-    if (page !== null) s += 4;
-    if (isNext || isPrev) s += 5;
-    if (hasTransition) s += 5;
-    if (href === currentUrl) s += 1;
-
-    seen.add(href);
-    links.push({ url: href, label: text, pageNumber: page, isNext, isPrev, hasTransition,
-      isCurrent: anchor.matches(".current, [aria-current='page']") });
-    if (page !== null) numericCount++;
-    if (isNext) nextCount++;
-    if (isPrev) prevCount++;
-    if (hasPagerSig) pagerSignalCount++;
-    score += s;
+    if (text && (!entry.label || (entry.label.length > text.length))) entry.label = text;
+    if (entry.pageNumber === null && page !== null) entry.pageNumber = page;
+    entry.isNext = entry.isNext || isNext;
+    entry.isPrev = entry.isPrev || isPrev;
+    entry.hasTransition = entry.hasTransition || hasTransition;
+    entry.hasPagerSig = entry.hasPagerSig || hasPagerSig;
+    entry.isCurrent = entry.isCurrent || isCurrent;
   }
 
+  links.push(...linkByUrl.values());
   if (links.length === 0) return null;
+
+  for (const link of links) {
+    let s = 0;
+    if (link.hasPagerSig) s += 4;
+    if (link.pageNumber !== null) s += 4;
+    if (link.isNext || link.isPrev) s += 5;
+    if (link.hasTransition) s += 5;
+    if (link.url === currentUrl) s += 1;
+
+    if (link.pageNumber !== null) numericCount++;
+    if (link.isNext) nextCount++;
+    if (link.isPrev) prevCount++;
+    if (link.hasPagerSig) pagerSignalCount++;
+    score += s;
+  }
 
   const currentPageNode = container.querySelector(
     ".current, [aria-current='page'], strong, em, .pager-num.current, .page-numbers.current"
