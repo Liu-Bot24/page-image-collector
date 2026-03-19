@@ -5,7 +5,12 @@
 ## 文档
 
 - 隐私政策：[PRIVACY.md](./PRIVACY.md)
-- GitHub Releases 推荐安装包：`page-image-collector-1.2.3-unpacked.zip`
+- GitHub Releases 推荐安装包：`page-image-collector-1.2.4-unpacked.zip`
+
+## 1.2.4 更新
+
+- 修复通用网站场景下“缩略图未升级到原图”的问题，提升原图提取兼容性
+- 修复漫画模式分页检测漏判与尾页遗漏问题，提升连续分页获取稳定性
 
 ## 1.2.3 更新
 
@@ -170,7 +175,7 @@
 ### 从 GitHub Releases 安装（推荐）
 
 1. 进入项目的 `Releases` 页面
-2. 下载对应版本的解压包，例如 `page-image-collector-1.2.3-unpacked.zip`
+2. 下载对应版本的解压包，例如 `page-image-collector-1.2.4-unpacked.zip`
 3. 打开 `chrome://extensions/`
 4. 开启“开发者模式”
 5. 解压下载的 ZIP 文件
@@ -222,5 +227,5 @@
 
 ## 版本信息
 
-- 版本：`1.2.3`
+- 版本：`1.2.4`
 - Manifest：`MV3`
