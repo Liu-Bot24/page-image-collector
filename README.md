@@ -1,11 +1,16 @@
+<div align="center">
+
 # 图片采集查看器
+
+Languages: [简体中文](README.md) · [English](README-en.md)
+
+</div>
 
 一款面向日常浏览场景的 Chrome 扩展，用于快速采集网页图片，并提供筛选、查看、批量复制、批量下载与 ZIP 打包能力。
 
 ## 文档
 
 - 隐私政策：[PRIVACY.md](./PRIVACY.md)
-- GitHub Releases 推荐安装包：`page-image-collector-1.2.4-unpacked.zip`
 
 ## 1.2.4 更新
 
@@ -172,7 +177,11 @@
 
 ## 安装
 
-### 从 GitHub Releases 安装（推荐）
+### 从 Chrome 网上应用店安装（推荐）
+
+[图片采集查看器 - Chrome Web Store](https://chromewebstore.google.com/detail/%E5%9B%BE%E7%89%87%E9%87%87%E9%9B%86%E6%9F%A5%E7%9C%8B%E5%99%A8/jchjkamalmegomjijigapilnecdccbom)
+
+### 从 GitHub Releases 安装
 
 1. 进入项目的 `Releases` 页面
 2. 下载对应版本的解压包，例如 `page-image-collector-1.2.4-unpacked.zip`
