@@ -12,6 +12,22 @@ Languages: [简体中文](README.md) · [English](README-en.md)
 
 - 隐私政策：[PRIVACY.md](./PRIVACY.md)
 
+## 安装
+
+### 从 Chrome 网上应用店安装（推荐）
+
+[图片采集查看器 - Chrome Web Store](https://chromewebstore.google.com/detail/%E5%9B%BE%E7%89%87%E9%87%87%E9%9B%86%E6%9F%A5%E7%9C%8B%E5%99%A8/jchjkamalmegomjijigapilnecdccbom)
+
+### 从 GitHub Releases 安装
+
+1. 进入项目的 `Releases` 页面
+2. 下载对应版本的解压包，例如 `page-image-collector-1.2.4-unpacked.zip`
+3. 打开 `chrome://extensions/`
+4. 开启“开发者模式”
+5. 解压下载的 ZIP 文件
+6. 点击“加载已解压的扩展程序”
+7. 选择解压后的扩展目录
+
 ## 1.2.4 更新
 
 - 修复通用网站场景下“缩略图未升级到原图”的问题，提升原图提取兼容性
@@ -174,22 +190,6 @@ Languages: [简体中文](README.md) · [English](README-en.md)
   - 查看原图
   - 复制原图
   - 下载原图
-
-## 安装
-
-### 从 Chrome 网上应用店安装（推荐）
-
-[图片采集查看器 - Chrome Web Store](https://chromewebstore.google.com/detail/%E5%9B%BE%E7%89%87%E9%87%87%E9%9B%86%E6%9F%A5%E7%9C%8B%E5%99%A8/jchjkamalmegomjijigapilnecdccbom)
-
-### 从 GitHub Releases 安装
-
-1. 进入项目的 `Releases` 页面
-2. 下载对应版本的解压包，例如 `page-image-collector-1.2.4-unpacked.zip`
-3. 打开 `chrome://extensions/`
-4. 开启“开发者模式”
-5. 解压下载的 ZIP 文件
-6. 点击“加载已解压的扩展程序”
-7. 选择解压后的扩展目录
 
 ## 快速开始
 
