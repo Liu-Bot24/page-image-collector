@@ -2,6 +2,8 @@
 
 # 图片采集查看器
 
+![图片采集查看器预览](assets/github-preview.jpg)
+
 Languages: [简体中文](README.md) · [English](README-en.md)
 
 </div>

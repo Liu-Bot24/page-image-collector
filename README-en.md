@@ -2,6 +2,8 @@
 
 # Page Image Collector
 
+![Page Image Collector preview](assets/github-preview.jpg)
+
 Languages: [简体中文](README.md) · [English](README-en.md)
 
 </div>
