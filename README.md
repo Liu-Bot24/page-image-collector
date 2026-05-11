@@ -23,12 +23,20 @@ Languages: [简体中文](README.md) · [English](README-en.md)
 ### 从 GitHub Releases 安装
 
 1. 进入项目的 `Releases` 页面
-2. 下载对应版本的解压包，例如 `page-image-collector-1.2.4-unpacked.zip`
+2. 下载对应版本的解压包，例如 `page-image-collector-1.2.5-unpacked.zip`
 3. 打开 `chrome://extensions/`
 4. 开启“开发者模式”
 5. 解压下载的 ZIP 文件
 6. 点击“加载已解压的扩展程序”
 7. 选择解压后的扩展目录
+
+## 1.2.5 更新
+
+- 提升大图获取与展示一致性：Workspace 会优先使用已发现的最大可用图片，减少网格已识别大尺寸、灯箱或全屏仍停留在缩略图的情况
+- 增强动态图片采集能力：补充更多常见懒加载字段、高清图字段、`picture/srcset` 与背景图线索，提升复杂页面中的大图发现率
+- 优化漫画分页连续加载：向后加载支持从上次进度继续，临时加载页的自动滚动更稳定，异常中断后可从中断页重试
+- 提高 ZIP 打包稳定性：优化大批量 ZIP 的执行流程，并在 Workspace 提供分卷大小设置；Popup 批量 ZIP 会沿用 Workspace 当前设置
+- 改进图片格式识别与保存命名：对无扩展名、带格式参数或特殊来源的图片，结合图片内容判断格式，减少 Unknown 和错误扩展名
 
 ## 1.2.4 更新
 
@@ -244,5 +252,5 @@ Languages: [简体中文](README.md) · [English](README-en.md)
 
 ## 版本信息
 
-- 版本：`1.2.4`
+- 版本：`1.2.5`
 - Manifest：`MV3`

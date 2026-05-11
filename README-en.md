@@ -19,7 +19,7 @@ A Chrome extension for daily browsing scenarios, used to quickly collect web pag
 ### Install from GitHub Releases
 
 1. Go to the project's `Releases` page.
-2. Download the unpacked zip for the corresponding version, e.g., `page-image-collector-1.2.4-unpacked.zip`.
+2. Download the unpacked zip for the corresponding version, e.g., `page-image-collector-1.2.5-unpacked.zip`.
 3. Open `chrome://extensions/`.
 4. Enable "Developer mode".
 5. Unzip the downloaded ZIP file.
@@ -29,6 +29,14 @@ A Chrome extension for daily browsing scenarios, used to quickly collect web pag
 ## Documentation
 
 - Privacy Policy: [PRIVACY.md](./PRIVACY.md)
+
+## What's New in 1.2.5
+
+- Improved consistency between large-image detection and viewing: Workspace now prefers the largest available image already discovered, reducing cases where the grid shows a large size while the lightbox or fullscreen view still uses a thumbnail.
+- Enhanced dynamic image collection: Added support for more common lazy-load fields, high-resolution image fields, `picture/srcset`, and background image signals to improve large-image discovery on complex pages.
+- Improved continuous comic pagination loading: loading subsequent pages can continue from the previous progress point; temporary loading pages scroll more reliably, and interrupted loads can retry from the interrupted page.
+- Improved ZIP packaging reliability: optimized the large-batch ZIP workflow and added ZIP part-size settings in Workspace; Popup ZIP downloads follow the current Workspace setting.
+- Improved image format detection and saved filenames: for images without file extensions, with format parameters, or from special sources, the extension is inferred from the image payload to reduce Unknown formats and incorrect extensions.
 
 ## What's New in 1.2.4
 
@@ -244,5 +252,5 @@ For dynamic pages, it is recommended to perform a manual scan first, then enable
 
 ## Version Info
 
-- Version: `1.2.4`
+- Version: `1.2.5`
 - Manifest: `MV3`
