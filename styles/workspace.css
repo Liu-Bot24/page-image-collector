@@ -748,6 +748,32 @@ input[type="number"]::-webkit-inner-spin-button {
   object-fit: contain;
 }
 
+.gallery.is-virtual-grid {
+  display: block;
+  grid-template-columns: none;
+}
+
+.virtual-gallery-spacer {
+  position: relative;
+  width: 100%;
+  min-height: 1px;
+}
+
+.virtual-gallery-row {
+  position: absolute;
+  left: 0;
+  right: 0;
+  top: 0;
+  display: grid;
+  align-items: start;
+  will-change: transform;
+}
+
+.virtual-gallery-row .gallery-card {
+  width: var(--virtual-card-width);
+  height: var(--virtual-card-height);
+}
+
 .gallery.drag-select-active {
   cursor: crosshair;
 }

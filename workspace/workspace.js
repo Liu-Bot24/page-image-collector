@@ -102,6 +102,7 @@ let currentImages = [];
 let selectedIds = new Set();
 const hiddenImageIds = new Set();
 let galleryRenderToken = 0;
+let committedGalleryRenderToken = 0;
 let currentLayoutMode = "grid";
 let currentZoom = 100;
 let lightboxImage = null;
@@ -154,6 +155,7 @@ const imageDimensionCache = new Map();
 const cardDimensionCache = new Map();
 const cardDimensionPending = new Set();
 const cardDimensionTasks = new Map();
+let imageMetadataGeneration = 0;
 const fullscreenCache = new Map();
 const fullscreenPendingTasks = new Map();
 let actionStatusTimer = null;
@@ -167,6 +169,19 @@ let suppressLightboxClickUntil = 0;
 let dragSelectState = null;
 let dragSelectionBox = null;
 let dragPreviewIds = new Set();
+let virtualGridState = {
+  enabled: false,
+  adapter: null,
+  instance: null,
+  rows: [],
+  metrics: null,
+  spacer: null,
+  renderedKey: "",
+  rowRenderFrame: 0,
+  renderToken: 0
+};
+let virtualGridHydrationToken = 0;
+let virtualGridRefreshFrame = 0;
 let transientActionStatus = "";
 let transientActionStatusTitle = "";
 let pinnedActionStatus = "";
@@ -175,6 +190,11 @@ const FULLSCREEN_PRELOAD_RADIUS = 4;
 const DIMENSION_PROBE_CONCURRENCY = 8;
 const DRAG_SELECT_MOVE_THRESHOLD = 6;
 const DRAG_CLICK_SUPPRESS_MS = 260;
+const VIRTUAL_GRID_MIN_COUNT = 500;
+const VIRTUAL_GRID_OVERSCAN_ROWS = 8;
+const VIRTUAL_GRID_BASE_MIN_WIDTH = 220;
+const VIRTUAL_GRID_DEFAULT_GAP = 20;
+const VIRTUAL_GRID_FOOTER_HEIGHT = 38;
 const FORMAT_GROUPS = [
   { value: "jpg", label: "JPG", aliases: ["jpg", "jpeg"] },
   { value: "png", label: "PNG", aliases: ["png"] },
@@ -541,6 +561,12 @@ const sendImageMetadataUpdate = (image, meta, options = {}) => {
 
 const rememberImageDimensions = (image, meta, options = {}) => {
   if (!image?.id) return false;
+  if (
+    Number.isInteger(options.metadataGeneration) &&
+    options.metadataGeneration !== imageMetadataGeneration
+  ) {
+    return false;
+  }
   const normalized = normalizeDimensionMeta(meta);
   if (normalized.width <= 0 || normalized.height <= 0) return false;
   const detectedFormat = String(options.format || "").trim().toLowerCase();
@@ -619,8 +645,11 @@ const runWithConcurrency = async (tasks, concurrency) => {
   return results;
 };
 
-const resolveCardMaxDimensions = async (image) => {
+const resolveCardMaxDimensions = async (image, options = {}) => {
   if (!image?.id) return getCardMeta(image);
+  const metadataGeneration = Number.isInteger(options.metadataGeneration)
+    ? options.metadataGeneration
+    : imageMetadataGeneration;
 
   const effectiveHd = getEffectiveHdSrc(image);
   const hasHdCandidate = Boolean(effectiveHd && effectiveHd !== image.src);
@@ -664,10 +693,14 @@ const resolveCardMaxDimensions = async (image) => {
             bestHdDim = jpgDim;
             if (jpgDim.format) bestFormatDim = jpgDim;
             hdArea = jpgArea;
-            resolvedHdUrlMap.set(image.id, jpgAlt);
+            if (metadataGeneration === imageMetadataGeneration) {
+              resolvedHdUrlMap.set(image.id, jpgAlt);
+            }
           }
         }
       }
+
+      if (metadataGeneration !== imageMetadataGeneration) return getCardMeta(image);
 
       const baseMeta = getStoredMaxDimensionMeta(image);
 
@@ -697,7 +730,8 @@ const resolveCardMaxDimensions = async (image) => {
       rememberImageDimensions(image, resolved, {
         url: bestUrl,
         format: bestFormatDim.format || "",
-        formatTrusted: bestFormatDim.formatTrusted === true
+        formatTrusted: bestFormatDim.formatTrusted === true,
+        metadataGeneration
       });
       if (hasHdCandidate && !hdResolved) {
         setTimeout(() => cardDimensionCache.delete(image.id), 30000);
@@ -2182,9 +2216,10 @@ const evaluateMeaningfulOriginal = async (sessionId) => {
   updateOriginalButton();
 };
 
-const updateStats = async ({ visibleImages = [], facetStats = {} } = {}) => {
+const updateStats = async ({ visibleImages = [], facetStats = {}, renderToken = null } = {}) => {
   const response = await sendMessage(MSG.GET_STATS);
   if (!response.success) return;
+  if (renderToken !== null && renderToken !== galleryRenderToken) return false;
   const { total, selected } = response.stats;
   elements.statTotal.textContent = String(total);
   elements.statFiltered.textContent = String(visibleImages.length);
@@ -2193,6 +2228,7 @@ const updateStats = async ({ visibleImages = [], facetStats = {} } = {}) => {
   elements.btnCopyBatch.disabled = selected === 0;
   elements.btnDownloadBatch.textContent = formatDownloadButtonText(activeDownloadStatus);
   renderFormatFilters(facetStats);
+  return true;
 };
 
 const refreshSelectedState = async () => {
@@ -2253,6 +2289,127 @@ const toggleHideSelected = async () => {
 
 const BASE_ROW_HEIGHT = 220;
 
+const getVirtualGridApi = () => globalThis.PageImageCollectorVirtual || null;
+
+const resetVirtualGridState = (renderToken = virtualGridState.renderToken + 1) => {
+  virtualGridState = {
+    enabled: false,
+    adapter: null,
+    instance: null,
+    rows: [],
+    metrics: null,
+    spacer: null,
+    renderedKey: "",
+    rowRenderFrame: 0,
+    renderToken
+  };
+};
+
+const clearVirtualGridStyles = () => {
+  elements.gallery.classList.remove("is-virtual-grid");
+  elements.gallery.style.removeProperty("--virtual-grid-columns");
+  elements.gallery.style.removeProperty("--virtual-card-width");
+  elements.gallery.style.removeProperty("--virtual-card-height");
+  elements.gallery.style.removeProperty("--virtual-grid-gap");
+};
+
+const teardownVirtualGrid = () => {
+  if (virtualGridState.rowRenderFrame) {
+    cancelAnimationFrame(virtualGridState.rowRenderFrame);
+  }
+  if (virtualGridRefreshFrame) {
+    cancelAnimationFrame(virtualGridRefreshFrame);
+    virtualGridRefreshFrame = 0;
+  }
+  if (virtualGridState.adapter?.destroy) {
+    virtualGridState.adapter.destroy();
+  }
+  virtualGridHydrationToken += 1;
+  resetVirtualGridState();
+  clearVirtualGridStyles();
+};
+
+const getVirtualGridMetrics = () => {
+  const virtual = getVirtualGridApi();
+  const style = getComputedStyle(elements.gallery);
+  const paddingLeft = Number.parseFloat(style.paddingLeft) || 0;
+  const paddingRight = Number.parseFloat(style.paddingRight) || 0;
+  const gap =
+    Number.parseFloat(style.gap) ||
+    Number.parseFloat(style.columnGap) ||
+    VIRTUAL_GRID_DEFAULT_GAP;
+  return virtual.calculateVirtualGridMetrics({
+    containerWidth: elements.gallery.clientWidth,
+    paddingLeft,
+    paddingRight,
+    gap,
+    zoom: currentZoom,
+    baseMinWidth: VIRTUAL_GRID_BASE_MIN_WIDTH,
+    footerHeight: VIRTUAL_GRID_FOOTER_HEIGHT
+  });
+};
+
+const shouldUseVirtualGrid = () => {
+  const virtual = getVirtualGridApi();
+  return (
+    currentLayoutMode === "grid" &&
+    currentImages.length >= VIRTUAL_GRID_MIN_COUNT &&
+    Boolean(
+      virtual?.createElementVirtualizer &&
+      virtual?.calculateVirtualGridMetrics &&
+      virtual?.buildVirtualGridRows
+    )
+  );
+};
+
+const canRefreshCommittedVirtualGrid = () =>
+  virtualGridState.enabled &&
+  currentLayoutMode === "grid" &&
+  galleryRenderToken === committedGalleryRenderToken &&
+  shouldUseVirtualGrid();
+
+const getVirtualGridScrollAnchor = () => {
+  if (!virtualGridState.enabled || !virtualGridState.metrics || !virtualGridState.rows.length) {
+    return null;
+  }
+  const scrollTop = Math.max(0, elements.gallery.scrollTop || 0);
+  const rowHeight = Math.max(1, virtualGridState.metrics.rowHeight || 1);
+  const virtualItem = virtualGridState.instance?.getVirtualItemForOffset?.(scrollTop);
+  const rowIndex = Math.max(0, Math.min(
+    virtualGridState.rows.length - 1,
+    Number.isInteger(virtualItem?.index) ? virtualItem.index : Math.floor(scrollTop / rowHeight)
+  ));
+  const row = virtualGridState.rows[rowIndex];
+  const imageId = row?.items?.[0]?.id || "";
+  if (!imageId) return null;
+  const rowStart = Number(virtualItem?.start) || (rowIndex * rowHeight);
+  return {
+    imageId,
+    offsetWithinRow: Math.max(0, scrollTop - rowStart)
+  };
+};
+
+const getVirtualGridAnchorOffset = (rows, metrics, anchor, fallbackOffset = 0) => {
+  if (!anchor?.imageId) return Math.max(0, fallbackOffset || 0);
+  const rowIndex = rows.findIndex((row) => row.items.some((item) => item.id === anchor.imageId));
+  if (rowIndex < 0) return Math.max(0, fallbackOffset || 0);
+  const rowHeight = Math.max(1, Number(metrics?.rowHeight) || 1);
+  return Math.max(0, (rowIndex * rowHeight) + (Number(anchor.offsetWithinRow) || 0));
+};
+
+const hydrateVirtualGridImages = (images, renderToken) => {
+  const hydrationToken = virtualGridHydrationToken + 1;
+  virtualGridHydrationToken = hydrationToken;
+  const tasks = images
+    .filter((image) => image?.id)
+    .map((image) => async () => {
+      if (hydrationToken !== virtualGridHydrationToken || renderToken !== galleryRenderToken) return null;
+      return await resolveCardMaxDimensions(image);
+    });
+  if (tasks.length === 0) return;
+  runWithConcurrency(tasks, DIMENSION_PROBE_CONCURRENCY).catch(() => {});
+};
+
 const getImageAspectRatio = (image) => {
   const cached = cardDimensionCache.get(image.id);
   const stored = getStoredMaxDimensionMeta(image);
@@ -2262,6 +2419,7 @@ const getImageAspectRatio = (image) => {
 };
 
 const applyGalleryLayout = () => {
+  if (virtualGridState.enabled) return;
   const gallery = elements.gallery;
   const isWaterfall = currentLayoutMode === "waterfall";
   gallery.classList.toggle("layout-waterfall", isWaterfall);
@@ -2328,6 +2486,7 @@ const applyGalleryLayout = () => {
 };
 
 const createCard = (image, index) => {
+  const cardMetadataGeneration = imageMetadataGeneration;
   const resolved = resolvedHdUrlMap.get(image.id);
   const displaySrc = resolved || image.displaySrc || image.src;
   const ext = String(resolveImageFormat(image) || formatFromUrl(displaySrc) || "unknown").toUpperCase();
@@ -2379,11 +2538,13 @@ const createCard = (image, index) => {
 
   imageNode.addEventListener("error", () => fallbackImageError(imageNode, image.src, image));
   imageNode.addEventListener("load", () => {
+    if (cardMetadataGeneration !== imageMetadataGeneration) return;
     const width = imageNode.naturalWidth || 0;
     const height = imageNode.naturalHeight || 0;
     if (width > 0 && height > 0) {
       rememberImageDimensions(image, { width, height, area: width * height }, {
-        url: imageNode.currentSrc || imageNode.src
+        url: imageNode.currentSrc || imageNode.src,
+        metadataGeneration: cardMetadataGeneration
       });
     }
   });
@@ -2401,7 +2562,7 @@ const createCard = (image, index) => {
     await toggleSelect(image.id);
   });
 
-  resolveCardMaxDimensions(image).catch(() => {});
+  resolveCardMaxDimensions(image, { metadataGeneration: cardMetadataGeneration }).catch(() => {});
 
   return card;
 };
@@ -2431,13 +2592,144 @@ const appendGalleryCardsBatched = async (images, renderToken) => {
   return renderToken === galleryRenderToken;
 };
 
+const renderVirtualGridRows = (renderToken = virtualGridState.renderToken) => {
+  const { enabled, instance, rows, metrics, spacer } = virtualGridState;
+  virtualGridState.rowRenderFrame = 0;
+  if (!enabled || !instance || !metrics || !spacer) return;
+  if (renderToken !== virtualGridState.renderToken) return;
+
+  const virtualRows = instance.getVirtualItems();
+  spacer.style.height = `${Math.max(0, instance.getTotalSize())}px`;
+  const renderedKey = virtualRows.map((row) => row.index).join(",");
+  if (renderedKey === virtualGridState.renderedKey && spacer.childElementCount > 0) return;
+  virtualGridState.renderedKey = renderedKey;
+
+  const fragment = document.createDocumentFragment();
+  for (const virtualRow of virtualRows) {
+    const row = rows[virtualRow.index];
+    if (!row) continue;
+
+    const rowNode = document.createElement("div");
+    rowNode.className = "virtual-gallery-row";
+    rowNode.style.height = `${metrics.cardHeight}px`;
+    rowNode.style.transform = `translateY(${virtualRow.start}px)`;
+    rowNode.style.gridTemplateColumns = `repeat(${row.items.length}, ${metrics.cardWidth}px)`;
+    rowNode.style.gap = `${metrics.gap}px`;
+
+    row.items.forEach((image, offset) => {
+      rowNode.appendChild(createCard(image, row.startIndex + offset));
+    });
+    fragment.appendChild(rowNode);
+  }
+
+  spacer.replaceChildren(fragment);
+};
+
+const scheduleVirtualGridRowsRender = (renderToken = virtualGridState.renderToken) => {
+  if (!virtualGridState.enabled) return;
+  if (renderToken !== virtualGridState.renderToken) return;
+  if (virtualGridState.rowRenderFrame) return;
+  virtualGridState.rowRenderFrame = requestAnimationFrame(() => {
+    renderVirtualGridRows(renderToken);
+  });
+};
+
+const mountVirtualGrid = (images, renderToken, options = {}) => {
+  const virtual = getVirtualGridApi();
+  if (renderToken !== galleryRenderToken) return false;
+  if (!virtual?.createElementVirtualizer) return false;
+
+  const preservedScrollTop =
+    Number.isFinite(options.preservedScrollTop) ? Math.max(0, options.preservedScrollTop) : null;
+  teardownVirtualGrid();
+
+  elements.gallery.classList.remove("layout-waterfall");
+  const metrics = getVirtualGridMetrics();
+  const rows = virtual.buildVirtualGridRows(images, metrics.columns);
+  const initialOffset = getVirtualGridAnchorOffset(
+    rows,
+    metrics,
+    options.scrollAnchor,
+    preservedScrollTop ?? elements.gallery.scrollTop
+  );
+  const spacer = document.createElement("div");
+  spacer.className = "virtual-gallery-spacer";
+
+  elements.gallery.innerHTML = "";
+  elements.gallery.classList.add("is-virtual-grid");
+  elements.gallery.style.setProperty("--virtual-grid-columns", String(metrics.columns));
+  elements.gallery.style.setProperty("--virtual-card-width", `${metrics.cardWidth}px`);
+  elements.gallery.style.setProperty("--virtual-card-height", `${metrics.cardHeight}px`);
+  elements.gallery.style.setProperty("--virtual-grid-gap", `${metrics.gap}px`);
+  elements.gallery.appendChild(spacer);
+
+  const nextVirtualToken = virtualGridState.renderToken + 1;
+  resetVirtualGridState(nextVirtualToken);
+  virtualGridState.enabled = true;
+  virtualGridState.rows = rows;
+  virtualGridState.metrics = metrics;
+  virtualGridState.spacer = spacer;
+
+  const adapter = virtual.createElementVirtualizer({
+    count: rows.length,
+    getScrollElement: () => elements.gallery,
+    estimateSize: () => metrics.rowHeight,
+    overscan: VIRTUAL_GRID_OVERSCAN_ROWS,
+    initialRect: {
+      width: elements.gallery.clientWidth,
+      height: elements.gallery.clientHeight
+    },
+    initialOffset,
+    getItemKey: (index) => rows[index]?.startIndex ?? index,
+    onChange: () => scheduleVirtualGridRowsRender(nextVirtualToken)
+  });
+  virtualGridState.adapter = adapter;
+  virtualGridState.instance = adapter.instance;
+  adapter.mount();
+
+  elements.gallery.scrollTop = initialOffset;
+  renderVirtualGridRows(nextVirtualToken);
+  hydrateVirtualGridImages(images, renderToken);
+  return renderToken === galleryRenderToken;
+};
+
+const refreshVirtualGridLayout = ({ defer = false } = {}) => {
+  if (!canRefreshCommittedVirtualGrid()) return false;
+  const scrollAnchor = getVirtualGridScrollAnchor();
+  const preservedScrollTop = elements.gallery.scrollTop;
+  const renderToken = committedGalleryRenderToken;
+  const imagesSnapshot = currentImages.slice();
+  const refresh = () => {
+    if (!canRefreshCommittedVirtualGrid()) return;
+    if (galleryRenderToken !== renderToken || committedGalleryRenderToken !== renderToken) return;
+    mountVirtualGrid(imagesSnapshot, renderToken, { preservedScrollTop, scrollAnchor });
+  };
+  if (!defer) {
+    refresh();
+    return true;
+  }
+  if (virtualGridRefreshFrame) cancelAnimationFrame(virtualGridRefreshFrame);
+  virtualGridRefreshFrame = requestAnimationFrame(() => {
+    virtualGridRefreshFrame = 0;
+    refresh();
+  });
+  return true;
+};
+
 const renderGallery = async () => {
   teardownDragSelect();
+  if (virtualGridRefreshFrame) {
+    cancelAnimationFrame(virtualGridRefreshFrame);
+    virtualGridRefreshFrame = 0;
+  }
+  const scrollAnchor = getVirtualGridScrollAnchor();
+  const preservedScrollTop = virtualGridState.enabled ? elements.gallery.scrollTop : null;
   const renderToken = galleryRenderToken + 1;
   galleryRenderToken = renderToken;
   const filters = getFilters();
   const allResponse = await sendMessage(MSG.GET_IMAGES, { filtered: false });
   if (!allResponse.success) return;
+  if (renderToken !== galleryRenderToken) return;
   const allImages = allResponse.images || [];
   syncHiddenImageIdsFromImages(allImages);
 
@@ -2462,6 +2754,7 @@ const renderGallery = async () => {
         uncached.map((img) => () => resolveCardMaxDimensions(img)),
         DIMENSION_PROBE_CONCURRENCY
       );
+      if (renderToken !== galleryRenderToken) return;
     }
   }
 
@@ -2470,19 +2763,24 @@ const renderGallery = async () => {
     .filter((image) => passesOrientationFilter(image));
   const facetStats = computeFormatStatsFromImages(metricAndOrientationFiltered);
 
-  currentImages = metricAndOrientationFiltered
+  let nextImages = metricAndOrientationFiltered
     .filter((image) => passesFormatFilters(image, filters.formats));
 
   if (comicModeEnabled) {
-    currentImages = await applyComicSequenceOrder(currentImages);
+    nextImages = await applyComicSequenceOrder(nextImages);
+    if (renderToken !== galleryRenderToken) return;
   } else if (currentConfig.enableSizeSort) {
-    currentImages = currentImages.sort((a, b) => {
+    nextImages = nextImages.slice().sort((a, b) => {
       const aMeta = getImageMetaForFilters(a);
       const bMeta = getImageMetaForFilters(b);
       return bMeta.area - aMeta.area;
     });
   }
-  selectedIds = await refreshSelectedState();
+  const nextSelectedIds = await refreshSelectedState();
+  if (renderToken !== galleryRenderToken) return;
+
+  currentImages = nextImages;
+  selectedIds = nextSelectedIds;
 
   if (elements.lightbox.classList.contains("active") && lightboxImage) {
     const nextIndex = currentImages.findIndex((item) => item.id === lightboxImage.id);
@@ -2511,26 +2809,50 @@ const renderGallery = async () => {
     }
   }
 
-  elements.gallery.innerHTML = "";
   if (currentImages.length === 0) {
+    if (renderToken !== galleryRenderToken) return;
+    teardownVirtualGrid();
+    elements.gallery.innerHTML = "";
+    elements.gallery.classList.toggle("layout-waterfall", currentLayoutMode === "waterfall");
     elements.emptyState.style.display = "flex";
     elements.gallery.appendChild(elements.emptyState);
     elements.btnSelectAll.textContent = SELECT_ALL_LABEL;
     syncHideToggleButton();
-    await updateStats({ visibleImages: currentImages, facetStats });
+    const statsUpdated = await updateStats({ visibleImages: currentImages, facetStats, renderToken });
+    if (!statsUpdated) return;
+    committedGalleryRenderToken = renderToken;
     hasScannedOnce = hasScannedOnce || allImages.length > 0;
     syncScanButtonLabel();
     return;
   }
 
   elements.emptyState.style.display = "none";
+  if (shouldUseVirtualGrid()) {
+    if (renderToken !== galleryRenderToken) return;
+    const completed = mountVirtualGrid(currentImages, renderToken, { preservedScrollTop, scrollAnchor });
+    if (!completed) return;
+    syncSelectAllButtonLabel();
+    syncHideToggleButton();
+    const statsUpdated = await updateStats({ visibleImages: currentImages, facetStats, renderToken });
+    if (!statsUpdated) return;
+    committedGalleryRenderToken = renderToken;
+    hasScannedOnce = true;
+    syncScanButtonLabel();
+    return;
+  }
+
+  if (renderToken !== galleryRenderToken) return;
+  teardownVirtualGrid();
+  elements.gallery.innerHTML = "";
   const completed = await appendGalleryCardsBatched(currentImages, renderToken);
   if (!completed) return;
   applyGalleryLayout();
 
   syncSelectAllButtonLabel();
   syncHideToggleButton();
-  await updateStats({ visibleImages: currentImages, facetStats });
+  const statsUpdated = await updateStats({ visibleImages: currentImages, facetStats, renderToken });
+  if (!statsUpdated) return;
+  committedGalleryRenderToken = renderToken;
   hasScannedOnce = true;
   syncScanButtonLabel();
 };
@@ -2622,11 +2944,19 @@ const updateDragPreview = (ids) => {
 const hitTestSelectionCards = (rect) => {
   const hitIds = new Set();
   const cards = elements.gallery.querySelectorAll(".gallery-card[data-id]");
+  const galleryRect = virtualGridState.enabled ? elements.gallery.getBoundingClientRect() : null;
   for (const card of cards) {
-    const cardLeft = card.offsetLeft;
-    const cardTop = card.offsetTop;
-    const cardRight = cardLeft + card.offsetWidth;
-    const cardBottom = cardTop + card.offsetHeight;
+    let cardLeft = card.offsetLeft;
+    let cardTop = card.offsetTop;
+    let cardRight = cardLeft + card.offsetWidth;
+    let cardBottom = cardTop + card.offsetHeight;
+    if (galleryRect) {
+      const cardRect = card.getBoundingClientRect();
+      cardLeft = cardRect.left - galleryRect.left + elements.gallery.scrollLeft;
+      cardTop = cardRect.top - galleryRect.top + elements.gallery.scrollTop;
+      cardRight = cardLeft + cardRect.width;
+      cardBottom = cardTop + cardRect.height;
+    }
     const intersects =
       rect.left <= cardRight &&
       rect.right >= cardLeft &&
@@ -2935,6 +3265,14 @@ const clearImages = async () => {
   currentImages = [];
   selectedIds = new Set();
   hiddenImageIds.clear();
+  resolvedHdUrlMap.clear();
+  imageDimensionCache.clear();
+  cardDimensionCache.clear();
+  cardDimensionTasks.clear();
+  cardDimensionPending.clear();
+  imageMetadataGeneration += 1;
+  clipboardPayloadCache.clear();
+  clearFullscreenCache();
   hasScannedOnce = false;
   await renderGallery();
   setActionStatus("已清理采集结果", 1400);
@@ -3059,16 +3397,19 @@ const bindEvents = () => {
 
   elements.layoutMode.addEventListener("change", () => {
     currentLayoutMode = elements.layoutMode.value;
-    applyGalleryLayout();
+    renderGallery();
   });
 
   elements.zoomSlider.addEventListener("input", () => {
     currentZoom = Number(elements.zoomSlider.value) || 100;
     elements.zoomValue.textContent = `${currentZoom}%`;
-    applyGalleryLayout();
+    if (!refreshVirtualGridLayout({ defer: true })) {
+      applyGalleryLayout();
+    }
   });
 
   window.addEventListener("resize", () => {
+    if (refreshVirtualGridLayout({ defer: true })) return;
     if (currentLayoutMode === "waterfall") applyGalleryLayout();
   });
 
@@ -3386,6 +3727,7 @@ const bindEvents = () => {
 
   window.addEventListener("beforeunload", () => {
     teardownDragSelect();
+    teardownVirtualGrid();
     unlockFullscreenPageScroll();
     clearFullscreenCache();
     if (comicAssistState.ownedAutoScan) {

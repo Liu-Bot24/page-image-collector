@@ -8,6 +8,7 @@
     "build:vendor": "node scripts/build-vendor.mjs"
   },
   "dependencies": {
+    "@tanstack/virtual-core": "^3.14.0",
     "postcss-value-parser": "^4.2.0",
     "srcset": "^5.0.3"
   },

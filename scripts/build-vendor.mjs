@@ -9,6 +9,10 @@ const bundles = [
   {
     entryPoint: "src/vendor/content-parsers.entry.js",
     outfile: "vendor/content-parsers.js"
+  },
+  {
+    entryPoint: "src/vendor/workspace-virtual.entry.js",
+    outfile: "vendor/workspace-virtual.js"
   }
 ];
 
@@ -21,6 +25,9 @@ for (const bundle of bundles) {
     bundle: true,
     format: "iife",
     target: "chrome120",
+    define: {
+      "process.env.NODE_ENV": '"production"'
+    },
     legalComments: "none",
     logLevel: "silent",
     sourcemap: false
