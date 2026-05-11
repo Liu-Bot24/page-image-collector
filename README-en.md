@@ -19,7 +19,7 @@ A Chrome extension for daily browsing scenarios, used to quickly collect web pag
 ### Install from GitHub Releases
 
 1. Go to the project's `Releases` page.
-2. Download the unpacked zip for the corresponding version, e.g., `page-image-collector-1.2.5-unpacked.zip`.
+2. Download the unpacked zip for the corresponding version, e.g., `page-image-collector-1.2.6-unpacked.zip`.
 3. Open `chrome://extensions/`.
 4. Enable "Developer mode".
 5. Unzip the downloaded ZIP file.
@@ -29,6 +29,14 @@ A Chrome extension for daily browsing scenarios, used to quickly collect web pag
 ## Documentation
 
 - Privacy Policy: [PRIVACY.md](./PRIVACY.md)
+
+## What's New in 1.2.6
+
+- Improved Workspace performance for large collections: grid mode now renders only the visible area and buffer range, making fast scrolling smoother with 1000+ images.
+- Preserved large-image detection in virtualized grids: images that have not been scrolled into view still continue maximum-size, real-format, and HD-source probing.
+- Improved responsive image and background image parsing: better discovery stability for complex `srcset`, CSS background images, and `image-set` cases.
+- Fixed some images showing as Unknown format: images without extensions, with format parameters, or from special sources now prefer payload-based format detection.
+- Improved Workspace interaction stability: optimized state consistency across scrolling, zooming, filtering, sorting, lightbox, fullscreen, drag selection, and grid/masonry switching.
 
 ## What's New in 1.2.5
 
@@ -252,5 +260,5 @@ For dynamic pages, it is recommended to perform a manual scan first, then enable
 
 ## Version Info
 
-- Version: `1.2.5`
+- Version: `1.2.6`
 - Manifest: `MV3`

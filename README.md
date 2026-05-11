@@ -23,12 +23,20 @@ Languages: [简体中文](README.md) · [English](README-en.md)
 ### 从 GitHub Releases 安装
 
 1. 进入项目的 `Releases` 页面
-2. 下载对应版本的解压包，例如 `page-image-collector-1.2.5-unpacked.zip`
+2. 下载对应版本的解压包，例如 `page-image-collector-1.2.6-unpacked.zip`
 3. 打开 `chrome://extensions/`
 4. 开启“开发者模式”
 5. 解压下载的 ZIP 文件
 6. 点击“加载已解压的扩展程序”
 7. 选择解压后的扩展目录
+
+## 1.2.6 更新
+
+- 优化 Workspace 大批量浏览性能：网格模式在大量图片场景下改为按可视区域渲染，1000+ 图片快速滚动时更流畅
+- 保持大图识别能力不退化：虚拟网格下未滚动到的图片也会继续进行最大尺寸、真实格式和高清来源探测
+- 改进响应式图片与背景图解析：提升复杂 `srcset`、CSS 背景图、`image-set` 场景下发现大图的稳定性
+- 修复部分图片格式显示为 Unknown 的问题：对无扩展名、带格式参数或特殊来源图片，优先使用实际图片内容识别格式
+- 改进 Workspace 交互稳定性：优化滚动、缩放、筛选、排序、灯箱、全屏、框选、网格/瀑布流切换时的状态一致性
 
 ## 1.2.5 更新
 
@@ -252,5 +260,5 @@ Languages: [简体中文](README.md) · [English](README-en.md)
 
 ## 版本信息
 
-- 版本：`1.2.5`
+- 版本：`1.2.6`
 - Manifest：`MV3`
