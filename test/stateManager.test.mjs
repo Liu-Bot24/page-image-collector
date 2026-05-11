@@ -284,6 +284,67 @@ test("updates image metadata with larger loaded dimensions without downgrading l
   assert.equal(stored.format, "jpg");
 });
 
+test("updates image format from trusted payload inspection even when URL guess was different", () => {
+  const manager = createTabStateManager();
+  const url = "https://cdn.example.com/photo.jpg";
+
+  manager.mergeImages(tabId, [{
+    src: url,
+    originalSrc: url,
+    hdSrc: url,
+    normalized: url,
+    width: 640,
+    height: 360,
+    area: 230400
+  }]);
+
+  let [stored] = manager.getAllImages(tabId);
+  assert.equal(stored.format, "jpg");
+
+  const update = manager.updateImageMetadata(tabId, {
+    imageId: stored.id,
+    url,
+    maxWidth: 640,
+    maxHeight: 360,
+    maxArea: 230400,
+    format: "webp",
+    formatTrusted: true
+  });
+
+  [stored] = manager.getAllImages(tabId);
+  assert.equal(update.updated, true);
+  assert.equal(stored.format, "webp");
+});
+
+test("does not replace a known format from an untrusted metadata update", () => {
+  const manager = createTabStateManager();
+  const url = "https://cdn.example.com/photo.jpg";
+
+  manager.mergeImages(tabId, [{
+    src: url,
+    originalSrc: url,
+    hdSrc: url,
+    normalized: url,
+    width: 640,
+    height: 360,
+    area: 230400
+  }]);
+
+  const [image] = manager.getAllImages(tabId);
+  const update = manager.updateImageMetadata(tabId, {
+    imageId: image.id,
+    url,
+    maxWidth: 640,
+    maxHeight: 360,
+    maxArea: 230400,
+    format: "webp"
+  });
+
+  const [stored] = manager.getAllImages(tabId);
+  assert.equal(update.updated, false);
+  assert.equal(stored.format, "jpg");
+});
+
 test("updates image metadata by loaded URL when image id is absent", () => {
   const manager = createTabStateManager();
   const thumb = "https://cdn.example.com/photo-small.jpg";

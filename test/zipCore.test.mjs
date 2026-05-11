@@ -29,6 +29,23 @@ test("accepts binary image data with missing or generic MIME when the URL is ima
   assert.equal(result.mimeType, "image/jpeg");
 });
 
+test("trusts payload bytes over a misleading URL extension", () => {
+  const result = inspectImagePayload({
+    bytes: bytes(
+      0x52, 0x49, 0x46, 0x46,
+      0x18, 0x00, 0x00, 0x00,
+      0x57, 0x45, 0x42, 0x50,
+      0x56, 0x50, 0x38, 0x20
+    ),
+    mimeType: "image/jpeg",
+    url: "https://cdn.example.com/photo.jpg"
+  });
+
+  assert.equal(result.ok, true);
+  assert.equal(result.extension, "webp");
+  assert.equal(result.mimeType, "image/webp");
+});
+
 test("accepts SVG text as an image payload but rejects generic non-image text", () => {
   const svg = inspectImagePayload({
     bytes: textBytes("<svg xmlns=\"http://www.w3.org/2000/svg\"></svg>"),

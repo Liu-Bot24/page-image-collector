@@ -880,10 +880,15 @@ export const createTabStateManager = () => {
     const shouldUpdateMaxDimensions = maxDimensions.maxArea > existingMax.maxArea;
 
     const incomingFormat = String(metadata.format || "").trim().toLowerCase();
+    const existingFormat = String(existing.format || "").toLowerCase();
+    const formatTrusted = metadata.formatTrusted === true;
     const shouldUpgradeFormat =
       incomingFormat &&
       incomingFormat !== "unknown" &&
-      String(existing.format || "").toLowerCase() === "unknown";
+      (
+        existingFormat === "unknown" ||
+        (formatTrusted && incomingFormat !== existingFormat)
+      );
 
     const isUsableLoadedImageUrl =
       loadedUrl &&

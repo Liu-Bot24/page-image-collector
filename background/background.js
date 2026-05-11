@@ -1563,9 +1563,14 @@ const probeImageDimensions = async (url) => {
     let off = 0;
     for (const ch of chunks) { merged.set(ch, off); off += ch.length; }
 
+    const contentType = String(resp.headers.get("content-type") || "").toLowerCase();
+    const inspection = inspectImagePayload({ bytes: merged, mimeType: contentType, url });
+    const formatTrusted = inspection.ok && Boolean(inspection.extension);
+    const format = formatTrusted ? inspection.extension : formatFromUrl(url);
+
     const dims = parseDimsFromHeader(merged.buffer);
     if (dims && dims.width > 0 && dims.height > 0) {
-      return { success: true, width: dims.width, height: dims.height };
+      return { success: true, width: dims.width, height: dims.height, format, formatTrusted };
     }
 
     const blob = new Blob([merged]);
@@ -1573,7 +1578,7 @@ const probeImageDimensions = async (url) => {
       const bitmap = await createImageBitmap(blob);
       const w = bitmap.width || 0, h = bitmap.height || 0;
       bitmap.close();
-      if (w > 0 && h > 0) return { success: true, width: w, height: h };
+      if (w > 0 && h > 0) return { success: true, width: w, height: h, format, formatTrusted };
     } catch (_) {}
 
     return { success: false, error: "Header parse failed", width: 0, height: 0 };
@@ -2694,7 +2699,8 @@ const handleMessage = async (message, sender) => {
         maxWidth: payload.maxWidth,
         maxHeight: payload.maxHeight,
         maxArea: payload.maxArea,
-        format: payload.format
+        format: payload.format,
+        formatTrusted: payload.formatTrusted === true
       });
       return { success: true, ...result };
     }

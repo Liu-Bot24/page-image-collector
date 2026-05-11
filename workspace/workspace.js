@@ -432,7 +432,9 @@ const getImageDimensions = async (url) => {
       if (response?.success) {
         const probed = {
           width: Number(response.width) || 0,
-          height: Number(response.height) || 0
+          height: Number(response.height) || 0,
+          format: String(response.format || "").toLowerCase(),
+          formatTrusted: response.formatTrusted === true
         };
         if (probed.width > 0 && probed.height > 0) return probed;
       }
@@ -500,11 +502,17 @@ const isHdBadge = (image) => {
 const updateCardMetaInDom = (imageId, meta) => {
   const card = document.querySelector(`.gallery-card[data-id="${imageId}"]`);
   if (!card) return;
-  if (!currentConfig.enableHD) return;
-  const dim = card.querySelector(".dimensions");
-  const area = card.querySelector(".area");
-  if (dim) dim.textContent = `${meta.width} × ${meta.height}`;
-  if (area) area.textContent = `${Math.round(meta.area / 1000)}K`;
+  if (currentConfig.enableHD) {
+    const dim = card.querySelector(".dimensions");
+    const area = card.querySelector(".area");
+    if (dim) dim.textContent = `${meta.width} × ${meta.height}`;
+    if (area) area.textContent = `${Math.round(meta.area / 1000)}K`;
+  }
+  const format = String(meta.format || "").trim().toUpperCase();
+  if (format && format !== "UNKNOWN") {
+    const formatBadge = card.querySelector(".format-badge");
+    if (formatBadge) formatBadge.textContent = format;
+  }
   const image = currentImages.find((item) => item.id === imageId);
   if (!image) return;
   const existingBadge = card.querySelector(".hd-badge");
@@ -526,7 +534,8 @@ const sendImageMetadataUpdate = (image, meta, options = {}) => {
     maxWidth: normalized.width,
     maxHeight: normalized.height,
     maxArea: normalized.area,
-    format: options.format || ""
+    format: options.format || "",
+    formatTrusted: options.formatTrusted === true
   }).catch(() => {});
 };
 
@@ -534,6 +543,15 @@ const rememberImageDimensions = (image, meta, options = {}) => {
   if (!image?.id) return false;
   const normalized = normalizeDimensionMeta(meta);
   if (normalized.width <= 0 || normalized.height <= 0) return false;
+  const detectedFormat = String(options.format || "").trim().toLowerCase();
+  const formatTrusted = options.formatTrusted === true;
+  const shouldUpdateFormat =
+    detectedFormat &&
+    detectedFormat !== "unknown" &&
+    (
+      String(image.format || "").toLowerCase() === "unknown" ||
+      (formatTrusted && detectedFormat !== String(image.format || "").toLowerCase())
+    );
   const loadedUrl = String(options.url || "").trim();
   const isPersistentLoadedUrl =
     loadedUrl &&
@@ -548,8 +566,17 @@ const rememberImageDimensions = (image, meta, options = {}) => {
     normalized.area >= (Number(cached?.area) || 0) &&
     loadedUrl !== cached?.url;
   if (!cached || normalized.area > (Number(cached.area) || 0) || shouldPreferLoadedSource) {
-    cardDimensionCache.set(image.id, { ...normalized, url: loadedUrl || cached?.url || "" });
-    updateCardMetaInDom(image.id, normalized);
+    cardDimensionCache.set(image.id, {
+      ...normalized,
+      url: loadedUrl || cached?.url || "",
+      format: shouldUpdateFormat ? detectedFormat : cached?.format || ""
+    });
+    updateCardMetaInDom(image.id, { ...normalized, format: shouldUpdateFormat ? detectedFormat : "" });
+  }
+
+  if (shouldUpdateFormat) {
+    image.format = detectedFormat;
+    updateCardMetaInDom(image.id, { ...normalized, format: detectedFormat });
   }
 
   const baseMeta = getBaseDimensionMeta(image);
@@ -571,6 +598,8 @@ const rememberImageDimensions = (image, meta, options = {}) => {
     image.maxArea = normalized.area;
     sendImageMetadataUpdate(image, normalized, options);
   } else if (loadedIsLargerThanBase) {
+    sendImageMetadataUpdate(image, storedMax, options);
+  } else if (shouldUpdateFormat) {
     sendImageMetadataUpdate(image, storedMax, options);
   }
 
@@ -624,6 +653,7 @@ const resolveCardMaxDimensions = async (image) => {
       const srcArea = computeArea(srcDim.width, srcDim.height);
       let hdArea = computeArea(hdDim.width, hdDim.height);
       let bestHdDim = hdDim;
+      let bestFormatDim = srcDim.format ? srcDim : hdDim;
 
       if (hasHdCandidate && hdArea === 0 && /\.webp(?:\?|$)/i.test(effectiveHd)) {
         const jpgAlt = effectiveHd.replace(/\.webp(?=\?|$)/i, ".jpg");
@@ -632,6 +662,7 @@ const resolveCardMaxDimensions = async (image) => {
           const jpgArea = computeArea(jpgDim.width, jpgDim.height);
           if (jpgArea > 0) {
             bestHdDim = jpgDim;
+            if (jpgDim.format) bestFormatDim = jpgDim;
             hdArea = jpgArea;
             resolvedHdUrlMap.set(image.id, jpgAlt);
           }
@@ -650,17 +681,24 @@ const resolveCardMaxDimensions = async (image) => {
         height = srcDim.height;
         area = srcArea;
         bestUrl = image.src;
+        bestHdDim = srcDim;
+        if (srcDim.format) bestFormatDim = srcDim;
       }
       if (hdArea >= area) {
         width = bestHdDim.width;
         height = bestHdDim.height;
         area = hdArea;
         bestUrl = resolvedHdUrlMap.get(image.id) || effectiveHd;
+        if (bestHdDim.format) bestFormatDim = bestHdDim;
       }
 
       const resolved = { width, height, area };
       const hdResolved = hasHdCandidate && hdArea > 0;
-      rememberImageDimensions(image, resolved, { url: bestUrl });
+      rememberImageDimensions(image, resolved, {
+        url: bestUrl,
+        format: bestFormatDim.format || "",
+        formatTrusted: bestFormatDim.formatTrusted === true
+      });
       if (hasHdCandidate && !hdResolved) {
         setTimeout(() => cardDimensionCache.delete(image.id), 30000);
       }

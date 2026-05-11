@@ -17,6 +17,7 @@ const MSG = {
   AUTO_SCROLL_STATE_CHANGED: "AUTO_SCROLL_STATE_CHANGED",
   DOWNLOAD_PROGRESS: "DOWNLOAD_PROGRESS",
   PROBE_IMAGE_DIMENSIONS: "PROBE_IMAGE_DIMENSIONS",
+  UPDATE_IMAGE_METADATA: "UPDATE_IMAGE_METADATA",
   OPEN_DOWNLOAD_DIRECTORY: "OPEN_DOWNLOAD_DIRECTORY",
   OPEN_SOURCE_URL: "OPEN_SOURCE_URL",
   CLEAR_IMAGES: "CLEAR_IMAGES"
@@ -435,7 +436,9 @@ const getImageDimensions = async (url) => {
       if (response?.success) {
         return {
           width: Number(response.width) || 0,
-          height: Number(response.height) || 0
+          height: Number(response.height) || 0,
+          format: String(response.format || "").toLowerCase(),
+          formatTrusted: response.formatTrusted === true
         };
       }
       return { width: 0, height: 0 };
@@ -449,6 +452,34 @@ const getImageDimensions = async (url) => {
 
 const computeArea = (width, height) => Math.max(0, (Number(width) || 0) * (Number(height) || 0));
 const formatAreaMp = (area) => `${(Math.max(0, Number(area) || 0) / 1000000).toFixed(2)} MP`;
+
+const shouldApplyDetectedFormat = (image, meta = {}) => {
+  const format = String(meta.format || "").trim().toLowerCase();
+  if (!image?.id || !format || format === "unknown") return false;
+  const currentFormat = String(image.format || "").toLowerCase();
+  return currentFormat === "unknown" || (meta.formatTrusted === true && format !== currentFormat);
+};
+
+const sendImageFormatUpdate = (image, meta = {}) => {
+  const format = String(meta.format || "").trim().toLowerCase();
+  if (!shouldApplyDetectedFormat(image, meta)) return;
+  sendMessage(MSG.UPDATE_IMAGE_METADATA, {
+    imageId: image.id,
+    url: image.hdSrc || image.src || image.originalSrc || "",
+    maxWidth: Number(meta.width) || Number(image.maxWidth) || Number(image.width) || 0,
+    maxHeight: Number(meta.height) || Number(image.maxHeight) || Number(image.height) || 0,
+    maxArea: Number(meta.area) || Number(image.maxArea) || Number(image.area) || 0,
+    format,
+    formatTrusted: meta.formatTrusted === true
+  }).catch(() => {});
+};
+
+const applyDetectedFormat = (image, meta = {}) => {
+  if (!shouldApplyDetectedFormat(image, meta)) return false;
+  sendImageFormatUpdate(image, meta);
+  image.format = String(meta.format || "").trim().toLowerCase();
+  return true;
+};
 
 const runWithConcurrency = async (tasks, concurrency) => {
   const results = new Array(tasks.length);
@@ -499,19 +530,31 @@ const resolveCardMaxDimensions = async (image) => {
       let width = base.width;
       let height = base.height;
       let area = base.area;
+      let bestDim = base;
+      let bestFormatDim = srcDim.format ? srcDim : hdDim;
 
       if (srcArea >= area) {
         width = srcDim.width;
         height = srcDim.height;
         area = srcArea;
+        bestDim = srcDim;
+        if (srcDim.format) bestFormatDim = srcDim;
       }
       if (hdArea >= area) {
         width = hdDim.width;
         height = hdDim.height;
         area = hdArea;
+        bestDim = hdDim;
+        if (hdDim.format) bestFormatDim = hdDim;
       }
 
-      const resolved = { width, height, area };
+      const resolved = {
+        width,
+        height,
+        area,
+        format: bestDim.format || bestFormatDim.format || "",
+        formatTrusted: bestDim.formatTrusted === true || bestFormatDim.formatTrusted === true
+      };
       cardDimensionCache.set(image.id, resolved);
       return resolved;
     } finally {
@@ -928,7 +971,11 @@ const createCard = (image, index) => {
     await toggleSelect(image.id);
   });
 
-  resolveCardMaxDimensions(image).catch(() => {});
+  resolveCardMaxDimensions(image).then((resolved) => {
+    if (applyDetectedFormat(image, resolved)) {
+      formatBadge.textContent = String(image.format || "unknown").toUpperCase();
+    }
+  }).catch(() => {});
   return card;
 };
 
@@ -948,13 +995,18 @@ const renderImages = async () => {
       currentConfig.enableSizeSort ||
       currentConfig.enablePortraitOnly ||
       filters.preset !== "all" ||
+      filters.formats.length > 0 ||
       filters.minShort > 0 ||
       filters.minLong > 0 ||
       filters.minArea > 0
   );
   if (needsDimensionHydration) {
     await runWithConcurrency(
-      visibleAllImages.map((image) => () => resolveCardMaxDimensions(image)),
+      visibleAllImages.map((image) => async () => {
+        const resolved = await resolveCardMaxDimensions(image);
+        applyDetectedFormat(image, resolved);
+        return resolved;
+      }),
       DIMENSION_PROBE_CONCURRENCY
     );
   }
