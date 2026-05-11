@@ -1349,18 +1349,30 @@ const isNoReceiverError = (message) =>
   /Receiving end does not exist|Could not establish connection/i.test(String(message || ""));
 
 const ensureContentScript = async (tabId) => {
+  let alreadyReady = false;
+  let parsersReady = false;
   try {
     const probe = await chrome.scripting.executeScript({
       target: { tabId },
-      func: () => Boolean(globalThis.__PIC_COLLECTOR_CONTENT_READY__)
+      func: () => ({
+        contentReady: Boolean(globalThis.__PIC_COLLECTOR_CONTENT_READY__),
+        parsersReady: Boolean(globalThis.PageImageCollectorParsers)
+      })
     });
-    const alreadyReady = Array.isArray(probe) && probe.some((item) => item?.result === true);
-    if (alreadyReady) return;
+    alreadyReady = Array.isArray(probe) && probe.some((item) => item?.result?.contentReady === true);
+    parsersReady = Array.isArray(probe) && probe.some((item) => item?.result?.parsersReady === true);
   } catch (_error) {
     // Ignore probe failures and try direct injection.
   }
 
   try {
+    if (!parsersReady) {
+      await chrome.scripting.executeScript({
+        target: { tabId },
+        files: ["vendor/content-parsers.js"]
+      });
+    }
+    if (alreadyReady) return;
     await chrome.scripting.executeScript({
       target: { tabId },
       files: ["content/content.js"]

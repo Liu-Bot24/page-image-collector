@@ -201,7 +201,21 @@ const splitSrcsetCandidates = (srcset) => {
   return candidates;
 };
 
-const parseSrcset = (srcset) => {
+const mergeUrlLists = (...lists) => {
+  const merged = [];
+  const seen = new Set();
+  for (const list of lists) {
+    const items = Array.isArray(list) ? list : [list];
+    for (const url of items) {
+      if (!url || seen.has(url)) continue;
+      seen.add(url);
+      merged.push(url);
+    }
+  }
+  return merged;
+};
+
+const parseSrcsetLegacyUrl = (srcset) => {
   if (!srcset || typeof srcset !== "string") return null;
   const candidates = splitSrcsetCandidates(srcset)
     .map((item) => item.trim())
@@ -218,6 +232,14 @@ const parseSrcset = (srcset) => {
     .sort((a, b) => b.score - a.score);
 
   return candidates[0]?.url || null;
+};
+
+const parseSrcsetUrls = (srcset) => {
+  if (!srcset || typeof srcset !== "string") return [];
+  const legacyUrl = parseSrcsetLegacyUrl(srcset);
+  const vendorUrls = globalThis.PageImageCollectorParsers?.parseSrcsetUrls?.(srcset);
+  const vendorBestUrl = Array.isArray(vendorUrls) ? vendorUrls[0] : null;
+  return mergeUrlLists(legacyUrl, vendorBestUrl);
 };
 
 const getHDUrl = (url) => {
@@ -1374,8 +1396,8 @@ const extractFromImg = (element) => {
     element.getAttribute("data-large-image"),
     element.getAttribute("data-url"),
     element.getAttribute("data-pic"),
-    parseSrcset(element.getAttribute("data-srcset")),
-    parseSrcset(element.srcset),
+    ...parseSrcsetUrls(element.getAttribute("data-srcset")),
+    ...parseSrcsetUrls(element.srcset),
     element.currentSrc,
     element.src,
     element.getAttribute("src")
@@ -1401,8 +1423,8 @@ const extractFromPicture = (element) => {
   const image = element.querySelector("img");
   const anchorCandidate = getAnchorImageCandidate(element);
   const sourceCandidates = sourceSets.flatMap((source) => [
-    parseSrcset(source.getAttribute("srcset") || source.srcset),
-    parseSrcset(source.getAttribute("data-srcset")),
+    ...parseSrcsetUrls(source.getAttribute("srcset") || source.srcset),
+    ...parseSrcsetUrls(source.getAttribute("data-srcset")),
     ...collectNodeImageCandidates(source)
   ]);
   const hintedCandidates = [
@@ -1423,8 +1445,8 @@ const extractFromPicture = (element) => {
     image?.getAttribute("data-large-image"),
     image?.getAttribute("data-url"),
     image?.getAttribute("data-pic"),
-    parseSrcset(image?.getAttribute("data-srcset")),
-    parseSrcset(image?.srcset),
+    ...parseSrcsetUrls(image?.getAttribute("data-srcset")),
+    ...parseSrcsetUrls(image?.srcset),
     image?.currentSrc,
     image?.src
   ];
@@ -1444,7 +1466,7 @@ const extractFromPicture = (element) => {
   };
 };
 
-const extractBgUrls = (value) => {
+const extractBgUrlsLegacy = (value) => {
   const css = String(value || "").trim();
   if (!css || css === "none") return [];
 
@@ -1484,6 +1506,14 @@ const extractBgUrls = (value) => {
   return candidates
     .sort((a, b) => b.score - a.score)
     .map((item) => item.url);
+};
+
+const extractBgUrls = (value) => {
+  const css = String(value || "").trim();
+  if (!css || css === "none") return [];
+  const legacyUrls = extractBgUrlsLegacy(css);
+  const vendorUrls = globalThis.PageImageCollectorParsers?.extractCssImageUrls?.(css);
+  return mergeUrlLists(legacyUrls, vendorUrls);
 };
 
 const extractFromBackground = (element) => {

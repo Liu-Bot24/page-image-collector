@@ -5,6 +5,7 @@
 ## 1. 静态检查
 
 ```bash
+npm run build:vendor
 npm test
 node --check background/background.js
 node --check background/stateManager.js
@@ -15,6 +16,7 @@ node --check workspace/workspace.js
 node --check shared/zipCore.js
 node --check shared/dnrCore.js
 node --check shared/comicCore.js
+node --check vendor/content-parsers.js
 node -e "JSON.parse(require('fs').readFileSync('manifest.json','utf8')); console.log('manifest-ok')"
 ```
 
@@ -25,6 +27,7 @@ node -e "JSON.parse(require('fs').readFileSync('manifest.json','utf8')); console
 3. 选择“加载已解压的扩展程序”。
 4. 选择项目根目录。
 5. 确认扩展无 manifest、权限、service worker 或 offscreen document 加载错误。
+6. 确认未出现 `Could not load javascript 'vendor/content-parsers.js'` 或扩展页 CSP 错误。
 
 ## 3. 核心功能冒烟
 

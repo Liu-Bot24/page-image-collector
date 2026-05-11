@@ -3,6 +3,15 @@
   "private": true,
   "type": "module",
   "scripts": {
-    "test": "node --test"
+    "pretest": "npm run build:vendor",
+    "test": "node --test",
+    "build:vendor": "node scripts/build-vendor.mjs"
+  },
+  "dependencies": {
+    "postcss-value-parser": "^4.2.0",
+    "srcset": "^5.0.3"
+  },
+  "devDependencies": {
+    "esbuild": "^0.28.0"
   }
 }
