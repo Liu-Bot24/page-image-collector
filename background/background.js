@@ -1,7 +1,7 @@
 import { createTabStateManager } from "./stateManager.js";
 import { annotateComicPageImages } from "../shared/comicCore.js";
 import { buildRefererModifyRule, normalizeDnrHostname, normalizeRefererOrigin } from "../shared/dnrCore.js";
-import { DEFAULT_ZIP_PART_PRESET, inspectImagePayload, normalizeZipPartOptions } from "../shared/zipCore.js";
+import { DEFAULT_ZIP_PART_PRESET, formatFromUrl, inspectImagePayload, mimeFromFormat, normalizeZipPartOptions } from "../shared/zipCore.js";
 
 const MSG = {
   SCAN: "SCAN",
@@ -34,6 +34,7 @@ const MSG = {
   DOWNLOAD_PROGRESS: "DOWNLOAD_PROGRESS",
   COPY_IMAGE_DATA_URL: "COPY_IMAGE_DATA_URL",
   PROBE_IMAGE_DIMENSIONS: "PROBE_IMAGE_DIMENSIONS",
+  UPDATE_IMAGE_METADATA: "UPDATE_IMAGE_METADATA",
   OPEN_DOWNLOAD_DIRECTORY: "OPEN_DOWNLOAD_DIRECTORY",
   OPEN_SOURCE_URL: "OPEN_SOURCE_URL",
   CLEAR_IMAGES: "CLEAR_IMAGES",
@@ -62,12 +63,14 @@ const DOWNLOAD_STATUS_STORAGE_KEY = "pic_collector_download_status_v1";
 const ZIP_PENDING_DOWNLOADS_STORAGE_KEY = "pic_collector_zip_pending_downloads_v1";
 const ZIP_PREFERENCES_STORAGE_KEY = "pic_collector_zip_preferences_v1";
 const IMAGE_REFERER_METADATA_STORAGE_KEY = "pic_collector_image_referer_rules_v1";
+const DOWNLOAD_STATUS_PERSIST_DEBOUNCE_MS = 350;
 
 const stateManager = createTabStateManager();
 const TEXT_ENCODER = new TextEncoder();
 const pendingFilenameHints = new Map();
 const activeBatchDownloads = new Set();
 const batchDownloadStatusByTab = new Map();
+let downloadStatusPersistTimer = null;
 const pendingZipPartDownloads = new Map();
 const DOWNLOAD_STATUS_TTL_MS = 15 * 1000;
 const CRC32_TABLE = (() => {
@@ -109,6 +112,10 @@ const withZipPreferences = async (config = {}) => ({
 });
 
 const persistDownloadStatuses = () => {
+  if (downloadStatusPersistTimer) {
+    clearTimeout(downloadStatusPersistTimer);
+    downloadStatusPersistTimer = null;
+  }
   const payload = {};
   const now = Date.now();
   for (const [key, status] of batchDownloadStatusByTab.entries()) {
@@ -119,6 +126,18 @@ const persistDownloadStatuses = () => {
     payload[String(key)] = status;
   }
   chrome.storage.local.set({ [DOWNLOAD_STATUS_STORAGE_KEY]: payload }).catch(() => {});
+};
+
+const schedulePersistDownloadStatuses = (immediate = false) => {
+  if (immediate) {
+    persistDownloadStatuses();
+    return;
+  }
+  if (downloadStatusPersistTimer) return;
+  downloadStatusPersistTimer = setTimeout(() => {
+    downloadStatusPersistTimer = null;
+    persistDownloadStatuses();
+  }, DOWNLOAD_STATUS_PERSIST_DEBOUNCE_MS);
 };
 
 const cleanupExpiredDownloadStatuses = (tabId = null) => {
@@ -157,7 +176,7 @@ const updateDownloadStatus = (tabId, patch = {}) => {
   }
 
   batchDownloadStatusByTab.set(tabId, next);
-  persistDownloadStatuses();
+  schedulePersistDownloadStatuses(next.active === false);
   return cloneDownloadStatus(next);
 };
 
@@ -747,46 +766,6 @@ const getTabHostname = async (tabId) => {
   }
 };
 
-const mimeFromFormat = (format) => {
-  const normalized = String(format || "").toLowerCase();
-  if (normalized === "jpg" || normalized === "jpeg") return "image/jpeg";
-  if (normalized === "png") return "image/png";
-  if (normalized === "webp") return "image/webp";
-  if (normalized === "gif") return "image/gif";
-  if (normalized === "bmp") return "image/bmp";
-  return "";
-};
-
-const formatFromUrl = (url) => {
-  if (!url) return "";
-  try {
-    const parsed = new URL(url);
-    if (
-      String(url).startsWith("blob:https://web.telegram.org/") ||
-      (parsed.protocol === "blob:" && /web\.telegram\.org/i.test(String(parsed.pathname || "")))
-    ) {
-      return "jpg";
-    }
-    const format = parsed.searchParams.get("format");
-    if (format) return format.toLowerCase();
-
-    const formatByRule = parsed.href.match(/(?:format=|\/format\/)(jpg|jpeg|png|webp|gif|svg|avif|bmp)(?:[&/?#]|$)/i);
-    if (formatByRule?.[1]) return formatByRule[1].toLowerCase();
-
-    const formatFromSuffix = parsed.pathname.match(/(?:^|[_!.-])(jpg|jpeg|png|webp|gif|svg|avif|bmp)(?:[_!.-]|$)/i);
-    if (formatFromSuffix?.[1]) return formatFromSuffix[1].toLowerCase();
-
-    if (/xhscdn\.com$/i.test(parsed.hostname) && (/webpic/i.test(parsed.hostname) || /notes_pre_post/i.test(parsed.pathname))) {
-      return "webp";
-    }
-  } catch (_error) {
-    // Ignore parse failures.
-  }
-
-  const match = url.split("?")[0].match(/\.([a-z0-9]+)$/i);
-  return match ? match[1].toLowerCase() : "";
-};
-
 const extensionFromUrl = (url, fallback = "jpg") => {
   if (!url) return fallback;
   const format = formatFromUrl(url);
@@ -1047,7 +1026,9 @@ const loadComicPaginationPages = async (sourceTabId, startUrl, options = {}) => 
   const waitMs = Math.max(1000, Math.min(30000, (Number(options.waitSeconds) || 6) * 1000));
   const results = [];
   const seen = new Set();
+  const pageIndexBase = stateManager.getMaxComicPageIndex(sourceTabId);
   let nextUrl = startUrl;
+  let retryUrl = "";
 
   const prepareComicPageForScan = async (tabId, budgetMs) => {
     const settleMs = Math.max(
@@ -1057,7 +1038,7 @@ const loadComicPaginationPages = async (sourceTabId, startUrl, options = {}) => 
     await sendMessageToTab(tabId, { type: MSG.START_AUTO_SCAN }).catch(() => null);
     await sendMessageToTab(tabId, {
       type: MSG.START_AUTO_SCROLL,
-      payload: { profile: "comic" }
+      payload: { profile: "comic", ignoreUserInterrupt: true }
     }).catch(() => null);
     await timeout(settleMs);
     await sendMessageToTab(tabId, { type: MSG.STOP_AUTO_SCROLL }).catch(() => null);
@@ -1065,7 +1046,10 @@ const loadComicPaginationPages = async (sourceTabId, startUrl, options = {}) => 
   };
 
   while (nextUrl && results.length < maxPages) {
-    if (seen.has(nextUrl)) break;
+    if (seen.has(nextUrl)) {
+      nextUrl = "";
+      break;
+    }
     seen.add(nextUrl);
     const url = nextUrl;
     nextUrl = null;
@@ -1078,9 +1062,9 @@ const loadComicPaginationPages = async (sourceTabId, startUrl, options = {}) => 
       await prepareComicPageForScan(tab.id, remainingWaitMs);
 
       const scan = await sendMessageToTab(tab.id, { type: MSG.SCAN_IMAGES });
+      const pageIndex = pageIndexBase + results.length + 1;
       if (scan?.success && Array.isArray(scan.images) && scan.images.length > 0) {
         const sequenceResult = await sendMessageToTab(tab.id, { type: MSG.GET_COMIC_SEQUENCE });
-        const pageIndex = results.length + 1;
         const annotatedImages = annotateComicPageImages(scan.images, sequenceResult?.sequence || [], {
           pageIndex,
           pageUrl: url
@@ -1088,7 +1072,7 @@ const loadComicPaginationPages = async (sourceTabId, startUrl, options = {}) => 
         const merge = stateManager.mergeImages(sourceTabId, annotatedImages);
         results.push({ url, success: true, added: merge.added || 0, pageIndex });
       } else {
-        results.push({ url, success: true, added: 0, pageIndex: results.length + 1 });
+        results.push({ url, success: true, added: 0, pageIndex });
       }
 
       const paginationResult = await sendMessageToTab(tab.id, { type: MSG.GET_COMIC_PAGINATION });
@@ -1099,6 +1083,7 @@ const loadComicPaginationPages = async (sourceTabId, startUrl, options = {}) => 
       await updateImageRefererRulesForTab(sourceTabId).catch(() => {});
       notifyImagesUpdated(sourceTabId);
     } catch (error) {
+      retryUrl = url;
       results.push({ url, success: false, error: error?.message || "加载失败" });
     } finally {
       if (tab?.id) {
@@ -1110,7 +1095,15 @@ const loadComicPaginationPages = async (sourceTabId, startUrl, options = {}) => 
   }
 
   notifyImagesUpdated(sourceTabId);
-  return { success: true, results, loadedPages: results.length };
+  const resumeUrl = nextUrl || retryUrl || "";
+  return {
+    success: true,
+    results,
+    loadedPages: results.length,
+    nextUrl: resumeUrl,
+    hasMore: Boolean(resumeUrl),
+    retryable: Boolean(retryUrl && !nextUrl)
+  };
 };
 
 const delay = (ms) => new Promise((resolve) => setTimeout(resolve, Math.max(0, Number(ms) || 0)));
@@ -1740,12 +1733,12 @@ const buildZipEntryFromImage = async (image, options = {}) => {
         } catch (_convertError) {
           // Conversion failure should not break ZIP download; fallback to original blob.
           const extFromUrl = extensionFromUrl(url, "");
-          const ext = extFromUrl || mimeToExtension(blob.type, "jpg");
+          const ext = inspection.extension || extFromUrl || mimeToExtension(blob.type, "jpg");
           filename = `${baseFilename(image, index)}.${ext}`;
         }
       } else {
         const extFromUrl = extensionFromUrl(url, "");
-        const ext = extFromUrl || inspection.extension || mimeToExtension(blob.type, "jpg");
+        const ext = inspection.extension || extFromUrl || mimeToExtension(blob.type, "jpg");
         filename = `${baseFilename(image, index)}.${ext}`;
       }
 
@@ -2149,6 +2142,30 @@ const downloadImage = async (image, options = {}) => {
   let lastError = null;
   const jpgBaseName = `${baseFilename(image, index)}.jpg`;
 
+  const downloadVerifiedOriginal = async (url, fallbackUsed) => {
+    const blob = await fetchBlob(url);
+    const bytes = new Uint8Array(await blob.arrayBuffer());
+    const inspection = inspectImagePayload({
+      bytes,
+      mimeType: String(blob.type || "").toLowerCase() || mimeFromFormat(formatFromUrl(url)).toLowerCase(),
+      url
+    });
+    if (!inspection.ok) {
+      throw new Error(inspection.reason || "Non-image response");
+    }
+    const ext = inspection.extension || extensionFromUrl(url, "") || mimeToExtension(blob.type, "jpg");
+    const filename = `${baseFilename(image, index)}.${ext}`;
+    return {
+      ...(await downloadBlobAsFile(
+        blob,
+        filename,
+        inspection.mimeType || blob.type || mimeFromFormat(ext) || "application/octet-stream"
+      )),
+      converted: false,
+      fallbackUsed
+    };
+  };
+
   if (convertToJpg) {
     for (let i = 0; i < candidates.length; i += 1) {
       const url = candidates[i];
@@ -2176,8 +2193,15 @@ const downloadImage = async (image, options = {}) => {
 
   for (let i = 0; i < candidates.length; i += 1) {
     const url = candidates[i];
-    const ext = extensionFromUrl(url, "jpg");
-    const filename = `${baseFilename(image, index)}.${ext}`;
+    const extFromUrl = extensionFromUrl(url, "");
+    if (!extFromUrl) {
+      try {
+        return await downloadVerifiedOriginal(url, i > 0);
+      } catch (error) {
+        lastError = error;
+      }
+    }
+    const filename = `${baseFilename(image, index)}.${extFromUrl || "jpg"}`;
     try {
       return {
         ...(await downloadByUrl(url, filename)),
@@ -2186,6 +2210,13 @@ const downloadImage = async (image, options = {}) => {
       };
     } catch (error) {
       lastError = error;
+      if (extFromUrl) {
+        try {
+          return await downloadVerifiedOriginal(url, i > 0);
+        } catch (verifiedError) {
+          lastError = verifiedError;
+        }
+      }
     }
   }
 
@@ -2245,7 +2276,12 @@ const getTabIdFromMessage = (message, sender) => {
 const withDisplaySource = (image, enableHD) => {
   const useHd = enableHD && image.hdSrc && image.hdSrc !== image.src && !image.hdRejected;
   const area = Number(image.area) || ((Number(image.width) || 0) * (Number(image.height) || 0));
-  const isHighResolution = area >= 1280 * 720;
+  const maxArea = Math.max(
+    area,
+    Number(image.maxArea) || 0,
+    (Number(image.maxWidth) || 0) * (Number(image.maxHeight) || 0)
+  );
+  const isHighResolution = maxArea >= 1280 * 720;
   const hasLargerCandidate = Boolean(image.hdSrc && image.hdSrc !== image.src && !image.hdRejected);
   return {
     ...image,
@@ -2630,6 +2666,25 @@ const handleMessage = async (message, sender) => {
     case MSG.PROBE_IMAGE_DIMENSIONS: {
       const url = String(payload.url || message.url || "");
       return await probeImageDimensions(url);
+    }
+
+    case MSG.UPDATE_IMAGE_METADATA: {
+      if (!tabId) return { success: false, error: "No active tab id" };
+      const result = stateManager.updateImageMetadata(tabId, {
+        imageId: payload.imageId,
+        id: payload.id,
+        url: payload.url,
+        src: payload.src,
+        displaySrc: payload.displaySrc,
+        width: payload.width,
+        height: payload.height,
+        area: payload.area,
+        maxWidth: payload.maxWidth,
+        maxHeight: payload.maxHeight,
+        maxArea: payload.maxArea,
+        format: payload.format
+      });
+      return { success: true, ...result };
     }
 
     case MSG.SET_CONFIG: {

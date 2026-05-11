@@ -30,6 +30,13 @@ const clampNumber = (value, min, max, fallback) => {
   return Math.min(max, Math.max(min, numeric));
 };
 
+const normalizeImageExtension = (value) => {
+  const ext = String(value || "").trim().toLowerCase();
+  if (ext === "jpeg") return "jpg";
+  if (ext === "svg+xml") return "svg";
+  return IMAGE_EXTENSIONS.has(ext) ? ext : "";
+};
+
 export const normalizeZipPartOptions = (options = {}) => {
   const rawPreset = String(options.zipPartPreset || options.preset || "").trim().toLowerCase();
   const zipPartPreset = Object.prototype.hasOwnProperty.call(ZIP_PART_PRESETS, rawPreset)
@@ -64,6 +71,10 @@ export const normalizeZipPartOptions = (options = {}) => {
 
 export const formatFromUrl = (url) => {
   if (!url) return "";
+  const dataMime = String(url).match(/^data:image\/([^;,]+)/i);
+  if (dataMime?.[1]) {
+    return normalizeImageExtension(dataMime[1]);
+  }
   try {
     const parsed = new URL(url);
     if (
@@ -72,14 +83,18 @@ export const formatFromUrl = (url) => {
     ) {
       return "jpg";
     }
+    if (/web\.telegram\.org$/i.test(parsed.hostname) && !/\.[a-z0-9]+$/i.test(parsed.pathname || "")) {
+      return "jpg";
+    }
     const format = parsed.searchParams.get("format");
-    if (format && IMAGE_EXTENSIONS.has(format.toLowerCase())) return format.toLowerCase();
+    const normalizedFormat = normalizeImageExtension(format);
+    if (normalizedFormat) return normalizedFormat;
 
     const formatByRule = parsed.href.match(/(?:format=|\/format\/)(jpg|jpeg|png|webp|gif|svg|avif|bmp)(?:[&/?#]|$)/i);
-    if (formatByRule?.[1]) return formatByRule[1].toLowerCase();
+    if (formatByRule?.[1]) return normalizeImageExtension(formatByRule[1]);
 
     const formatFromSuffix = parsed.pathname.match(/(?:^|[_!.-])(jpg|jpeg|png|webp|gif|svg|avif|bmp)(?:[_!.-]|$)/i);
-    if (formatFromSuffix?.[1]) return formatFromSuffix[1].toLowerCase();
+    if (formatFromSuffix?.[1]) return normalizeImageExtension(formatFromSuffix[1]);
 
     if (/xhscdn\.com$/i.test(parsed.hostname) && (/webpic/i.test(parsed.hostname) || /notes_pre_post/i.test(parsed.pathname))) {
       return "webp";
@@ -89,8 +104,7 @@ export const formatFromUrl = (url) => {
   }
 
   const match = String(url).split("?")[0].match(/\.([a-z0-9]+)$/i);
-  const ext = match ? match[1].toLowerCase() : "";
-  return IMAGE_EXTENSIONS.has(ext) ? ext : "";
+  return normalizeImageExtension(match?.[1]);
 };
 
 export const mimeFromFormat = (format) => {

@@ -108,6 +108,8 @@ const FORMAT_GROUPS = [
   { value: "avif", label: "AVIF", aliases: ["avif"] }
 ];
 const PRIMARY_FORMATS = new Set(FORMAT_GROUPS.flatMap((item) => item.aliases));
+const IMAGE_FORMAT_EXTENSIONS = new Set([...PRIMARY_FORMATS, "bmp"]);
+const DIMENSION_PROBE_CONCURRENCY = 6;
 
 const RESOLUTION_PRESETS = {
   all: { type: "all", minShort: 0, minLong: 0, minArea: 0 },
@@ -115,6 +117,13 @@ const RESOLUTION_PRESETS = {
   "1080p": { type: "resolution", minShort: 1080, minLong: 1920, minArea: 1920 * 1080 },
   "2k": { type: "resolution", minShort: 1440, minLong: 2560, minArea: 2560 * 1440 },
   "4k": { type: "resolution", minShort: 2160, minLong: 3840, minArea: 3840 * 2160 }
+};
+
+const normalizeImageExtension = (value) => {
+  const ext = String(value || "").trim().toLowerCase();
+  if (ext === "jpeg") return "jpg";
+  if (ext === "svg+xml") return "svg";
+  return IMAGE_FORMAT_EXTENSIONS.has(ext) ? ext : "";
 };
 const SELECT_ALL_LABEL = "全 选";
 const UNSELECT_ALL_LABEL = "取消全选";
@@ -441,6 +450,20 @@ const getImageDimensions = async (url) => {
 const computeArea = (width, height) => Math.max(0, (Number(width) || 0) * (Number(height) || 0));
 const formatAreaMp = (area) => `${(Math.max(0, Number(area) || 0) / 1000000).toFixed(2)} MP`;
 
+const runWithConcurrency = async (tasks, concurrency) => {
+  const results = new Array(tasks.length);
+  let next = 0;
+  const run = async () => {
+    while (next < tasks.length) {
+      const idx = next;
+      next += 1;
+      results[idx] = await tasks[idx]();
+    }
+  };
+  await Promise.all(Array.from({ length: Math.min(concurrency, tasks.length) }, () => run()));
+  return results;
+};
+
 const getCardMeta = (image) => {
   const cached = cardDimensionCache.get(image.id);
   if (cached && currentConfig.enableHD) return cached;
@@ -509,6 +532,8 @@ const isHdBadge = (image) => {
 
 const formatFromUrl = (url) => {
   if (!url) return "unknown";
+  const dataMime = String(url || "").match(/^data:image\/([^;,]+)/i);
+  if (dataMime?.[1]) return normalizeImageExtension(dataMime[1]) || "unknown";
   try {
     const parsed = new URL(url);
     if (
@@ -517,14 +542,18 @@ const formatFromUrl = (url) => {
     ) {
       return "jpg";
     }
+    if (/web\.telegram\.org$/i.test(parsed.hostname) && !/\.[a-z0-9]+$/i.test(parsed.pathname || "")) {
+      return "jpg";
+    }
     const fromParam = parsed.searchParams.get("format");
-    if (fromParam) return fromParam.toLowerCase();
+    const normalizedFormat = normalizeImageExtension(fromParam);
+    if (normalizedFormat) return normalizedFormat;
 
     const formatByRule = parsed.href.match(/(?:format=|\/format\/)(jpg|jpeg|png|webp|gif|svg|avif|bmp)(?:[&/?#]|$)/i);
-    if (formatByRule?.[1]) return formatByRule[1].toLowerCase();
+    if (formatByRule?.[1]) return normalizeImageExtension(formatByRule[1]) || "unknown";
 
     const formatFromSuffix = parsed.pathname.match(/(?:^|[_!.-])(jpg|jpeg|png|webp|gif|svg|avif|bmp)(?:[_!.-]|$)/i);
-    if (formatFromSuffix?.[1]) return formatFromSuffix[1].toLowerCase();
+    if (formatFromSuffix?.[1]) return normalizeImageExtension(formatFromSuffix[1]) || "unknown";
 
     if (/xhscdn\.com$/i.test(parsed.hostname) && (/webpic/i.test(parsed.hostname) || /notes_pre_post/i.test(parsed.pathname))) {
       return "webp";
@@ -533,7 +562,7 @@ const formatFromUrl = (url) => {
     // Ignore parse failures.
   }
   const match = url.split("?")[0].match(/\.([a-z0-9]+)$/i);
-  return match ? match[1].toLowerCase() : "unknown";
+  return normalizeImageExtension(match?.[1]) || "unknown";
 };
 
 const resolveImageFormat = (image) => {
@@ -919,13 +948,15 @@ const renderImages = async () => {
       currentConfig.enableSizeSort ||
       currentConfig.enablePortraitOnly ||
       filters.preset !== "all" ||
-      filters.formats.length > 0 ||
       filters.minShort > 0 ||
       filters.minLong > 0 ||
       filters.minArea > 0
-    );
+  );
   if (needsDimensionHydration) {
-    await Promise.all(visibleAllImages.map((image) => resolveCardMaxDimensions(image)));
+    await runWithConcurrency(
+      visibleAllImages.map((image) => () => resolveCardMaxDimensions(image)),
+      DIMENSION_PROBE_CONCURRENCY
+    );
   }
 
   const metricAndOrientationFiltered = visibleAllImages

@@ -1,3 +1,5 @@
+import { formatFromUrl } from "../shared/zipCore.js";
+
 const STORAGE_KEY = "pic_collector_tab_states_v2";
 const NOISE_QUERY_KEYS = new Set([
   "t",
@@ -259,37 +261,7 @@ const findTelegramEquivalentId = (state, incomingImage) => {
 };
 
 const getImageFormat = (url) => {
-  if (!url) return "unknown";
-
-  try {
-    const parsed = new URL(url);
-    if (
-      String(url).startsWith("blob:https://web.telegram.org/") ||
-      (parsed.protocol === "blob:" && /web\.telegram\.org/i.test(String(parsed.pathname || "")))
-    ) {
-      return "jpg";
-    }
-    if (/web\.telegram\.org$/i.test(parsed.hostname) && !/\.[a-z0-9]+$/i.test(parsed.pathname || "")) {
-      return "jpg";
-    }
-    const formatFromParam = parsed.searchParams.get("format");
-    if (formatFromParam) return formatFromParam.toLowerCase();
-
-    const formatByRule = parsed.href.match(/(?:format=|\/format\/)(jpg|jpeg|png|webp|gif|svg|avif|bmp)(?:[&/?#]|$)/i);
-    if (formatByRule?.[1]) return formatByRule[1].toLowerCase();
-
-    const formatFromSuffix = parsed.pathname.match(/(?:^|[_!.-])(jpg|jpeg|png|webp|gif|svg|avif|bmp)(?:[_!.-]|$)/i);
-    if (formatFromSuffix?.[1]) return formatFromSuffix[1].toLowerCase();
-
-    if (/xhscdn\.com$/i.test(parsed.hostname) && (/webpic/i.test(parsed.hostname) || /notes_pre_post/i.test(parsed.pathname))) {
-      return "webp";
-    }
-  } catch (_error) {
-    // Ignore parse failures and continue with extension detection.
-  }
-
-  const match = url.split("?")[0].match(/\.([a-z0-9]+)$/i);
-  return match ? match[1].toLowerCase() : "unknown";
+  return formatFromUrl(url) || "unknown";
 };
 
 export const generateImageId = (normalizedUrl) => {
@@ -313,6 +285,61 @@ const normalizeComicPageMetadata = (rawImage) => {
   };
 };
 
+const normalizePositiveNumber = (value) => {
+  const number = Number(value);
+  return Number.isFinite(number) && number > 0 ? number : 0;
+};
+
+const normalizeMaxDimensions = ({ width = 0, height = 0, area = 0, maxWidth = 0, maxHeight = 0, maxArea = 0 } = {}) => {
+  const normalizedWidth = normalizePositiveNumber(width);
+  const normalizedHeight = normalizePositiveNumber(height);
+  const normalizedArea = Math.max(normalizePositiveNumber(area), normalizedWidth * normalizedHeight);
+  const candidateMaxWidth = normalizePositiveNumber(maxWidth);
+  const candidateMaxHeight = normalizePositiveNumber(maxHeight);
+  const candidateMaxArea = Math.max(
+    normalizePositiveNumber(maxArea),
+    candidateMaxWidth * candidateMaxHeight
+  );
+
+  if (candidateMaxWidth > 0 && candidateMaxHeight > 0 && candidateMaxArea > normalizedArea) {
+    return {
+      maxWidth: candidateMaxWidth,
+      maxHeight: candidateMaxHeight,
+      maxArea: candidateMaxArea
+    };
+  }
+
+  return {
+    maxWidth: normalizedWidth,
+    maxHeight: normalizedHeight,
+    maxArea: normalizedArea
+  };
+};
+
+const mergeMaxDimensions = (existing, incoming) => {
+  const existingMax = normalizeMaxDimensions(existing);
+  const incomingMax = normalizeMaxDimensions(incoming);
+  if (incomingMax.maxArea > existingMax.maxArea) {
+    return incomingMax;
+  }
+  return existingMax;
+};
+
+const shouldUpgradeHdSrc = (existing, incoming) => {
+  const incomingHd = String(incoming?.hdSrc || "").trim();
+  if (!incomingHd) return false;
+  if (incomingHd === incoming?.src && incomingHd === existing?.hdSrc) return false;
+
+  const existingHd = String(existing?.hdSrc || "").trim();
+  if (!existingHd || existingHd === existing?.src) {
+    return incomingHd !== existingHd;
+  }
+
+  const existingMaxArea = normalizeMaxDimensions(existing).maxArea;
+  const incomingMaxArea = normalizeMaxDimensions(incoming).maxArea;
+  return incomingMaxArea > existingMaxArea && incomingHd !== existingHd;
+};
+
 const sanitizeImage = (rawImage) => {
   if (!rawImage) return null;
 
@@ -327,6 +354,14 @@ const sanitizeImage = (rawImage) => {
   const width = Number(rawImage.width) || 0;
   const height = Number(rawImage.height) || 0;
   const area = Math.max(Number(rawImage.area) || 0, width * height);
+  const maxDimensions = normalizeMaxDimensions({
+    width,
+    height,
+    area,
+    maxWidth: rawImage.maxWidth,
+    maxHeight: rawImage.maxHeight,
+    maxArea: rawImage.maxArea
+  });
   const hdSrc = rawImage.hdSrc || src;
   const sourceUrl = normalizeSourceUrl(rawImage.sourceUrl || rawImage.pageUrl || rawImage.originUrl || "");
   const incomingFormat = String(rawImage.format || "").toLowerCase();
@@ -344,6 +379,7 @@ const sanitizeImage = (rawImage) => {
     width,
     height,
     area,
+    ...maxDimensions,
     format: resolvedFormat,
     source: rawImage.source || "dom",
     sourceUrl,
@@ -386,6 +422,33 @@ const findExistingImageId = (state, image) => {
     if (existingId) return existingId;
   }
   return findTelegramEquivalentId(state, image);
+};
+
+const findImageIdByUrl = (state, url) => {
+  if (!state || !url) return null;
+  const raw = String(url || "").trim();
+  if (!raw) return null;
+
+  const keys = new Set([raw]);
+  const normalized = normalizeUrl(raw);
+  if (normalized) keys.add(normalized);
+
+  for (const key of keys) {
+    const existingId = state.imagesByHdSrc.get(key) || state.imagesByNormalized.get(key);
+    if (existingId) return existingId;
+  }
+
+  for (const [id, image] of state.images.entries()) {
+    for (const value of [image.src, image.hdSrc, image.originalSrc, image.displaySrc, image.normalized]) {
+      const candidate = String(value || "").trim();
+      if (!candidate) continue;
+      if (keys.has(candidate)) return id;
+      const normalizedCandidate = normalizeUrl(candidate);
+      if (normalizedCandidate && keys.has(normalizedCandidate)) return id;
+    }
+  }
+
+  return null;
 };
 
 const preserveHdState = (existing, incoming) => {
@@ -595,10 +658,12 @@ export const createTabStateManager = () => {
         (image.area === existing.area && image.timestamp > existing.timestamp);
 
       if (shouldReplace) {
+        const maxDimensions = mergeMaxDimensions(existing, image);
         const merged = {
           ...existing,
           ...image,
           id: existingId,
+          ...maxDimensions,
           ...preserveHdState(existing, image),
           ...mergeComicPageMetadata(existing, image)
         };
@@ -615,15 +680,25 @@ export const createTabStateManager = () => {
         (String(image.format || "").toLowerCase() !== "unknown");
       const shouldUpdateComicMetadata =
         hasComicPageMetadata(image) && !hasComicPageMetadata(existing);
+      const maxDimensions = mergeMaxDimensions(existing, image);
+      const shouldUpdateMaxDimensions = maxDimensions.maxArea > normalizeMaxDimensions(existing).maxArea;
+      const shouldUpdateHdSrc = shouldUpgradeHdSrc(existing, image);
       if (
         (preferredSource && preferredSource !== existing.sourceUrl) ||
         shouldUpgradeFormat ||
-        shouldUpdateComicMetadata
+        shouldUpdateComicMetadata ||
+        shouldUpdateMaxDimensions ||
+        shouldUpdateHdSrc
       ) {
+        const hdSrc = shouldUpdateHdSrc ? image.hdSrc : existing.hdSrc;
+        const preservedHdState = preserveHdState(existing, { ...image, hdSrc });
         const merged = {
           ...existing,
           sourceUrl: preferredSource || existing.sourceUrl,
           format: shouldUpgradeFormat ? image.format : existing.format,
+          hdSrc,
+          ...maxDimensions,
+          ...preservedHdState,
           ...mergeComicPageMetadata(existing, image)
         };
         state.images.set(existingId, merged);
@@ -740,6 +815,19 @@ export const createTabStateManager = () => {
     };
   };
 
+  const getMaxComicPageIndex = (tabId) => {
+    const state = tabStates.get(tabId);
+    if (!state) return 0;
+    let maxIndex = 0;
+    for (const image of state.images.values()) {
+      const index = Number(image?.comicPageIndex);
+      if (Number.isInteger(index) && index > maxIndex) {
+        maxIndex = index;
+      }
+    }
+    return maxIndex;
+  };
+
   const setScanning = (tabId, isScanning) => {
     const state = initTabState(tabId);
     state.isScanning = Boolean(isScanning);
@@ -763,6 +851,72 @@ export const createTabStateManager = () => {
     image.hdRejected = Boolean(rejected);
     image.isHD = Boolean(image.hdSrc && image.hdSrc !== image.src && !image.hdRejected);
     schedulePersist();
+  };
+
+  const updateImageMetadata = (tabId, metadata = {}) => {
+    const state = tabStates.get(tabId);
+    if (!state) return { updated: false };
+
+    const requestedId = String(metadata.imageId || metadata.id || "").trim();
+    const loadedUrl = String(metadata.url || metadata.src || metadata.displaySrc || "").trim();
+    const imageId = state.images.has(requestedId)
+      ? requestedId
+      : findImageIdByUrl(state, loadedUrl);
+    if (!imageId) return { updated: false };
+
+    const existing = state.images.get(imageId);
+    if (!existing) return { updated: false };
+
+    const incomingDimensions = {
+      width: existing.width,
+      height: existing.height,
+      area: existing.area,
+      maxWidth: metadata.maxWidth ?? metadata.width,
+      maxHeight: metadata.maxHeight ?? metadata.height,
+      maxArea: metadata.maxArea ?? metadata.area
+    };
+    const existingMax = normalizeMaxDimensions(existing);
+    const maxDimensions = mergeMaxDimensions(existing, incomingDimensions);
+    const shouldUpdateMaxDimensions = maxDimensions.maxArea > existingMax.maxArea;
+
+    const incomingFormat = String(metadata.format || "").trim().toLowerCase();
+    const shouldUpgradeFormat =
+      incomingFormat &&
+      incomingFormat !== "unknown" &&
+      String(existing.format || "").toLowerCase() === "unknown";
+
+    const isUsableLoadedImageUrl =
+      loadedUrl &&
+      !/^data:/i.test(loadedUrl) &&
+      !/^blob:/i.test(loadedUrl) &&
+      !/^chrome-extension:/i.test(loadedUrl) &&
+      loadedUrl !== existing.src;
+    const shouldUpdateHdSrc =
+      isUsableLoadedImageUrl &&
+      (
+        shouldUpdateMaxDimensions ||
+        !existing.hdSrc ||
+        existing.hdSrc === existing.src
+      );
+
+    if (!shouldUpdateMaxDimensions && !shouldUpgradeFormat && !shouldUpdateHdSrc) {
+      return { updated: false, image: existing };
+    }
+
+    const hdSrc = shouldUpdateHdSrc ? loadedUrl : existing.hdSrc;
+    const merged = {
+      ...existing,
+      ...maxDimensions,
+      hdSrc,
+      format: shouldUpgradeFormat ? incomingFormat : existing.format,
+      ...preserveHdState(existing, { ...existing, hdSrc })
+    };
+
+    state.images.set(imageId, merged);
+    indexImage(state, merged, imageId);
+    state.lastScanTime = Date.now();
+    schedulePersist();
+    return { updated: true, image: merged };
   };
 
   const clearTabImages = (tabId) => {
@@ -789,8 +943,10 @@ export const createTabStateManager = () => {
     setConfig,
     getConfig,
     getStats,
+    getMaxComicPageIndex,
     setScanning,
     markHdRejected,
+    updateImageMetadata,
     removeTabState,
     clearTabImages
   };

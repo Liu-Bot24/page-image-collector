@@ -24,6 +24,7 @@ const MSG = {
   IMAGES_UPDATED: "IMAGES_UPDATED",
   DOWNLOAD_PROGRESS: "DOWNLOAD_PROGRESS",
   PROBE_IMAGE_DIMENSIONS: "PROBE_IMAGE_DIMENSIONS",
+  UPDATE_IMAGE_METADATA: "UPDATE_IMAGE_METADATA",
   OPEN_DOWNLOAD_DIRECTORY: "OPEN_DOWNLOAD_DIRECTORY",
   OPEN_SOURCE_URL: "OPEN_SOURCE_URL",
   CLEAR_IMAGES: "CLEAR_IMAGES"
@@ -183,9 +184,17 @@ const FORMAT_GROUPS = [
   { value: "avif", label: "AVIF", aliases: ["avif"] }
 ];
 const PRIMARY_FORMATS = new Set(FORMAT_GROUPS.flatMap((item) => item.aliases));
+const IMAGE_FORMAT_EXTENSIONS = new Set([...PRIMARY_FORMATS, "bmp"]);
 const ZIP_PART_PRESETS = new Set(["stable", "balanced", "large", "xlarge"]);
 const DEFAULT_ZIP_PART_PRESET = "balanced";
 const GALLERY_RENDER_BATCH_SIZE = 80;
+
+const normalizeImageExtension = (value) => {
+  const ext = String(value || "").trim().toLowerCase();
+  if (ext === "jpeg") return "jpg";
+  if (ext === "svg+xml") return "svg";
+  return IMAGE_FORMAT_EXTENSIONS.has(ext) ? ext : "";
+};
 
 const RESOLUTION_PRESETS = {
   all: { type: "all", minShort: 0, minLong: 0, minArea: 0 },
@@ -375,8 +384,14 @@ const canWriteClipboardImage = () =>
   typeof navigator.clipboard.write === "function";
 
 const getEffectiveHdSrc = (image) => {
-  if (!image?.hdSrc) return image?.hdSrc || "";
-  return resolvedHdUrlMap.get(image.id) || image.hdSrc;
+  if (!image) return "";
+  const resolved = image.id ? String(resolvedHdUrlMap.get(image.id) || "").trim() : "";
+  if (resolved) return resolved;
+  const hdSrc = String(image.hdSrc || "").trim();
+  if (hdSrc) return hdSrc;
+  const displaySrc = String(image.displaySrc || "").trim();
+  if (displaySrc && displaySrc !== image.src) return displaySrc;
+  return "";
 };
 
 const getImageDimensions = async (url) => {
@@ -391,13 +406,23 @@ const getImageDimensions = async (url) => {
   const domProbe = () =>
     new Promise((resolve) => {
       const probe = new Image();
+      let settled = false;
+      const finish = (dimensions) => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        probe.onload = null;
+        probe.onerror = null;
+        resolve(dimensions);
+      };
+      const timer = setTimeout(() => finish({ width: 0, height: 0 }), 10000);
       probe.onload = () => {
-        resolve({
+        finish({
           width: probe.naturalWidth || 0,
           height: probe.naturalHeight || 0
         });
       };
-      probe.onerror = () => resolve({ width: 0, height: 0 });
+      probe.onerror = () => finish({ width: 0, height: 0 });
       probe.src = normalizedUrl;
     });
 
@@ -405,13 +430,17 @@ const getImageDimensions = async (url) => {
     if (/^https?:/i.test(normalizedUrl)) {
       const response = await sendMessage(MSG.PROBE_IMAGE_DIMENSIONS, { url: normalizedUrl });
       if (response?.success) {
-        return {
+        const probed = {
           width: Number(response.width) || 0,
           height: Number(response.height) || 0
         };
+        if (probed.width > 0 && probed.height > 0) return probed;
       }
-      setTimeout(() => imageDimensionCache.delete(normalizedUrl), 30000);
-      return { width: 0, height: 0 };
+      const fallback = await domProbe();
+      if (fallback.width <= 0 || fallback.height <= 0) {
+        setTimeout(() => imageDimensionCache.delete(normalizedUrl), 30000);
+      }
+      return fallback;
     }
     return await domProbe();
   })();
@@ -423,23 +452,43 @@ const getImageDimensions = async (url) => {
 const computeArea = (width, height) => Math.max(0, (Number(width) || 0) * (Number(height) || 0));
 const formatAreaMp = (area) => `${(Math.max(0, Number(area) || 0) / 1000000).toFixed(2)} MP`;
 
+const normalizeDimensionMeta = (meta = {}) => {
+  const width = Math.max(0, Number(meta.width) || Number(meta.maxWidth) || 0);
+  const height = Math.max(0, Number(meta.height) || Number(meta.maxHeight) || 0);
+  const area = Math.max(0, Number(meta.area) || Number(meta.maxArea) || computeArea(width, height));
+  return { width, height, area };
+};
+
+const getBaseDimensionMeta = (image) => {
+  const width = Number(image?.width) || 0;
+  const height = Number(image?.height) || 0;
+  return {
+    width,
+    height,
+    area: Math.max(Number(image?.area) || 0, computeArea(width, height))
+  };
+};
+
+const getStoredMaxDimensionMeta = (image) => {
+  const base = getBaseDimensionMeta(image);
+  const maxWidth = Number(image?.maxWidth) || 0;
+  const maxHeight = Number(image?.maxHeight) || 0;
+  const maxArea = Math.max(Number(image?.maxArea) || 0, computeArea(maxWidth, maxHeight));
+  if (maxWidth > 0 && maxHeight > 0 && maxArea > base.area) {
+    return { width: maxWidth, height: maxHeight, area: maxArea };
+  }
+  return base;
+};
+
 const getCardMeta = (image) => {
   const cached = cardDimensionCache.get(image.id);
   if (cached && currentConfig.enableHD) return cached;
-  return {
-    width: Number(image.width) || 0,
-    height: Number(image.height) || 0,
-    area: Math.max(Number(image.area) || 0, computeArea(image.width, image.height))
-  };
+  return currentConfig.enableHD ? getStoredMaxDimensionMeta(image) : getBaseDimensionMeta(image);
 };
 
 const isHdBadge = (image) => {
   const currentMeta = getCardMeta(image);
-  const maxMeta = cardDimensionCache.get(image.id) || {
-    width: Number(image.width) || 0,
-    height: Number(image.height) || 0,
-    area: Math.max(Number(image.area) || 0, computeArea(image.width, image.height))
-  };
+  const maxMeta = cardDimensionCache.get(image.id) || getStoredMaxDimensionMeta(image);
   const hasLargeVariant = Boolean(image.hdSrc && image.hdSrc !== image.src);
   const highResolution = currentMeta.area >= (1280 * 720);
   if (!currentConfig.enableHD) {
@@ -467,6 +516,67 @@ const updateCardMetaInDom = (imageId, meta) => {
   }
 };
 
+const sendImageMetadataUpdate = (image, meta, options = {}) => {
+  if (!image?.id) return;
+  const normalized = normalizeDimensionMeta(meta);
+  if (normalized.width <= 0 || normalized.height <= 0) return;
+  sendMessage(MSG.UPDATE_IMAGE_METADATA, {
+    imageId: image.id,
+    url: options.url || "",
+    maxWidth: normalized.width,
+    maxHeight: normalized.height,
+    maxArea: normalized.area,
+    format: options.format || ""
+  }).catch(() => {});
+};
+
+const rememberImageDimensions = (image, meta, options = {}) => {
+  if (!image?.id) return false;
+  const normalized = normalizeDimensionMeta(meta);
+  if (normalized.width <= 0 || normalized.height <= 0) return false;
+  const loadedUrl = String(options.url || "").trim();
+  const isPersistentLoadedUrl =
+    loadedUrl &&
+    loadedUrl !== image.src &&
+    !loadedUrl.startsWith("blob:") &&
+    !loadedUrl.startsWith("data:") &&
+    !loadedUrl.startsWith("chrome-extension:");
+
+  const cached = cardDimensionCache.get(image.id);
+  const shouldPreferLoadedSource =
+    isPersistentLoadedUrl &&
+    normalized.area >= (Number(cached?.area) || 0) &&
+    loadedUrl !== cached?.url;
+  if (!cached || normalized.area > (Number(cached.area) || 0) || shouldPreferLoadedSource) {
+    cardDimensionCache.set(image.id, { ...normalized, url: loadedUrl || cached?.url || "" });
+    updateCardMetaInDom(image.id, normalized);
+  }
+
+  const baseMeta = getBaseDimensionMeta(image);
+  const storedMax = getStoredMaxDimensionMeta(image);
+  const loadedIsLargerThanBase = isPersistentLoadedUrl && normalized.area > baseMeta.area;
+  if (loadedIsLargerThanBase) {
+    resolvedHdUrlMap.set(image.id, loadedUrl);
+    if (!image.hdSrc || image.hdSrc === image.src) {
+      image.hdSrc = loadedUrl;
+    }
+    if (currentConfig.enableHD && (!image.displaySrc || image.displaySrc === image.src)) {
+      image.displaySrc = loadedUrl;
+    }
+  }
+
+  if (normalized.area > storedMax.area) {
+    image.maxWidth = normalized.width;
+    image.maxHeight = normalized.height;
+    image.maxArea = normalized.area;
+    sendImageMetadataUpdate(image, normalized, options);
+  } else if (loadedIsLargerThanBase) {
+    sendImageMetadataUpdate(image, storedMax, options);
+  }
+
+  return true;
+};
+
 const runWithConcurrency = async (tasks, concurrency) => {
   const results = new Array(tasks.length);
   let next = 0;
@@ -483,14 +593,24 @@ const runWithConcurrency = async (tasks, concurrency) => {
 const resolveCardMaxDimensions = async (image) => {
   if (!image?.id) return getCardMeta(image);
 
+  const effectiveHd = getEffectiveHdSrc(image);
+  const hasHdCandidate = Boolean(effectiveHd && effectiveHd !== image.src);
   const cached = cardDimensionCache.get(image.id);
-  if (cached) return cached;
+  if (cached) {
+    const cachedArea = Number(cached.area) || computeArea(cached.width, cached.height);
+    const cachedUrl = String(cached.url || "").trim();
+    const storedMax = getStoredMaxDimensionMeta(image);
+    const baseMeta = getBaseDimensionMeta(image);
+    const cachedCoversKnownMax = cachedArea >= storedMax.area;
+    const cachedCoversHdCandidate =
+      !hasHdCandidate ||
+      (cachedUrl && cachedUrl !== image.src) ||
+      cachedArea > baseMeta.area;
+    if (cachedCoversKnownMax && cachedCoversHdCandidate) return cached;
+  }
 
   const pendingTask = cardDimensionTasks.get(image.id);
   if (pendingTask) return await pendingTask;
-
-  const effectiveHd = getEffectiveHdSrc(image);
-  const hasHdCandidate = Boolean(effectiveHd && effectiveHd !== image.src);
 
   const task = (async () => {
     cardDimensionPending.add(image.id);
@@ -518,32 +638,32 @@ const resolveCardMaxDimensions = async (image) => {
         }
       }
 
-      const baseWidth = Number(image.width) || 0;
-      const baseHeight = Number(image.height) || 0;
-      const baseArea = Math.max(Number(image.area) || 0, computeArea(baseWidth, baseHeight));
+      const baseMeta = getStoredMaxDimensionMeta(image);
 
-      let width = baseWidth;
-      let height = baseHeight;
-      let area = baseArea;
+      let width = baseMeta.width;
+      let height = baseMeta.height;
+      let area = baseMeta.area;
+      let bestUrl = "";
 
       if (srcArea >= area) {
         width = srcDim.width;
         height = srcDim.height;
         area = srcArea;
+        bestUrl = image.src;
       }
       if (hdArea >= area) {
         width = bestHdDim.width;
         height = bestHdDim.height;
         area = hdArea;
+        bestUrl = resolvedHdUrlMap.get(image.id) || effectiveHd;
       }
 
       const resolved = { width, height, area };
       const hdResolved = hasHdCandidate && hdArea > 0;
-      cardDimensionCache.set(image.id, resolved);
+      rememberImageDimensions(image, resolved, { url: bestUrl });
       if (hasHdCandidate && !hdResolved) {
         setTimeout(() => cardDimensionCache.delete(image.id), 30000);
       }
-      updateCardMetaInDom(image.id, resolved);
       return resolved;
     } finally {
       cardDimensionPending.delete(image.id);
@@ -944,7 +1064,7 @@ const updateComicPaginationUi = () => {
   el.hidden = false;
 
   if (elements.comicBannerPaginationGo) {
-    elements.comicBannerPaginationGo.disabled = comicPaginationLoading;
+    elements.comicBannerPaginationGo.disabled = comicPaginationLoading || !comicPaginationInfo.nextUrl;
   }
   if (elements.comicBannerPaginationLimit) {
     elements.comicBannerPaginationLimit.disabled = comicPaginationLoading;
@@ -1005,9 +1125,24 @@ const loadComicPaginationPages = async () => {
     });
 
     if (response?.success) {
-      const loaded = response.loadedPages || 0;
-      const added = (response.results || []).reduce((sum, r) => sum + (r.added || 0), 0);
-      setActionStatus(`分页加载完成，共加载 ${loaded} 页，新增 ${added} 张图片`, 8000);
+      const results = Array.isArray(response.results) ? response.results : [];
+      const loaded = results.filter((item) => item?.success).length;
+      const added = results.reduce((sum, r) => sum + (r.added || 0), 0);
+      comicPaginationInfo = {
+        ...comicPaginationInfo,
+        nextUrl: response.nextUrl || "",
+        supported: Boolean(response.nextUrl)
+      };
+      setActionStatus(
+        response.nextUrl
+          ? (
+            response.retryable
+              ? `分页加载中断，已加载 ${loaded} 页，新增 ${added} 张图片，点击 Go 将从中断页重试`
+              : `分页加载完成，共加载 ${loaded} 页，新增 ${added} 张图片，可继续向后加载`
+          )
+          : `分页加载完成，共加载 ${loaded} 页，新增 ${added} 张图片，未检测到更多后续分页`,
+        8000
+      );
       invalidateComicSequenceCache();
       await renderGallery();
     } else {
@@ -1304,14 +1439,9 @@ const getImageMetaForFilters = (image) => {
   if (currentConfig.enableHD) {
     const cached = cardDimensionCache.get(image.id);
     if (cached) return cached;
+    return getStoredMaxDimensionMeta(image);
   }
-  const width = Number(image.width) || 0;
-  const height = Number(image.height) || 0;
-  return {
-    width,
-    height,
-    area: Math.max(Number(image.area) || 0, computeArea(width, height))
-  };
+  return getBaseDimensionMeta(image);
 };
 
 const passesMetricFilters = (image, filters) => {
@@ -1399,13 +1529,7 @@ const fallbackImageError = (imgElement, fallbackUrl, image = null) => {
             const nw = imgElement.naturalWidth || 0;
             const nh = imgElement.naturalHeight || 0;
             if (nw > 0 && nh > 0) {
-              const area = nw * nh;
-              const prev = cardDimensionCache.get(image.id);
-              if (!prev || area > (prev.area || 0)) {
-                const updated = { width: nw, height: nh, area };
-                cardDimensionCache.set(image.id, updated);
-                updateCardMetaInDom(image.id, updated);
-              }
+              rememberImageDimensions(image, { width: nw, height: nh, area: nw * nh }, { url: jpgAlt });
             }
           }
           if (typeof prevOnload === "function") prevOnload();
@@ -1435,6 +1559,8 @@ const fallbackImageError = (imgElement, fallbackUrl, image = null) => {
 
 const formatFromUrl = (url) => {
   if (!url) return "unknown";
+  const dataMime = String(url || "").match(/^data:image\/([^;,]+)/i);
+  if (dataMime?.[1]) return normalizeImageExtension(dataMime[1]) || "unknown";
   try {
     const parsed = new URL(url);
     if (
@@ -1443,14 +1569,18 @@ const formatFromUrl = (url) => {
     ) {
       return "jpg";
     }
+    if (/web\.telegram\.org$/i.test(parsed.hostname) && !/\.[a-z0-9]+$/i.test(parsed.pathname || "")) {
+      return "jpg";
+    }
     const fromParam = parsed.searchParams.get("format");
-    if (fromParam) return fromParam.toLowerCase();
+    const normalizedFormat = normalizeImageExtension(fromParam);
+    if (normalizedFormat) return normalizedFormat;
 
     const formatByRule = parsed.href.match(/(?:format=|\/format\/)(jpg|jpeg|png|webp|gif|svg|avif|bmp)(?:[&/?#]|$)/i);
-    if (formatByRule?.[1]) return formatByRule[1].toLowerCase();
+    if (formatByRule?.[1]) return normalizeImageExtension(formatByRule[1]) || "unknown";
 
     const formatFromSuffix = parsed.pathname.match(/(?:^|[_!.-])(jpg|jpeg|png|webp|gif|svg|avif|bmp)(?:[_!.-]|$)/i);
-    if (formatFromSuffix?.[1]) return formatFromSuffix[1].toLowerCase();
+    if (formatFromSuffix?.[1]) return normalizeImageExtension(formatFromSuffix[1]) || "unknown";
 
     if (/xhscdn\.com$/i.test(parsed.hostname) && (/webpic/i.test(parsed.hostname) || /notes_pre_post/i.test(parsed.pathname))) {
       return "webp";
@@ -1459,7 +1589,7 @@ const formatFromUrl = (url) => {
     // Ignore parse failures.
   }
   const match = url.split("?")[0].match(/\.([a-z0-9]+)$/i);
-  return match ? match[1].toLowerCase() : "unknown";
+  return normalizeImageExtension(match?.[1]) || "unknown";
 };
 
 const resolveImageFormat = (image) => {
@@ -1471,18 +1601,25 @@ const resolveImageFormat = (image) => {
 
 const getViewSources = (image) => {
   const hdCandidate = getEffectiveHdSrc(image);
-  if (/twimg\.com/i.test(hdCandidate) && /name=orig/i.test(hdCandidate)) {
+  const previewSrc = image?.src || image?.originalSrc || image?.displaySrc || hdCandidate || "";
+  const originalCandidates = [
+    hdCandidate,
+    image?.hdSrc,
+    image?.displaySrc,
+    image?.originalSrc
+  ]
+    .map((value) => String(value || "").trim())
+    .filter((value, index, values) => value && value !== previewSrc && values.indexOf(value) === index);
+
+  const originalSrc = originalCandidates[0] || "";
+  if (/twimg\.com/i.test(originalSrc) && /name=orig/i.test(originalSrc)) {
     return {
-      previewSrc: hdCandidate.replace(/name=orig/i, "name=large"),
-      originalSrc: hdCandidate
+      previewSrc: previewSrc || originalSrc.replace(/name=orig/i, "name=large"),
+      originalSrc
     };
   }
 
-  const base = image?.src || image?.originalSrc || image?.displaySrc || hdCandidate || "";
-  if (!base) return { previewSrc: "", originalSrc: "" };
-
-  const originalSrc = hdCandidate && hdCandidate !== base ? hdCandidate : "";
-  return { previewSrc: base, originalSrc };
+  return { previewSrc, originalSrc };
 };
 
 const LIGHTBOX_NAV_BUCKET_CLASSES = [
@@ -1785,15 +1922,10 @@ const renderFullscreenImage = async () => {
       const nh = elements.fullscreenImage.naturalHeight || 0;
       if (nw > 0 && nh > 0) {
         const loadedArea = nw * nh;
-        const prev = cardDimensionCache.get(image.id);
-        if (!prev || loadedArea > (prev.area || 0)) {
-          const updated = { width: nw, height: nh, area: loadedArea };
-          cardDimensionCache.set(image.id, updated);
-          updateCardMetaInDom(image.id, updated);
-        }
         if (loadedSrc && loadedSrc !== thumbFallback && !loadedSrc.startsWith("blob:")) {
           resolvedHdUrlMap.set(image.id, loadedSrc);
         }
+        rememberImageDimensions(image, { width: nw, height: nh, area: loadedArea }, { url: loadedSrc });
       }
     }
     setFullscreenLoading(false);
@@ -1920,6 +2052,32 @@ const updateLightboxNavigation = () => {
   elements.lightboxNext.disabled = !hasMultiple;
 };
 
+const syncActiveLightboxRecord = (image, index) => {
+  if (!image) return;
+  lightboxImage = image;
+  lightboxIndex = index;
+
+  const { previewSrc, originalSrc } = getViewSources(image);
+  const nextPreviewSrc = previewSrc || image.src || image.originalSrc || image.displaySrc || image.hdSrc;
+  const nextOriginalSrc = originalSrc || "";
+  const sourcesChanged =
+    nextPreviewSrc !== lightboxPreviewSrc ||
+    nextOriginalSrc !== lightboxOriginalSrc;
+
+  if (sourcesChanged) {
+    lightboxSessionId += 1;
+    lightboxPreviewSrc = nextPreviewSrc;
+    lightboxOriginalSrc = nextOriginalSrc;
+    lightboxHasMeaningfulOriginal = false;
+    lightboxCanOneToOne = false;
+    lightboxOriginalEvalPending = Boolean(lightboxOriginalSrc && lightboxOriginalSrc !== lightboxPreviewSrc);
+    evaluateMeaningfulOriginal(lightboxSessionId).catch(() => {});
+  }
+
+  updateLightboxNavigation();
+  updateOriginalButton();
+};
+
 const setLightboxSource = (src, mode) => {
   if (!src) return;
   lightboxMode = mode;
@@ -1928,21 +2086,16 @@ const setLightboxSource = (src, mode) => {
   elements.lightboxImage.dataset.fallbackApplied = "0";
   elements.lightboxImage.src = src;
   elements.lightboxImage.onload = () => {
-    if (mode === "original" && lightboxImage?.id) {
+    if (lightboxImage?.id) {
       const nw = elements.lightboxImage.naturalWidth || 0;
       const nh = elements.lightboxImage.naturalHeight || 0;
       if (nw > 0 && nh > 0) {
         const loadedArea = nw * nh;
-        const prev = cardDimensionCache.get(lightboxImage.id);
-        if (!prev || loadedArea > (prev.area || 0)) {
-          const updated = { width: nw, height: nh, area: loadedArea };
-          cardDimensionCache.set(lightboxImage.id, updated);
-          updateCardMetaInDom(lightboxImage.id, updated);
-        }
         const loadedSrc = elements.lightboxImage.src || src;
         if (loadedSrc && !loadedSrc.startsWith("blob:")) {
           resolvedHdUrlMap.set(lightboxImage.id, loadedSrc);
         }
+        rememberImageDimensions(lightboxImage, { width: nw, height: nh, area: loadedArea }, { url: loadedSrc });
       }
     }
     syncLightboxMeta(src);
@@ -1975,13 +2128,11 @@ const evaluateMeaningfulOriginal = async (sessionId) => {
   if (sessionId !== lightboxSessionId) return;
 
   const bothKnown = previewDim.width > 0 && previewDim.height > 0 && originalDim.width > 0 && originalDim.height > 0;
-  const sameDimensions =
-    bothKnown &&
-    previewDim.width === originalDim.width &&
-    previewDim.height === originalDim.height;
+  const originalArea = computeArea(originalDim.width, originalDim.height);
+  const previewArea = computeArea(previewDim.width, previewDim.height);
 
   lightboxOriginalEvalPending = false;
-  lightboxHasMeaningfulOriginal = !sameDimensions;
+  lightboxHasMeaningfulOriginal = bothKnown ? originalArea > previewArea : true;
   if (lightboxHasMeaningfulOriginal) {
     lightboxCanOneToOne = false;
   } else {
@@ -2066,8 +2217,9 @@ const BASE_ROW_HEIGHT = 220;
 
 const getImageAspectRatio = (image) => {
   const cached = cardDimensionCache.get(image.id);
-  const w = cached?.width || Number(image.width) || 0;
-  const h = cached?.height || Number(image.height) || 0;
+  const stored = getStoredMaxDimensionMeta(image);
+  const w = cached?.width || stored.width || 0;
+  const h = cached?.height || stored.height || 0;
   return w > 0 && h > 0 ? w / h : 1;
 };
 
@@ -2188,6 +2340,15 @@ const createCard = (image, index) => {
   card.append(imageWrap, footer, selectWrap);
 
   imageNode.addEventListener("error", () => fallbackImageError(imageNode, image.src, image));
+  imageNode.addEventListener("load", () => {
+    const width = imageNode.naturalWidth || 0;
+    const height = imageNode.naturalHeight || 0;
+    if (width > 0 && height > 0) {
+      rememberImageDimensions(image, { width, height, area: width * height }, {
+        url: imageNode.currentSrc || imageNode.src
+      });
+    }
+  });
   imageNode.addEventListener("click", (event) => {
     if (Date.now() < suppressLightboxClickUntil) {
       event.preventDefault();
@@ -2290,8 +2451,7 @@ const renderGallery = async () => {
     if (nextIndex === -1) {
       closeLightbox();
     } else {
-      lightboxIndex = nextIndex;
-      updateLightboxNavigation();
+      syncActiveLightboxRecord(currentImages[nextIndex], nextIndex);
     }
   }
 

@@ -1,7 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 
-import { inspectImagePayload, normalizeZipPartOptions } from "../shared/zipCore.js";
+import { formatFromUrl, inspectImagePayload, normalizeZipPartOptions } from "../shared/zipCore.js";
 
 const bytes = (...values) => new Uint8Array(values);
 const textBytes = (value) => new TextEncoder().encode(value);
@@ -60,4 +60,18 @@ test("normalizes ZIP split presets for larger archive parts", () => {
   assert.equal(options.zipPartPreset, "large");
   assert.equal(options.zipPartMaxBytes, 384 * 1024 * 1024);
   assert.equal(options.zipPartMaxFiles, 500);
+});
+
+test("keeps only image format query values from URL guessing", () => {
+  assert.equal(formatFromUrl("https://cdn.example.com/photo?format=webp"), "webp");
+  assert.equal(formatFromUrl("https://cdn.example.com/photo?format=jpeg"), "jpg");
+  assert.equal(formatFromUrl("https://cdn.example.com/photo?format=auto"), "");
+  assert.equal(formatFromUrl("https://cdn.example.com/photo?format=raw"), "");
+});
+
+test("detects data URL image MIME during format guessing", () => {
+  assert.equal(formatFromUrl("data:image/jpeg;base64,/9j/4AAQ"), "jpg");
+  assert.equal(formatFromUrl("data:image/webp;base64,UklGRg=="), "webp");
+  assert.equal(formatFromUrl("data:image/svg+xml;base64,PHN2Zy8+"), "svg");
+  assert.equal(formatFromUrl("data:text/html;base64,PGh0bWw+"), "");
 });

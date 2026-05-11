@@ -228,7 +228,18 @@ const getHDUrl = (url) => {
   return url;
 };
 
+const IMAGE_FORMAT_EXTENSIONS = new Set(["jpg", "jpeg", "png", "webp", "gif", "svg", "avif", "bmp"]);
+
+const normalizeImageExtension = (value) => {
+  const ext = String(value || "").trim().toLowerCase();
+  if (ext === "jpeg") return "jpg";
+  if (ext === "svg+xml") return "svg";
+  return IMAGE_FORMAT_EXTENSIONS.has(ext) ? ext : "";
+};
+
 const inferFormat = (url) => {
+  const dataMime = String(url || "").match(/^data:image\/([^;,]+)/i);
+  if (dataMime?.[1]) return normalizeImageExtension(dataMime[1]) || "unknown";
   try {
     const parsed = new URL(url, location.href);
     if (
@@ -237,14 +248,18 @@ const inferFormat = (url) => {
     ) {
       return "jpg";
     }
+    if (/web\.telegram\.org$/i.test(parsed.hostname) && !/\.[a-z0-9]+$/i.test(parsed.pathname || "")) {
+      return "jpg";
+    }
     const format = parsed.searchParams.get("format");
-    if (format) return format.toLowerCase();
+    const normalizedFormat = normalizeImageExtension(format);
+    if (normalizedFormat) return normalizedFormat;
 
     const formatByRule = parsed.href.match(/(?:format=|\/format\/)(jpg|jpeg|png|webp|gif|svg|avif|bmp)(?:[&/?#]|$)/i);
-    if (formatByRule?.[1]) return formatByRule[1].toLowerCase();
+    if (formatByRule?.[1]) return normalizeImageExtension(formatByRule[1]) || "unknown";
 
     const formatFromSuffix = parsed.pathname.match(/(?:^|[_!.-])(jpg|jpeg|png|webp|gif|svg|avif|bmp)(?:[_!.-]|$)/i);
-    if (formatFromSuffix?.[1]) return formatFromSuffix[1].toLowerCase();
+    if (formatFromSuffix?.[1]) return normalizeImageExtension(formatFromSuffix[1]) || "unknown";
 
     // 小红书常见图片域名: sns-webpic-*.xhscdn.com（无扩展名，但实际是 webp）。
     if (/xhscdn\.com$/i.test(parsed.hostname) && (/webpic/i.test(parsed.hostname) || /notes_pre_post/i.test(parsed.pathname))) {
@@ -255,7 +270,7 @@ const inferFormat = (url) => {
   }
 
   const match = url?.split("?")[0].match(/\.([a-z0-9]+)$/i);
-  return match ? match[1].toLowerCase() : "unknown";
+  return normalizeImageExtension(match?.[1]) || "unknown";
 };
 
 const isInvalidSource = (url) => {
@@ -1239,14 +1254,29 @@ const IMAGE_LINK_HINT_ATTRIBUTES = [
   "data-lazy-src",
   "data-actualsrc",
   "data-image",
+  "data-image-url",
   "data-img",
+  "data-img-url",
   "data-pic",
+  "data-large",
+  "data-large-src",
   "data-large-image",
+  "data-full-image",
   "data-zoom-image",
+  "data-zoom-src",
   "data-full",
   "data-full-src",
+  "data-full-size",
   "data-fullsrc",
+  "data-hires",
+  "data-high-res",
   "data-highres",
+  "data-original-url",
+  "data-retina",
+  "data-src-retina",
+  "data-2x",
+  "data-pswp-src",
+  "data-mfp-src",
   "data-lightbox",
   "data-fancybox",
   "data-fancybox-href",
@@ -1288,15 +1318,7 @@ const getAnchorImageCandidate = (element) => {
 
   let node = element;
   for (let depth = 0; node && depth < 5; depth += 1) {
-    const hasImageHints =
-      node.hasAttribute?.("onclick") ||
-      node.hasAttribute?.("data-href") ||
-      node.hasAttribute?.("data-url") ||
-      node.hasAttribute?.("data-src") ||
-      node.hasAttribute?.("data-original") ||
-      node.hasAttribute?.("data-image") ||
-      node.hasAttribute?.("data-lightbox") ||
-      node.hasAttribute?.("data-fancybox");
+    const hasImageHints = IMAGE_LINK_HINT_ATTRIBUTES.some((attr) => node.hasAttribute?.(attr));
 
     if (hasImageHints) {
       pushFromNode(node);
@@ -1339,8 +1361,10 @@ const collectShadowRoots = (root, out = []) => {
 
 const extractFromImg = (element) => {
   const anchorCandidate = getAnchorImageCandidate(element);
+  const hintedCandidates = collectNodeImageCandidates(element);
   const srcCandidates = [
     anchorCandidate,
+    ...hintedCandidates,
     element.getAttribute("data-original"),
     element.getAttribute("data-original-src"),
     element.getAttribute("data-src"),
@@ -1373,14 +1397,23 @@ const extractFromImg = (element) => {
 };
 
 const extractFromPicture = (element) => {
-  const sourceSet = element.querySelector("source[srcset]");
+  const sourceSets = Array.from(element.querySelectorAll("source"));
   const image = element.querySelector("img");
   const anchorCandidate = getAnchorImageCandidate(element);
+  const sourceCandidates = sourceSets.flatMap((source) => [
+    parseSrcset(source.getAttribute("srcset") || source.srcset),
+    parseSrcset(source.getAttribute("data-srcset")),
+    ...collectNodeImageCandidates(source)
+  ]);
+  const hintedCandidates = [
+    ...collectNodeImageCandidates(element),
+    ...(image ? collectNodeImageCandidates(image) : [])
+  ];
 
   const srcCandidates = [
     anchorCandidate,
-    parseSrcset(sourceSet?.srcset),
-    parseSrcset(sourceSet?.getAttribute("data-srcset")),
+    ...sourceCandidates,
+    ...hintedCandidates,
     image?.getAttribute("data-original"),
     image?.getAttribute("data-original-src"),
     image?.getAttribute("data-src"),
@@ -1411,22 +1444,58 @@ const extractFromPicture = (element) => {
   };
 };
 
-const extractBgUrl = (value) => {
-  if (!value || value === "none") return null;
-  const match = value.match(/url\((['"]?)(.*?)\1\)/i);
-  return match?.[2] || null;
+const extractBgUrls = (value) => {
+  const css = String(value || "").trim();
+  if (!css || css === "none") return [];
+
+  const candidates = [];
+  const pushCandidate = (url, descriptor, order) => {
+    const rawUrl = String(url || "").trim();
+    if (!rawUrl) return;
+    const score = /x$/i.test(descriptor || "")
+      ? Math.round(parseFloat(descriptor) * 1000)
+      : /w$/i.test(descriptor || "")
+        ? parseInt(descriptor, 10)
+        : Math.max(1, 100 - order);
+    candidates.push({
+      url: rawUrl,
+      score: Number.isFinite(score) ? score : Math.max(1, 100 - order)
+    });
+  };
+
+  const urlRe = /url\(\s*(['"]?)(.*?)\1\s*\)(?:\s+type\([^)]+\))?(?:\s+(\d+(?:\.\d+)?x|\d+w))?/gi;
+  let match;
+  let order = 0;
+  while ((match = urlRe.exec(css))) {
+    pushCandidate(match[2], match[3], order);
+    order += 1;
+  }
+
+  const imageSetRe = /(?:-webkit-)?image-set\((.*)\)/gi;
+  while ((match = imageSetRe.exec(css))) {
+    const quotedItemRe = /(['"])(.*?)\1(?:\s+type\([^)]+\))?\s+(\d+(?:\.\d+)?x|\d+w)/gi;
+    let quotedMatch;
+    while ((quotedMatch = quotedItemRe.exec(match[1]))) {
+      pushCandidate(quotedMatch[2], quotedMatch[3], order);
+      order += 1;
+    }
+  }
+
+  return candidates
+    .sort((a, b) => b.score - a.score)
+    .map((item) => item.url);
 };
 
 const extractFromBackground = (element) => {
   if (isTelegramSite()) return null;
-  const inlineBg = extractBgUrl(element.style?.backgroundImage);
-  let computedBg = null;
-  if (!inlineBg) {
+  const inlineCandidates = extractBgUrls(element.style?.backgroundImage);
+  let computedCandidates = [];
+  if (inlineCandidates.length === 0) {
     const computed = window.getComputedStyle(element);
-    computedBg = extractBgUrl(computed?.backgroundImage);
+    computedCandidates = extractBgUrls(computed?.backgroundImage);
   }
 
-  const src = absoluteUrl(inlineBg || computedBg);
+  const src = chooseBestSource([...inlineCandidates, ...computedCandidates]);
   if (!src || isInvalidSource(src)) return null;
 
   const { width, height } = measureElement(element);
@@ -1897,13 +1966,14 @@ const scanImages = () => {
 const COMIC_PAGINATION_SELECTORS =
   ".pager, .pagination, .pg, .pgs, .page-link, .page-links, .wp-pagenavi, " +
   "[class*='page-numbers'], [id*='pager'], [id*='pagination'], " +
-  "nav[aria-label*='page' i], nav[aria-label*='next' i]";
+  "nav[aria-label*='page' i], nav[aria-label*='next' i], nav[aria-label*='chapter' i], " +
+  "[class*='reader-nav'], [class*='chapter-nav'], [class*='comic-nav'], [class*='manga-nav']";
 
-const PAGINATION_QUERY_KEY_RE = /^(?:p|pg|pn|page|page_no|pageno|pageid|chapter|chap|ch|index|paged)$/i;
+const PAGINATION_QUERY_KEY_RE = /^(?:p|pg|pn|page|page_no|pageno|pageid|chapter|chap|ch|index|paged|offset|start|from)$/i;
 const MAX_GENERIC_SLASH_PAGE_NUMBER = 999;
 
-const NEXT_LABEL_RE = /^(?:下一页|下页|next|›|»|>|→)$/i;
-const PREV_LABEL_RE = /^(?:上一页|上页|prev|previous|‹|«|<|←)$/i;
+const NEXT_LABEL_RE = /^(?:下一页|下页|下一章|下一话|下章|下回|下一集|继续阅读|next|next\s*chapter|read\s*next|›|»|>|→)$/i;
+const PREV_LABEL_RE = /^(?:上一页|上页|上一章|上一话|上章|上回|上一集|prev|previous|previous\s*chapter|‹|«|<|←)$/i;
 
 const normalizePaginationHref = (url) => {
   if (!url) return null;
@@ -1964,7 +2034,8 @@ const isLikelyPaginationTransition = (currentHref, candidateHref) => {
   try {
     const cur = new URL(currentHref, location.href);
     const can = new URL(candidateHref, location.href);
-    if (cur.origin !== can.origin) return false;
+    const normalizeHost = (host) => String(host || "").toLowerCase().replace(/^(?:www|m)\./, "");
+    if (cur.origin !== can.origin && normalizeHost(cur.hostname) !== normalizeHost(can.hostname)) return false;
     if (cur.toString() === can.toString()) return false;
     if (hasPaginationQueryTransition(cur, can)) return true;
     const ct = extractPathPaginationToken(cur.pathname);
@@ -1986,12 +2057,28 @@ const readNodeSignature = (node) => {
     node.getAttribute?.("aria-label") || "", node.getAttribute?.("title") || ""].join(" ").toLowerCase();
 };
 
+const getPaginationCandidateHref = (node) => {
+  if (!(node instanceof Element)) return "";
+  const direct =
+    node.getAttribute("href") ||
+    node.getAttribute("data-href") ||
+    node.getAttribute("data-url") ||
+    node.getAttribute("data-next") ||
+    node.getAttribute("to") ||
+    node.getAttribute("data-to") ||
+    "";
+  if (direct) return direct;
+  if (node.tagName === "A" && node.href) return node.href;
+  return "";
+};
+
 const scorePaginationContainer = (container) => {
   if (!(container instanceof Element)) return null;
   const currentUrl = normalizePaginationHref(location.href);
-  const anchors = [
-    ...(container.matches("a[href]") ? [container] : []),
-    ...Array.from(container.querySelectorAll("a[href]"))
+  const candidateSelector = "a[href], button, [role='button'], [data-href], [data-url], [data-next], router-link, [to], [data-to]";
+  const nodes = [
+    ...(container.matches(candidateSelector) ? [container] : []),
+    ...Array.from(container.querySelectorAll(candidateSelector))
   ];
   const linkByUrl = new Map();
   const links = [];
@@ -2001,22 +2088,27 @@ const scorePaginationContainer = (container) => {
   let prevCount = 0;
   let pagerSignalCount = 0;
 
-  for (const anchor of anchors) {
-    const href = normalizePaginationHref(anchor.getAttribute("href") || anchor.href);
+  for (const anchor of nodes) {
+    const href = normalizePaginationHref(getPaginationCandidateHref(anchor));
     if (!href || isLikelyImageHref(href)) continue;
     let parsed;
     try { parsed = new URL(href, location.href); } catch { continue; }
-    if (parsed.origin !== location.origin) continue;
+    const currentParsed = new URL(currentUrl, location.href);
+    const normalizeHost = (host) => String(host || "").toLowerCase().replace(/^(?:www|m)\./, "");
+    if (parsed.origin !== location.origin && normalizeHost(parsed.hostname) !== normalizeHost(currentParsed.hostname)) continue;
 
     const text = String(anchor.textContent || "").trim();
     const page = extractPageNumber(text);
     const sig = `${readNodeSignature(container)} ${readNodeSignature(anchor)}`;
     const innerMarkup = anchor.innerHTML || "";
-    const isNext = anchor.rel?.includes?.("next") === true || /\b(next|nxt)\b/i.test(sig) || NEXT_LABEL_RE.test(text)
+    const rel = String(anchor.getAttribute?.("rel") || "");
+    const isRelNext = /\bnext\b/i.test(rel);
+    const isRelPrev = /\bprev(?:ious)?\b/i.test(rel);
+    const isNext = isRelNext || /\b(next|nxt)\b/i.test(sig) || NEXT_LABEL_RE.test(text)
       || /\b(?:angle-right|arrow-right|chevron-right|right-arrow|icon-right|icon-next)\b/i.test(innerMarkup);
-    const isPrev = anchor.rel?.includes?.("prev") === true || /\b(prev|previous)\b/i.test(sig) || PREV_LABEL_RE.test(text)
+    const isPrev = isRelPrev || /\b(prev|previous)\b/i.test(sig) || PREV_LABEL_RE.test(text)
       || /\b(?:angle-left|arrow-left|chevron-left|left-arrow|icon-left|icon-prev)\b/i.test(innerMarkup);
-    const hasPagerSig = /\b(pager|pagination|page-numbers|pg|pages?)\b/i.test(sig);
+    const hasPagerSig = /\b(pager|pagination|page-numbers|pg|pages?|chapter-nav|reader-nav|comic-nav|manga-nav)\b/i.test(sig);
     const hasTransition = currentUrl ? isLikelyPaginationTransition(currentUrl, href) : false;
     const isCurrent = anchor.matches(".current, [aria-current='page']");
     const hasSignal = isNext || isPrev || page !== null || hasPagerSig;
@@ -2030,6 +2122,7 @@ const scorePaginationContainer = (container) => {
         pageNumber: page,
         isNext,
         isPrev,
+        isRelNext,
         hasTransition,
         hasPagerSig,
         isCurrent
@@ -2042,6 +2135,7 @@ const scorePaginationContainer = (container) => {
     if (entry.pageNumber === null && page !== null) entry.pageNumber = page;
     entry.isNext = entry.isNext || isNext;
     entry.isPrev = entry.isPrev || isPrev;
+    entry.isRelNext = entry.isRelNext || isRelNext;
     entry.hasTransition = entry.hasTransition || hasTransition;
     entry.hasPagerSig = entry.hasPagerSig || hasPagerSig;
     entry.isCurrent = entry.isCurrent || isCurrent;
@@ -2055,6 +2149,7 @@ const scorePaginationContainer = (container) => {
     if (link.hasPagerSig) s += 4;
     if (link.pageNumber !== null) s += 4;
     if (link.isNext || link.isPrev) s += 5;
+    if (link.isRelNext) s += 6;
     if (link.hasTransition) s += 5;
     if (link.url === currentUrl) s += 1;
 
@@ -2079,27 +2174,34 @@ const buildComicPagination = () => {
 
   const containers = new Set();
   try {
-    for (const node of document.querySelectorAll(COMIC_PAGINATION_SELECTORS)) {
-      if (node instanceof Element) containers.add(node);
+    for (const scope of collectShadowRoots(document)) {
+      for (const node of scope.querySelectorAll?.(COMIC_PAGINATION_SELECTORS) || []) {
+        if (node instanceof Element) containers.add(node);
+      }
     }
   } catch { /* ignore */ }
 
-  for (const anchor of document.querySelectorAll("a[href]")) {
-    const text = String(anchor.textContent || "").trim();
-    const sig = readNodeSignature(anchor);
-    if (
-      NEXT_LABEL_RE.test(text) || PREV_LABEL_RE.test(text) ||
-      /\b(next|prev|pager|pagination|page-numbers|pg)\b/i.test(sig)
-    ) {
-      const parent = (() => {
-        try {
-          const found = anchor.closest(COMIC_PAGINATION_SELECTORS);
-          return found && found !== anchor ? found : null;
-        } catch { return null; }
-      })() || anchor.parentElement;
-      if (parent instanceof Element) containers.add(parent);
+  for (const scope of collectShadowRoots(document)) {
+    for (const anchor of scope.querySelectorAll?.("a[href], button, [role='button'], [data-href], [data-url], [data-next], router-link, [to], [data-to]") || []) {
+      const text = String(anchor.textContent || "").trim();
+      const sig = readNodeSignature(anchor);
+      if (
+        NEXT_LABEL_RE.test(text) || PREV_LABEL_RE.test(text) ||
+        /\b(next|prev|previous|pager|pagination|page-numbers|pg|chapter-nav|reader-nav|comic-nav|manga-nav)\b/i.test(sig)
+      ) {
+        const parent = (() => {
+          try {
+            const found = anchor.closest(COMIC_PAGINATION_SELECTORS);
+            return found && found !== anchor ? found : null;
+          } catch { return null; }
+        })() || anchor.parentElement;
+        if (parent instanceof Element) containers.add(parent);
+      }
     }
   }
+
+  const relNext = document.querySelector("link[rel~='next'][href]");
+  const relNextUrl = normalizePaginationHref(relNext?.getAttribute("href"));
 
   let best = null;
   for (const container of containers) {
@@ -2108,7 +2210,16 @@ const buildComicPagination = () => {
     if (!best || candidate.score > best.score) best = candidate;
   }
 
-  if (!best || best.links.length === 0) return { supported: false, currentUrl };
+  if (!best || best.links.length === 0) {
+    return {
+      supported: false,
+      currentUrl,
+      currentPage: null,
+      totalPages: null,
+      nextUrl: relNextUrl || "",
+      candidates: relNextUrl ? [relNextUrl] : []
+    };
+  }
 
   const currentPage = best.currentPage;
   const pageUrls = [];
@@ -2126,6 +2237,12 @@ const buildComicPagination = () => {
   }
   if (nextUrl && !seenUrls.has(nextUrl)) {
     pageUrls.push({ url: nextUrl, pageNumber: null });
+  }
+  if (!nextUrl && relNextUrl) {
+    nextUrl = relNextUrl;
+    if (!seenUrls.has(relNextUrl)) {
+      pageUrls.push({ url: relNextUrl, pageNumber: null });
+    }
   }
 
   if (!nextUrl && pageUrls.length > 0) {
@@ -2146,7 +2263,11 @@ const buildComicPagination = () => {
   const hasReliableFlow = currentPage !== null
     ? numericFwdCount > 0 && (hasStructural || transitionCount > 0)
     : hasUnknownPageFlow;
-  const supported = best.score >= 6 && hasReliableFlow;
+  const hasStrongSingleNext =
+    best.nextCount > 0 &&
+    forwardUrls.length > 0 &&
+    (transitionCount > 0 || best.links.some((link) => link.isRelNext));
+  const supported = best.score >= 6 && (hasReliableFlow || hasStrongSingleNext);
 
   return {
     supported,
@@ -2292,8 +2413,10 @@ let autoScrollStableHeight = 0;
 let autoScrollStableCount = 0;
 let autoScrollStableSince = 0;
 let autoScrollExpectedTop = 0;
+let autoScrollElementRoot = null;
 let autoScrollProgrammaticUntil = 0;
 let autoScrollUserIntentUntil = 0;
+let autoScrollIgnoreUserInterrupt = false;
 const AUTO_SCROLL_INTERVAL_MS = 680;
 const AUTO_SCROLL_SETTLE_INTERVAL_MS = 980;
 const AUTO_SCROLL_STEP_MIN = 280;
@@ -2494,7 +2617,62 @@ const stopAutoScan = () => {
   autoScanMutationRoots.clear();
 };
 
-const getScrollMetrics = () => {
+const isVisibleElement = (element) => {
+  const rect = element.getBoundingClientRect?.();
+  if (!rect || rect.width < 80 || rect.height < 80) return false;
+  const viewportWidth = Number(window.innerWidth) || document.documentElement?.clientWidth || 0;
+  const viewportHeight = Number(window.innerHeight) || document.documentElement?.clientHeight || 0;
+  return rect.bottom > 0 && rect.right > 0 && rect.top < viewportHeight && rect.left < viewportWidth;
+};
+
+const getScrollableElementScore = (element) => {
+  if (!(element instanceof Element)) return 0;
+  if (element === document.documentElement || element === document.body || element === document.scrollingElement) return 0;
+  if (!isVisibleElement(element)) return 0;
+  const scrollHeight = Number(element.scrollHeight) || 0;
+  const clientHeight = Number(element.clientHeight) || 0;
+  const maxTop = scrollHeight - clientHeight;
+  if (maxTop <= 120) return 0;
+  const style = window.getComputedStyle(element);
+  if (!/(auto|scroll|overlay)/i.test(style.overflowY || "")) return 0;
+
+  const imageCount = Math.min(30, element.querySelectorAll?.("img, picture, [style*='background']").length || 0);
+  const rect = element.getBoundingClientRect();
+  const viewportHeight = Number(window.innerHeight) || document.documentElement?.clientHeight || 1;
+  const visibleRatio = Math.max(0, Math.min(rect.bottom, viewportHeight) - Math.max(rect.top, 0)) / Math.max(1, rect.height);
+  return imageCount * 12 + Math.min(40, maxTop / 300) + visibleRatio * 10;
+};
+
+const getBestScrollableElement = () => {
+  if (autoScrollElementRoot && getScrollableElementScore(autoScrollElementRoot) >= 18) {
+    return autoScrollElementRoot;
+  }
+  autoScrollElementRoot = null;
+
+  const roots = collectShadowRoots(document);
+  let best = null;
+  let bestScore = 0;
+  let scanned = 0;
+  for (const root of roots) {
+    const elements = root.querySelectorAll?.("*") || [];
+    for (const element of elements) {
+      scanned += 1;
+      if (scanned > 1800) {
+        autoScrollElementRoot = bestScore >= 18 ? best : null;
+        return autoScrollElementRoot;
+      }
+      const score = getScrollableElementScore(element);
+      if (score > bestScore) {
+        best = element;
+        bestScore = score;
+      }
+    }
+  }
+  autoScrollElementRoot = bestScore >= 18 ? best : null;
+  return autoScrollElementRoot;
+};
+
+const getDocumentScrollMetrics = () => {
   const root = document.scrollingElement || document.documentElement || document.body;
   const viewportHeight = Math.max(
     Number(window.innerHeight) || 0,
@@ -2522,6 +2700,32 @@ const getScrollMetrics = () => {
     scrollTop,
     maxTop: Math.max(0, scrollHeight - viewportHeight)
   };
+};
+
+const getScrollMetrics = () => {
+  const documentMetrics = getDocumentScrollMetrics();
+  const elementRoot = getBestScrollableElement();
+  if (!elementRoot) return { ...documentMetrics, isElementRoot: false };
+
+  const viewportHeight = Math.max(
+    Number(elementRoot.clientHeight) || 0,
+    Math.round(elementRoot.getBoundingClientRect?.().height || 0),
+    1
+  );
+  const scrollHeight = Math.max(Number(elementRoot.scrollHeight) || 0, viewportHeight);
+  const scrollTop = Math.max(Number(elementRoot.scrollTop) || 0, 0);
+  const elementMetrics = {
+    root: elementRoot,
+    viewportHeight,
+    scrollHeight,
+    scrollTop,
+    maxTop: Math.max(0, scrollHeight - viewportHeight),
+    isElementRoot: true
+  };
+
+  return elementMetrics.maxTop > documentMetrics.maxTop + 120
+    ? elementMetrics
+    : { ...documentMetrics, isElementRoot: false };
 };
 
 const getAutoScrollObservedCount = () => {
@@ -2571,12 +2775,14 @@ const reportAutoScrollStopped = (reason = "complete") => {
 };
 
 const completeAutoScroll = (reason = "complete") => {
+  if (reason === "manual_interrupt" && autoScrollIgnoreUserInterrupt) return;
   stopAutoScroll();
   reportAutoScrollStopped(reason);
 };
 
 const markAutoScrollUserIntent = (durationMs = 1400) => {
   if (!autoScrollEnabled) return;
+  if (autoScrollIgnoreUserInterrupt) return;
   autoScrollUserIntentUntil = Date.now() + Math.max(300, Number(durationMs) || 1400);
 };
 
@@ -2673,10 +2879,14 @@ const scheduleAutoScrollTick = (delayMs = getAutoScrollProfileConfig().intervalM
 
     autoScrollExpectedTop = targetTop;
     autoScrollProgrammaticUntil = Date.now() + 900;
-    window.scrollTo({
-      top: targetTop,
-      behavior: "auto"
-    });
+    if (metrics.isElementRoot && metrics.root instanceof Element) {
+      metrics.root.scrollTop = targetTop;
+    } else {
+      window.scrollTo({
+        top: targetTop,
+        behavior: "auto"
+      });
+    }
 
     requestAnimationFrame(() => {
       if (!autoScrollEnabled) return;
@@ -2713,9 +2923,10 @@ const scheduleAutoScrollTick = (delayMs = getAutoScrollProfileConfig().intervalM
   }, Math.max(80, Number(delayMs) || getAutoScrollProfileConfig().intervalMs));
 };
 
-const startAutoScroll = (profile = "normal") => {
+const startAutoScroll = (profile = "normal", options = {}) => {
   const nextProfile = profile === "comic" ? "comic" : "normal";
   autoScrollProfile = nextProfile;
+  autoScrollIgnoreUserInterrupt = options?.ignoreUserInterrupt === true;
   if (autoScrollEnabled) return;
   autoScrollEnabled = true;
   autoScrollStallCount = 0;
@@ -2728,6 +2939,7 @@ const startAutoScroll = (profile = "normal") => {
   autoScrollStableCount = autoScrollLastObservedCount;
   autoScrollStableSince = autoScrollStartedAt;
   autoScrollExpectedTop = getScrollMetrics().scrollTop;
+  autoScrollElementRoot = null;
   autoScrollProgrammaticUntil = 0;
   autoScrollUserIntentUntil = 0;
   scheduleAutoScrollTick(autoScrollProfile === "comic" ? 120 : 180);
@@ -2746,8 +2958,10 @@ const stopAutoScroll = () => {
   autoScrollStableCount = 0;
   autoScrollStableSince = 0;
   autoScrollExpectedTop = 0;
+  autoScrollElementRoot = null;
   autoScrollProgrammaticUntil = 0;
   autoScrollUserIntentUntil = 0;
+  autoScrollIgnoreUserInterrupt = false;
   if (autoScrollTimer) {
     clearTimeout(autoScrollTimer);
     autoScrollTimer = null;
@@ -2756,22 +2970,26 @@ const stopAutoScroll = () => {
 
 window.addEventListener("wheel", (event) => {
   if (!autoScrollEnabled || !event.isTrusted) return;
+  if (autoScrollIgnoreUserInterrupt) return;
   if (Math.abs(Number(event.deltaY) || 0) < 4) return;
   completeAutoScroll("manual_interrupt");
 }, { passive: true, capture: true });
 
 window.addEventListener("mousedown", (event) => {
   if (!autoScrollEnabled || !event.isTrusted) return;
+  if (autoScrollIgnoreUserInterrupt) return;
   markAutoScrollUserIntent(1600);
 }, true);
 
 window.addEventListener("touchstart", (event) => {
   if (!autoScrollEnabled || !event.isTrusted) return;
+  if (autoScrollIgnoreUserInterrupt) return;
   markAutoScrollUserIntent(1800);
 }, { passive: true, capture: true });
 
 window.addEventListener("keydown", (event) => {
   if (!autoScrollEnabled || !event.isTrusted) return;
+  if (autoScrollIgnoreUserInterrupt) return;
   if (!["ArrowUp", "ArrowDown", "PageUp", "PageDown", "Home", "End", " ", "Spacebar"].includes(event.key)) {
     return;
   }
@@ -2780,6 +2998,7 @@ window.addEventListener("keydown", (event) => {
 
 window.addEventListener("scroll", () => {
   if (!autoScrollEnabled) return;
+  if (autoScrollIgnoreUserInterrupt) return;
   const now = Date.now();
   if (now <= autoScrollProgrammaticUntil) return;
   if (now > autoScrollUserIntentUntil) return;
@@ -2826,7 +3045,8 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
     }
 
     case MSG.START_AUTO_SCROLL: {
-      startAutoScroll(message?.payload?.profile || message?.profile || "normal");
+      const payload = message?.payload || {};
+      startAutoScroll(payload.profile || message?.profile || "normal", payload);
       sendResponse({ success: true });
       break;
     }
