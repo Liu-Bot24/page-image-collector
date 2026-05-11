@@ -174,20 +174,46 @@ const copyImagePayloadToClipboard = async (dataUrl, fallbackUrl = "") => {
   return { success: false, error: "Clipboard write failed" };
 };
 
+const splitSrcsetCandidates = (srcset) => {
+  const candidates = [];
+  let current = "";
+  let dataUrlCommaConsumed = false;
+
+  for (let i = 0; i < srcset.length; i += 1) {
+    const char = srcset[i];
+    if (char === ",") {
+      const trimmed = current.trim();
+      const dataUrlWithoutDescriptor = /^data:/i.test(trimmed) && !/\s+\d+(?:w|x)\s*$/i.test(trimmed);
+      if (dataUrlWithoutDescriptor && !dataUrlCommaConsumed) {
+        dataUrlCommaConsumed = true;
+      } else {
+        if (trimmed) candidates.push(trimmed);
+        current = "";
+        dataUrlCommaConsumed = false;
+        continue;
+      }
+    }
+    current += char;
+  }
+
+  const trailing = current.trim();
+  if (trailing) candidates.push(trailing);
+  return candidates;
+};
+
 const parseSrcset = (srcset) => {
   if (!srcset || typeof srcset !== "string") return null;
-  const candidates = srcset
-    .split(",")
+  const candidates = splitSrcsetCandidates(srcset)
     .map((item) => item.trim())
     .filter(Boolean)
-    .map((item) => {
+    .map((item, order) => {
       const [url, descriptor] = item.split(/\s+/, 2);
       const score = descriptor?.endsWith("w")
         ? parseInt(descriptor, 10)
         : descriptor?.endsWith("x")
           ? Math.round(parseFloat(descriptor) * 1000)
-          : 0;
-      return { url, score: Number.isFinite(score) ? score : 0 };
+          : Math.max(1, 100 - order);
+      return { url, score: Number.isFinite(score) ? score : Math.max(1, 100 - order) };
     })
     .sort((a, b) => b.score - a.score);
 
@@ -2393,6 +2419,28 @@ const scheduleIncrementalScan = () => {
   }, 220);
 };
 
+const AUTO_SCAN_ATTRIBUTE_FILTER = [
+  "src",
+  "srcset",
+  "style",
+  "data-src",
+  "data-srcset",
+  "data-original",
+  "data-original-src",
+  "data-lazy-src",
+  "data-actualsrc",
+  "data-zoom-image",
+  "data-large-image",
+  "data-url",
+  "data-pic",
+  "data-image",
+  "data-img",
+  "data-full",
+  "data-full-src",
+  "data-fullsrc",
+  "data-highres"
+];
+
 const startAutoScan = () => {
   if (autoScanEnabled) return;
   autoScanEnabled = true;
@@ -2428,7 +2476,7 @@ const startAutoScan = () => {
     childList: true,
     subtree: true,
     attributes: true,
-    attributeFilter: ["src", "srcset", "style", "data-src", "data-srcset"]
+    attributeFilter: AUTO_SCAN_ATTRIBUTE_FILTER
   });
 };
 

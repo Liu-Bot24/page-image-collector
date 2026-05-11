@@ -55,6 +55,15 @@
             <span class="switch-slider" aria-hidden="true"></span>
             <span class="switch-text">批量下载ZIP</span>
           </label>
+          <label class="metric-filter zip-part-preset" title="控制每个 ZIP 分卷的最大体积和图片数量">
+            <span>ZIP分卷</span>
+            <select id="zip-part-preset">
+              <option value="stable">稳定 96MB/200张</option>
+              <option value="balanced">默认 192MB/300张</option>
+              <option value="large">大包 384MB/500张</option>
+              <option value="xlarge">超大 768MB/800张</option>
+            </select>
+          </label>
       </div>
 
       <div class="console-row row-resolution">

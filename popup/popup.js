@@ -140,6 +140,38 @@ const sendMessage = async (type, payload = {}) => {
   });
 };
 
+const normalizePreviewImageUrl = (url) => {
+  const raw = String(url || "").trim();
+  if (!raw) return "";
+  try {
+    const parsed = new URL(raw, location.href);
+    if (parsed.protocol === "http:" || parsed.protocol === "https:" || parsed.protocol === "blob:") {
+      return parsed.href;
+    }
+    if (parsed.protocol === "data:" && /^data:image\//i.test(raw)) {
+      return raw;
+    }
+    if (parsed.protocol === "chrome-extension:" && parsed.origin === location.origin) {
+      return parsed.href;
+    }
+  } catch (_error) {
+    // Ignore invalid URLs from page-controlled attributes.
+  }
+  return "";
+};
+
+const setImagePreviewSrc = (imgElement, ...candidates) => {
+  for (const candidate of candidates) {
+    const safeUrl = normalizePreviewImageUrl(candidate);
+    if (safeUrl) {
+      imgElement.src = safeUrl;
+      return true;
+    }
+  }
+  imgElement.removeAttribute("src");
+  return false;
+};
+
 const openDownloadDirectory = async () => {
   const response = await sendMessage(MSG.OPEN_DOWNLOAD_DIRECTORY);
   if (!response.success) {
@@ -705,11 +737,16 @@ const renderFormatFilters = (stats = {}) => {
   const fragment = document.createDocumentFragment();
   for (const option of options) {
     const label = document.createElement("label");
-    label.innerHTML = `
-      <input type="checkbox" value="${option.value}" ${selected.has(option.value) ? "checked" : ""}>
-      <span>${option.label}</span>
-      <span class="format-count">${option.count}</span>
-    `;
+    const input = document.createElement("input");
+    input.type = "checkbox";
+    input.value = String(option.value || "");
+    input.checked = selected.has(option.value);
+    const name = document.createElement("span");
+    name.textContent = String(option.label || "");
+    const count = document.createElement("span");
+    count.className = "format-count";
+    count.textContent = String(Number(option.count) || 0);
+    label.append(input, name, count);
     fragment.appendChild(label);
   }
   elements.formatFilters.appendChild(fragment);
@@ -818,24 +855,45 @@ const createCard = (image, index) => {
   const card = document.createElement("div");
   card.className = `image-card${isSelected ? " selected" : ""}`;
   card.dataset.id = image.id;
-  card.innerHTML = `
-    <div class="image-wrapper">
-      <img src="${displaySrc}" alt="Image preview" loading="lazy">
-      ${isHdBadge(image) ? '<span class="hd-badge">HD</span>' : ""}
-      <span class="format-badge">${format}</span>
-      <button class="checkbox ${isSelected ? "checked" : ""}" type="button">${isSelected ? "✓" : ""}</button>
-    </div>
-    <div class="image-info">
-      <span>${meta.width} × ${meta.height}</span>
-      <span>${formatAreaMp(meta.area)}</span>
-    </div>
-  `;
 
-  const imageNode = card.querySelector("img");
+  const wrapper = document.createElement("div");
+  wrapper.className = "image-wrapper";
+  const imageNode = document.createElement("img");
+  imageNode.alt = "Image preview";
+  imageNode.loading = "lazy";
+  setImagePreviewSrc(imageNode, displaySrc, image.src);
+  wrapper.appendChild(imageNode);
+
+  if (isHdBadge(image)) {
+    const hdBadge = document.createElement("span");
+    hdBadge.className = "hd-badge";
+    hdBadge.textContent = "HD";
+    wrapper.appendChild(hdBadge);
+  }
+
+  const formatBadge = document.createElement("span");
+  formatBadge.className = "format-badge";
+  formatBadge.textContent = format;
+  wrapper.appendChild(formatBadge);
+
+  const checkbox = document.createElement("button");
+  checkbox.className = `checkbox${isSelected ? " checked" : ""}`;
+  checkbox.type = "button";
+  checkbox.textContent = isSelected ? "✓" : "";
+  wrapper.appendChild(checkbox);
+
+  const info = document.createElement("div");
+  info.className = "image-info";
+  const dimensions = document.createElement("span");
+  dimensions.textContent = `${meta.width} × ${meta.height}`;
+  const area = document.createElement("span");
+  area.textContent = formatAreaMp(meta.area);
+  info.append(dimensions, area);
+  card.append(wrapper, info);
+
   imageNode.addEventListener("error", () => fallbackImageError(imageNode, image.src, image));
   imageNode.addEventListener("click", () => openLightbox(image, index));
 
-  const checkbox = card.querySelector(".checkbox");
   checkbox.addEventListener("click", async (event) => {
     event.stopPropagation();
     await toggleSelect(image.id);
@@ -853,6 +911,7 @@ const renderImages = async () => {
     return;
   }
   const allImages = allResponse.images || [];
+  const visibleAllImages = allImages.filter((image) => image.hidden !== true);
 
   const needsDimensionHydration =
     currentConfig.enableHD &&
@@ -866,10 +925,10 @@ const renderImages = async () => {
       filters.minArea > 0
     );
   if (needsDimensionHydration) {
-    await Promise.all(allImages.map((image) => resolveCardMaxDimensions(image)));
+    await Promise.all(visibleAllImages.map((image) => resolveCardMaxDimensions(image)));
   }
 
-  const metricAndOrientationFiltered = allImages
+  const metricAndOrientationFiltered = visibleAllImages
     .filter((image) => passesMetricFilters(image, filters))
     .filter((image) => passesOrientationFilter(image));
   const facetStats = computeFormatStatsFromImages(metricAndOrientationFiltered);
@@ -1137,6 +1196,10 @@ const downloadSelected = async () => {
         phase: "failed",
         error: response.error || "未知错误"
       });
+      return;
+    }
+    if (response.accepted) {
+      await restoreDownloadStatus();
       return;
     }
     if (response.zipped) {

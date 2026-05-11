@@ -69,6 +69,10 @@ body {
   font-size: 12px;
 }
 
+.zip-part-preset select {
+  width: 150px;
+}
+
 .metric-filter select:focus {
   outline: none;
   border-color: var(--primary-color);

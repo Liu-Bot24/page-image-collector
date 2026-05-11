@@ -53,7 +53,7 @@ A Chrome extension for daily browsing scenarios, used to quickly collect web pag
 ## What's New in 1.2.0
 
 - Added Comic Mode (Experimental): One-click entry via right-click menu or Popup, images are arranged according to the original reading order on the page.
-- Comic mode supports automatic pagination detection and page-by-page fetching of subsequent images without manual page turning.
+- Comic mode supports automatic pagination detection; after user confirmation, it can fetch subsequent pages one by one without manual page turning.
 - Added quick entry for Comic Mode in Popup.
 - Optimized auto-scroll state synchronization, promptly notifying Popup and Workspace when stopped.
 
@@ -67,10 +67,10 @@ A Chrome extension for daily browsing scenarios, used to quickly collect web pag
 ## Features
 
 - **Multi-source Collection:** Supports common image sources like `img`, `picture`, `srcset`, common `data-*` lazy loading fields, background images, etc.
-- **Incremental Collection:** Supports manual continuous scanning and automatic collection, suitable for news feeds, masonry layouts, and infinite scrolling pages.
-- **Comic Mode:** Experimental feature, accessible via right-click menu or Popup. Images are arranged in DOM order, supports automatic pagination detection and sequential loading of subsequent page images.
+- **Incremental Collection:** Supports manual continuous scanning and automatic collection, listens to common lazy-loading fields and dynamically added images, suitable for news feeds, masonry layouts, and infinite scrolling pages.
+- **Comic Mode:** Experimental feature, accessible via right-click menu or Popup. Images are arranged in DOM order, supports automatic pagination detection, and loads subsequent pages after user confirmation.
   - Pagination detection is based on heuristic analysis of page structure; some unconventional pagination structures may not be recognized.
-  - When automatically fetching subsequent pages, only loaded image content on each page is collected; if the target page relies on scrolling to trigger lazy loading, images that have not entered the viewport may not be collected.
+  - When loading subsequent pages, the extension attempts to trigger basic lazy loading within the per-page wait limit, but it does not guarantee complete collection on every site.
 - **Auto Scroll:** Popup provides an auto-scroll entry, suitable for use with auto-collection for long lists and infinite scroll pages, or can be used independently.
 - **Smart Merging:** Automatically regularizes common parameter differences, size variants, and some original image links.
 - **Fine-grained Filtering:** Supports format filtering, resolution presets, minimum short edge, minimum long edge, and minimum pixel threshold.
@@ -107,8 +107,9 @@ Suitable for handling more complex collection tasks:
 - More immersive preview experience
 - Full-screen viewing and switching
 - Batch downloading and ZIP archiving
-- Comic Mode: Reading order arrangement, automatic pagination detection, and loading
+- Comic Mode: Reading order arrangement, automatic pagination detection, and loading after user confirmation
 - Layout Switching: Supports Grid and Masonry viewing modes
+- Hidden images: Hidden state is saved in the current collection session and can be viewed or restored through the "Hidden" filter
 - Pick up collected results from Popup, continue filtering and processing
 
 ## Usage
@@ -122,6 +123,7 @@ Suitable for handling more complex collection tasks:
 ### Auto Collection
 
 - When enabled, it monitors new image nodes added to the page and automatically adds them incrementally to the result set.
+- It listens to common lazy-loading fields and dynamically added images; complex sites may still require manual continuous scanning or auto-scroll assistance.
 - Suitable for dynamically loaded pages, such as feeds, long lists, and masonry pages.
 - It is recommended to perform a manual scan first, then enable auto collection.
 
@@ -169,6 +171,7 @@ Suitable for handling more complex collection tasks:
 - `Batch Download ZIP` is off by default; enable it manually as needed.
 - Batch tasks will output ZIP files, suitable for centralized archiving.
 - Large batch tasks will automatically split into volumes and download them sequentially.
+- ZIP volume settings are configured in Workspace; ZIP downloads started from Popup use the current global volume setting.
 - The packing and downloading process will display the current volume and overall processing progress.
 - Filename rules:
   - Single volume: `domain-YYYYMMDD-HHMM-images.zip`
@@ -176,6 +179,7 @@ Suitable for handling more complex collection tasks:
 - Automatic volume splitting conditions:
   - A single volume reaches approximately `192MB`.
   - Or a single volume reaches `300` images.
+- For large batches, the default or more stable volume setting is recommended; extra-large volumes increase memory pressure.
 
 ### Copying Strategy
 
@@ -233,6 +237,8 @@ For dynamic pages, it is recommended to perform a manual scan first, then enable
 - Strict anti-hotlinking, temporary signed links, or restricted image hosts may cause original image links to be undownloadable directly.
 - Some sites require expanding a details area or loading more content first before obtaining the complete image results.
 - Enabling auto collection on large dynamic pages may bring certain performance overheads.
+- For pages with login-state restrictions, strict anti-hotlinking, delayed scripts, inner scroll containers, Canvas / Blob content, or virtualized lists, the extension can only make a best-effort collection of accessible resources.
+- Subsequent page loading keeps user confirmation and will not automatically fetch unlimited pages after entering Comic Mode.
 - The Popup is limited by the browser extension popup mechanism and will close automatically when it loses focus; long-term observation, batch filtering, and centralized processing are recommended to be completed in the Workspace.
 - Large batch ZIP downloads will consume more browser resources; the number of volumes and time taken will vary with the volume of images on the page.
 

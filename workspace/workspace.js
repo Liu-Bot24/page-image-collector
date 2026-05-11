@@ -3,6 +3,7 @@ const MSG = {
   GET_IMAGES: "GET_IMAGES",
   TOGGLE_SELECT: "TOGGLE_SELECT",
   SET_SELECTION: "SET_SELECTION",
+  SET_HIDDEN_IMAGES: "SET_HIDDEN_IMAGES",
   GET_SELECTED: "GET_SELECTED",
   GET_STATS: "GET_STATS",
   DOWNLOAD: "DOWNLOAD",
@@ -38,6 +39,7 @@ const elements = {
   togglePortraitOnly: document.getElementById("toggle-portrait-only"),
   toggleWebP: document.getElementById("toggle-webp"),
   toggleBatchZipDownload: document.getElementById("toggle-batch-zip-download"),
+  zipPartPreset: document.getElementById("zip-part-preset"),
   btnSelectAll: document.getElementById("btn-select-all"),
   btnHideToggle: document.getElementById("btn-hide-toggle"),
   btnDownloadBatch: document.getElementById("btn-download-batch"),
@@ -98,6 +100,7 @@ let sourceTabId = null;
 let currentImages = [];
 let selectedIds = new Set();
 const hiddenImageIds = new Set();
+let galleryRenderToken = 0;
 let currentLayoutMode = "grid";
 let currentZoom = 100;
 let lightboxImage = null;
@@ -128,7 +131,8 @@ let currentConfig = {
   enableAutoScan: false,
   enableAutoScroll: false,
   enableWebPConvert: false,
-  enableBatchZipDownload: false
+  enableBatchZipDownload: false,
+  zipPartPreset: "balanced"
 };
 let hasScannedOnce = false;
 let comicModeEnabled = false;
@@ -179,6 +183,9 @@ const FORMAT_GROUPS = [
   { value: "avif", label: "AVIF", aliases: ["avif"] }
 ];
 const PRIMARY_FORMATS = new Set(FORMAT_GROUPS.flatMap((item) => item.aliases));
+const ZIP_PART_PRESETS = new Set(["stable", "balanced", "large", "xlarge"]);
+const DEFAULT_ZIP_PART_PRESET = "balanced";
+const GALLERY_RENDER_BATCH_SIZE = 80;
 
 const RESOLUTION_PRESETS = {
   all: { type: "all", minShort: 0, minLong: 0, minArea: 0 },
@@ -246,6 +253,45 @@ const sendMessage = async (type, payload = {}) => {
       }
     );
   });
+};
+
+const normalizeZipPartPreset = (value) => {
+  const preset = String(value || "").trim().toLowerCase();
+  return ZIP_PART_PRESETS.has(preset) ? preset : DEFAULT_ZIP_PART_PRESET;
+};
+
+const getZipPartPreset = () => normalizeZipPartPreset(elements.zipPartPreset?.value || currentConfig.zipPartPreset);
+
+const normalizePreviewImageUrl = (url) => {
+  const raw = String(url || "").trim();
+  if (!raw) return "";
+  try {
+    const parsed = new URL(raw, location.href);
+    if (parsed.protocol === "http:" || parsed.protocol === "https:" || parsed.protocol === "blob:") {
+      return parsed.href;
+    }
+    if (parsed.protocol === "data:" && /^data:image\//i.test(raw)) {
+      return raw;
+    }
+    if (parsed.protocol === "chrome-extension:" && parsed.origin === location.origin) {
+      return parsed.href;
+    }
+  } catch (_error) {
+    // Ignore invalid URLs from page-controlled attributes.
+  }
+  return "";
+};
+
+const setImagePreviewSrc = (imgElement, ...candidates) => {
+  for (const candidate of candidates) {
+    const safeUrl = normalizePreviewImageUrl(candidate);
+    if (safeUrl) {
+      imgElement.src = safeUrl;
+      return true;
+    }
+  }
+  imgElement.removeAttribute("src");
+  return false;
 };
 
 const openDownloadDirectory = async () => {
@@ -678,6 +724,41 @@ const invalidateComicSequenceCache = () => {
   comicSequenceTask = null;
 };
 
+const normalizeComicOrderNumber = (value) => {
+  const number = Number(value);
+  return Number.isInteger(number) && number >= 0 ? number : null;
+};
+
+const comicOrderKeysForImage = (image) => [
+  image?.normalized,
+  image?.hdSrc,
+  image?.originalSrc,
+  image?.src
+]
+  .map((value) => String(value || "").trim())
+  .filter(Boolean);
+
+const buildSourceComicOrderMap = (sequence) => {
+  const orderMap = new Map();
+  if (!Array.isArray(sequence)) return orderMap;
+  sequence.forEach((item, order) => {
+    for (const key of [item?.normalized, item?.hdNormalized]) {
+      const normalizedKey = String(key || "").trim();
+      if (normalizedKey && !orderMap.has(normalizedKey)) {
+        orderMap.set(normalizedKey, order);
+      }
+    }
+  });
+  return orderMap;
+};
+
+const getPaginationComicOrder = (image) => {
+  const pageIndex = normalizeComicOrderNumber(image?.comicPageIndex);
+  const pageOrder = normalizeComicOrderNumber(image?.comicPageOrder);
+  if (pageIndex === null || pageOrder === null) return null;
+  return { pageIndex, pageOrder };
+};
+
 const fetchComicSequence = async () => {
   if (comicSequenceCache) return comicSequenceCache;
   if (comicSequenceTask) return await comicSequenceTask;
@@ -717,7 +798,18 @@ const applyComicSequenceOrder = async (images = []) => {
   }
 
   if (!Array.isArray(sequence) || sequence.length === 0) {
-    return images;
+    const metadataOrdered = images
+      .map((image, index) => ({ image, index, order: getPaginationComicOrder(image) }))
+      .sort((a, b) => {
+        if (a.order && b.order) {
+          return (a.order.pageIndex - b.order.pageIndex) ||
+            (a.order.pageOrder - b.order.pageOrder) ||
+            (a.index - b.index);
+        }
+        return a.index - b.index;
+      })
+      .map((item) => item.image);
+    return metadataOrdered;
   }
 
   const byNormalized = new Map();
@@ -730,10 +822,15 @@ const applyComicSequenceOrder = async (images = []) => {
   const ordered = [];
   const usedIds = new Set();
 
+  const sourceOrderMap = buildSourceComicOrderMap(sequence);
   for (const item of sequence) {
-    const candidate =
-      (item?.hdNormalized && byNormalized.get(item.hdNormalized)) ||
-      (item?.normalized && byNormalized.get(item.normalized));
+    let candidate = null;
+    for (const key of [item?.hdNormalized, item?.normalized]) {
+      const normalizedKey = String(key || "").trim();
+      if (!normalizedKey) continue;
+      candidate = byNormalized.get(normalizedKey);
+      if (candidate) break;
+    }
     if (!candidate || usedIds.has(candidate.id)) continue;
     ordered.push(candidate);
     usedIds.add(candidate.id);
@@ -743,10 +840,29 @@ const applyComicSequenceOrder = async (images = []) => {
     return images;
   }
 
-  for (const image of images) {
-    if (usedIds.has(image.id)) continue;
-    ordered.push(image);
-  }
+  const remaining = images
+    .map((image, index) => ({
+      image,
+      index,
+      pageOrder: getPaginationComicOrder(image),
+      sourceOrder: comicOrderKeysForImage(image)
+        .map((key) => sourceOrderMap.get(key))
+        .find((order) => Number.isInteger(order))
+    }))
+    .filter((item) => !usedIds.has(item.image.id))
+    .sort((a, b) => {
+      if (a.pageOrder && b.pageOrder) {
+        return (a.pageOrder.pageIndex - b.pageOrder.pageIndex) ||
+          (a.pageOrder.pageOrder - b.pageOrder.pageOrder) ||
+          (a.index - b.index);
+      }
+      if (Number.isInteger(a.sourceOrder) && Number.isInteger(b.sourceOrder)) {
+        return a.sourceOrder - b.sourceOrder || a.index - b.index;
+      }
+      return a.index - b.index;
+    });
+
+  ordered.push(...remaining.map((item) => item.image));
 
   return ordered;
 };
@@ -999,11 +1115,17 @@ const renderFormatFilters = (stats = {}) => {
       ? option.value !== "_hidden"
       : selected.has(option.value);
     const label = document.createElement("label");
-    label.innerHTML = `
-      <input type="checkbox" value="${option.value}" ${checked ? "checked" : ""}>
-      <span class="format-name">${option.label}</span>
-      <span class="format-count">${option.count}</span>
-    `;
+    const input = document.createElement("input");
+    input.type = "checkbox";
+    input.value = String(option.value || "");
+    input.checked = checked;
+    const name = document.createElement("span");
+    name.className = "format-name";
+    name.textContent = String(option.label || "");
+    const count = document.createElement("span");
+    count.className = "format-count";
+    count.textContent = String(Number(option.count) || 0);
+    label.append(input, name, count);
     fragment.appendChild(label);
   }
 
@@ -1220,12 +1342,12 @@ const passesOrientationFilter = (image) => {
 };
 
 const passesFormatFilters = (image, selectedFormats = []) => {
-  if (!Array.isArray(selectedFormats) || selectedFormats.length === 0) return true;
   const formatSet = new Set(selectedFormats.map((item) => String(item).toLowerCase()));
-
-  if (hiddenImageIds.has(image.id)) {
+  const isHidden = image.hidden === true || hiddenImageIds.has(image.id);
+  if (isHidden) {
     return formatSet.has("_hidden");
   }
+  if (!Array.isArray(selectedFormats) || selectedFormats.length === 0) return true;
 
   const nonHidden = new Set([...formatSet].filter((f) => f !== "_hidden"));
   if (nonHidden.size === 0) return false;
@@ -1241,7 +1363,7 @@ const passesFormatFilters = (image, selectedFormats = []) => {
 const computeFormatStatsFromImages = (images = []) => {
   const stats = {};
   for (const image of images) {
-    if (hiddenImageIds.has(image.id)) {
+    if (image.hidden === true || hiddenImageIds.has(image.id)) {
       stats["_hidden"] = (stats["_hidden"] || 0) + 1;
       continue;
     }
@@ -1249,6 +1371,15 @@ const computeFormatStatsFromImages = (images = []) => {
     stats[key] = (stats[key] || 0) + 1;
   }
   return stats;
+};
+
+const syncHiddenImageIdsFromImages = (images = []) => {
+  hiddenImageIds.clear();
+  for (const image of images) {
+    if (image.hidden === true && image.id) {
+      hiddenImageIds.add(image.id);
+    }
+  }
 };
 
 const fallbackImageError = (imgElement, fallbackUrl, image = null) => {
@@ -1912,15 +2043,21 @@ const syncHideToggleButton = () => {
 const toggleHideSelected = async () => {
   if (selectedIds.size === 0) return;
   const allHidden = [...selectedIds].every((id) => hiddenImageIds.has(id));
+  const ids = [...selectedIds];
 
-  if (allHidden) {
-    for (const id of selectedIds) hiddenImageIds.delete(id);
-  } else {
-    for (const id of selectedIds) hiddenImageIds.add(id);
+  const response = await sendMessage(MSG.SET_HIDDEN_IMAGES, {
+    imageIds: ids,
+    hidden: !allHidden
+  });
+  if (!response.success) {
+    setActionStatus(`隐藏操作失败: ${response.error || "未知错误"}`, 3200);
+    return;
   }
 
-  const ids = [...selectedIds];
-  await sendMessage(MSG.SET_SELECTION, { imageIds: ids, selected: false });
+  hiddenImageIds.clear();
+  for (const id of response.hiddenIds || []) {
+    hiddenImageIds.add(id);
+  }
   selectedIds.clear();
   await renderGallery();
 };
@@ -2010,22 +2147,46 @@ const createCard = (image, index) => {
   const card = document.createElement("div");
   card.className = `gallery-card${isSelected ? " selected" : ""}`;
   card.dataset.id = image.id;
-  card.innerHTML = `
-    <div class="card-image">
-      <img src="${displaySrc}" alt="Image preview" loading="lazy">
-      ${isHdBadge(image) ? '<span class="hd-badge">HD</span>' : ""}
-      <span class="format-badge">${ext}</span>
-    </div>
-    <div class="card-footer">
-      <span class="dimensions">${meta.width} × ${meta.height}</span>
-      <span class="area">${Math.round(meta.area / 1000)}K</span>
-    </div>
-    <div class="card-select">
-      <button class="checkbox ${isSelected ? "checked" : ""}" type="button">${isSelected ? "✓" : ""}</button>
-    </div>
-  `;
 
-  const imageNode = card.querySelector("img");
+  const imageWrap = document.createElement("div");
+  imageWrap.className = "card-image";
+  const imageNode = document.createElement("img");
+  imageNode.alt = "Image preview";
+  imageNode.loading = "lazy";
+  setImagePreviewSrc(imageNode, displaySrc, image.src);
+  imageWrap.appendChild(imageNode);
+
+  if (isHdBadge(image)) {
+    const hdBadge = document.createElement("span");
+    hdBadge.className = "hd-badge";
+    hdBadge.textContent = "HD";
+    imageWrap.appendChild(hdBadge);
+  }
+
+  const formatBadge = document.createElement("span");
+  formatBadge.className = "format-badge";
+  formatBadge.textContent = ext;
+  imageWrap.appendChild(formatBadge);
+
+  const footer = document.createElement("div");
+  footer.className = "card-footer";
+  const dimensions = document.createElement("span");
+  dimensions.className = "dimensions";
+  dimensions.textContent = `${meta.width} × ${meta.height}`;
+  const area = document.createElement("span");
+  area.className = "area";
+  area.textContent = `${Math.round(meta.area / 1000)}K`;
+  footer.append(dimensions, area);
+
+  const selectWrap = document.createElement("div");
+  selectWrap.className = "card-select";
+  const checkbox = document.createElement("button");
+  checkbox.className = `checkbox${isSelected ? " checked" : ""}`;
+  checkbox.type = "button";
+  checkbox.textContent = isSelected ? "✓" : "";
+  selectWrap.appendChild(checkbox);
+  card.append(imageWrap, footer, selectWrap);
+
   imageNode.addEventListener("error", () => fallbackImageError(imageNode, image.src, image));
   imageNode.addEventListener("click", (event) => {
     if (Date.now() < suppressLightboxClickUntil) {
@@ -2036,7 +2197,6 @@ const createCard = (image, index) => {
     openLightbox(image, index);
   });
 
-  const checkbox = card.querySelector(".checkbox");
   checkbox.addEventListener("click", async (event) => {
     event.stopPropagation();
     await toggleSelect(image.id);
@@ -2047,12 +2207,40 @@ const createCard = (image, index) => {
   return card;
 };
 
+const waitForNextFrame = () =>
+  new Promise((resolve) => {
+    if (typeof requestAnimationFrame === "function") {
+      requestAnimationFrame(() => resolve());
+      return;
+    }
+    setTimeout(resolve, 0);
+  });
+
+const appendGalleryCardsBatched = async (images, renderToken) => {
+  for (let start = 0; start < images.length; start += GALLERY_RENDER_BATCH_SIZE) {
+    if (renderToken !== galleryRenderToken) return false;
+    const fragment = document.createDocumentFragment();
+    const end = Math.min(start + GALLERY_RENDER_BATCH_SIZE, images.length);
+    for (let index = start; index < end; index += 1) {
+      fragment.appendChild(createCard(images[index], index));
+    }
+    elements.gallery.appendChild(fragment);
+    if (end < images.length) {
+      await waitForNextFrame();
+    }
+  }
+  return renderToken === galleryRenderToken;
+};
+
 const renderGallery = async () => {
   teardownDragSelect();
+  const renderToken = galleryRenderToken + 1;
+  galleryRenderToken = renderToken;
   const filters = getFilters();
   const allResponse = await sendMessage(MSG.GET_IMAGES, { filtered: false });
   if (!allResponse.success) return;
   const allImages = allResponse.images || [];
+  syncHiddenImageIdsFromImages(allImages);
 
   const needsDimensionHydration =
     currentConfig.enableHD &&
@@ -2138,11 +2326,8 @@ const renderGallery = async () => {
   }
 
   elements.emptyState.style.display = "none";
-  const fragment = document.createDocumentFragment();
-  for (const [index, image] of currentImages.entries()) {
-    fragment.appendChild(createCard(image, index));
-  }
-  elements.gallery.appendChild(fragment);
+  const completed = await appendGalleryCardsBatched(currentImages, renderToken);
+  if (!completed) return;
   applyGalleryLayout();
 
   syncSelectAllButtonLabel();
@@ -2591,7 +2776,8 @@ const downloadBatch = async () => {
       zip: enableBatchZipDownload,
       mode: enableBatchZipDownload ? "zip" : "direct",
       downloadMode: enableBatchZipDownload ? "zip" : "direct",
-      enableConvertToJpg
+      enableConvertToJpg,
+      zipPartPreset: getZipPartPreset()
     });
     if (!response.success) {
       if (response?.zipped && Number(response?.zipPartCount) > 1) {
@@ -2615,6 +2801,10 @@ const downloadBatch = async () => {
         phase: "failed",
         error: response.error || "未知错误"
       });
+      return;
+    }
+    if (response.accepted) {
+      await restoreDownloadStatus();
       return;
     }
     if (response.zipped) {
@@ -2848,6 +3038,21 @@ const bindEvents = () => {
     setActionStatus(checked ? "已开启批量ZIP下载" : "已关闭批量ZIP下载", 1800);
   });
 
+  elements.zipPartPreset.addEventListener("change", async (event) => {
+    const previous = currentConfig.zipPartPreset;
+    const zipPartPreset = normalizeZipPartPreset(event.target.value);
+    event.target.value = zipPartPreset;
+    const response = await sendMessage(MSG.SET_CONFIG, { zipPartPreset });
+    if (!response.success) {
+      event.target.value = previous;
+      setActionStatus(`设置失败: ${response.error || "未知错误"}`, 3200);
+      return;
+    }
+    currentConfig.zipPartPreset = normalizeZipPartPreset(response.config?.zipPartPreset || zipPartPreset);
+    event.target.value = currentConfig.zipPartPreset;
+    setActionStatus("已更新ZIP分卷设置", 1600);
+  });
+
   elements.lightbox.querySelector(".lightbox-backdrop").addEventListener("click", closeLightbox);
   elements.lightboxClose.addEventListener("click", closeLightbox);
   elements.lightboxPrev.addEventListener("click", () => navigateLightbox(-1));
@@ -3006,6 +3211,7 @@ const init = async () => {
     elements.togglePortraitOnly.checked = configResponse.config.enablePortraitOnly === true;
     elements.toggleWebP.checked = configResponse.config.enableWebPConvert === true;
     elements.toggleBatchZipDownload.checked = false;
+    elements.zipPartPreset.value = normalizeZipPartPreset(configResponse.config.zipPartPreset);
     currentConfig.enableAutoScan = elements.toggleAutoScan.checked;
     currentConfig.enableHD = elements.toggleHd.checked;
     currentConfig.enableSizeSort = elements.toggleSortSize.checked;
@@ -3013,6 +3219,7 @@ const init = async () => {
     currentConfig.enableAutoScroll = configResponse.config.enableAutoScroll === true;
     currentConfig.enableWebPConvert = elements.toggleWebP.checked;
     currentConfig.enableBatchZipDownload = false;
+    currentConfig.zipPartPreset = elements.zipPartPreset.value;
   }
   if (elements.toggleComicMode) {
     elements.toggleComicMode.checked = false;

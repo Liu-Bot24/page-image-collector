@@ -1,0 +1,8 @@
+{
+  "name": "page-image-collector",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "test": "node --test"
+  }
+}

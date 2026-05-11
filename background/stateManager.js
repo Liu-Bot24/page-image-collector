@@ -297,6 +297,22 @@ export const generateImageId = (normalizedUrl) => {
   return `img_${hashText(normalizedUrl)}`;
 };
 
+const normalizeComicIndex = (value) => {
+  const number = Number(value);
+  return Number.isInteger(number) && number >= 0 ? number : null;
+};
+
+const normalizeComicPageMetadata = (rawImage) => {
+  const pageIndex = normalizeComicIndex(rawImage?.comicPageIndex);
+  const pageOrder = normalizeComicIndex(rawImage?.comicPageOrder);
+  if (pageIndex === null || pageOrder === null) return {};
+  return {
+    comicPageIndex: pageIndex,
+    comicPageOrder: pageOrder,
+    comicPageUrl: normalizeSourceUrl(rawImage?.comicPageUrl || rawImage?.sourceUrl || "") || null
+  };
+};
+
 const sanitizeImage = (rawImage) => {
   if (!rawImage) return null;
 
@@ -333,8 +349,73 @@ const sanitizeImage = (rawImage) => {
     sourceUrl,
     timestamp: Number(rawImage.timestamp) || Date.now(),
     hdRejected: Boolean(rawImage.hdRejected),
-    isHD: Boolean(hdSrc && hdSrc !== src && !rawImage.hdRejected)
+    isHD: Boolean(hdSrc && hdSrc !== src && !rawImage.hdRejected),
+    ...normalizeComicPageMetadata(rawImage)
   };
+};
+
+const imageLookupKeys = (image) => {
+  const keys = new Set();
+  for (const value of [image?.normalized, image?.hdSrc, image?.originalSrc]) {
+    const raw = String(value || "").trim();
+    if (!raw) continue;
+    keys.add(raw);
+    const normalized = normalizeUrl(raw);
+    if (normalized) keys.add(normalized);
+  }
+  return [...keys];
+};
+
+const indexImage = (state, image, imageId) => {
+  if (!state || !image || !imageId) return;
+  if (image.normalized) {
+    state.imagesByNormalized.set(image.normalized, imageId);
+  }
+  for (const key of imageLookupKeys(image)) {
+    state.imagesByHdSrc.set(key, imageId);
+  }
+};
+
+const findExistingImageId = (state, image) => {
+  if (!state || !image) return null;
+  if (image.normalized && state.imagesByNormalized.has(image.normalized)) {
+    return state.imagesByNormalized.get(image.normalized);
+  }
+  for (const key of imageLookupKeys(image)) {
+    const existingId = state.imagesByHdSrc.get(key) || state.imagesByNormalized.get(key);
+    if (existingId) return existingId;
+  }
+  return findTelegramEquivalentId(state, image);
+};
+
+const preserveHdState = (existing, incoming) => {
+  const hdRejected = existing?.hdRejected === true || incoming?.hdRejected === true;
+  return {
+    hdRejected,
+    isHD: Boolean(incoming?.hdSrc && incoming.hdSrc !== incoming.src && !hdRejected)
+  };
+};
+
+const hasComicPageMetadata = (image) =>
+  Number.isInteger(image?.comicPageIndex) &&
+  Number.isInteger(image?.comicPageOrder);
+
+const mergeComicPageMetadata = (existing, incoming) => {
+  if (hasComicPageMetadata(incoming) && !hasComicPageMetadata(existing)) {
+    return {
+      comicPageIndex: incoming.comicPageIndex,
+      comicPageOrder: incoming.comicPageOrder,
+      comicPageUrl: incoming.comicPageUrl || existing?.comicPageUrl || null
+    };
+  }
+  if (hasComicPageMetadata(existing)) {
+    return {
+      comicPageIndex: existing.comicPageIndex,
+      comicPageOrder: existing.comicPageOrder,
+      comicPageUrl: existing.comicPageUrl || incoming?.comicPageUrl || null
+    };
+  }
+  return {};
 };
 
 const createState = () => {
@@ -344,6 +425,7 @@ const createState = () => {
     imagesByNormalized: new Map(),
     imagesByHdSrc: new Map(),
     selectedIds: new Set(),
+    hiddenIds: new Set(),
     config: defaults.config,
     lastScanTime: null,
     isScanning: false
@@ -353,6 +435,7 @@ const createState = () => {
 const serializeState = (state) => ({
   images: Array.from(state.images.values()),
   selectedIds: Array.from(state.selectedIds),
+  hiddenIds: Array.from(state.hiddenIds || []),
   config: state.config,
   lastScanTime: state.lastScanTime
 });
@@ -453,15 +536,20 @@ export const createTabStateManager = () => {
             const normalizedImage = sanitizeImage(image);
             if (!normalizedImage) continue;
             state.images.set(normalizedImage.id, normalizedImage);
-            state.imagesByNormalized.set(normalizedImage.normalized, normalizedImage.id);
-            const hdK = normalizedImage.hdSrc && normalizedImage.hdSrc !== normalizedImage.src ? normalizedImage.hdSrc : "";
-            if (hdK) state.imagesByHdSrc.set(hdK, normalizedImage.id);
+            indexImage(state, normalizedImage, normalizedImage.id);
           }
 
           const selectedIds = Array.isArray(rawState.selectedIds) ? rawState.selectedIds : [];
           for (const id of selectedIds) {
             if (state.images.has(id)) {
               state.selectedIds.add(id);
+            }
+          }
+
+          const hiddenIds = Array.isArray(rawState.hiddenIds) ? rawState.hiddenIds : [];
+          for (const id of hiddenIds) {
+            if (state.images.has(id)) {
+              state.hiddenIds.add(id);
             }
           }
         }
@@ -484,15 +572,10 @@ export const createTabStateManager = () => {
       const image = sanitizeImage(rawImage);
       if (!image) continue;
 
-      const hdKey = image.hdSrc && image.hdSrc !== image.src ? image.hdSrc : "";
-      const existingId =
-        state.imagesByNormalized.get(image.normalized) ||
-        (hdKey && state.imagesByHdSrc.get(hdKey)) ||
-        findTelegramEquivalentId(state, image);
+      const existingId = findExistingImageId(state, image);
       if (!existingId) {
         state.images.set(image.id, image);
-        state.imagesByNormalized.set(image.normalized, image.id);
-        if (hdKey) state.imagesByHdSrc.set(hdKey, image.id);
+        indexImage(state, image, image.id);
         added += 1;
         continue;
       }
@@ -500,25 +583,28 @@ export const createTabStateManager = () => {
       const existing = state.images.get(existingId);
       if (!existing) {
         state.images.set(image.id, image);
-        state.imagesByNormalized.set(image.normalized, image.id);
-        if (hdKey) state.imagesByHdSrc.set(hdKey, image.id);
+        indexImage(state, image, image.id);
         added += 1;
         continue;
       }
 
-      if (image.normalized && image.normalized !== existing.normalized) {
-        state.imagesByNormalized.set(image.normalized, existingId);
-      }
-      if (hdKey) state.imagesByHdSrc.set(hdKey, existingId);
+      indexImage(state, image, existingId);
 
       const shouldReplace =
         image.area > existing.area ||
         (image.area === existing.area && image.timestamp > existing.timestamp);
 
       if (shouldReplace) {
-        const merged = { ...existing, ...image, id: existingId };
+        const merged = {
+          ...existing,
+          ...image,
+          id: existingId,
+          ...preserveHdState(existing, image),
+          ...mergeComicPageMetadata(existing, image)
+        };
         merged.sourceUrl = pickPreferredSourceUrl(existing.sourceUrl, image.sourceUrl);
         state.images.set(existingId, merged);
+        indexImage(state, merged, existingId);
         updated += 1;
         continue;
       }
@@ -527,15 +613,21 @@ export const createTabStateManager = () => {
       const shouldUpgradeFormat =
         (String(existing.format || "").toLowerCase() === "unknown") &&
         (String(image.format || "").toLowerCase() !== "unknown");
+      const shouldUpdateComicMetadata =
+        hasComicPageMetadata(image) && !hasComicPageMetadata(existing);
       if (
         (preferredSource && preferredSource !== existing.sourceUrl) ||
-        shouldUpgradeFormat
+        shouldUpgradeFormat ||
+        shouldUpdateComicMetadata
       ) {
-        state.images.set(existingId, {
+        const merged = {
           ...existing,
           sourceUrl: preferredSource || existing.sourceUrl,
-          format: shouldUpgradeFormat ? image.format : existing.format
-        });
+          format: shouldUpgradeFormat ? image.format : existing.format,
+          ...mergeComicPageMetadata(existing, image)
+        };
+        state.images.set(existingId, merged);
+        indexImage(state, merged, existingId);
         updated += 1;
       }
     }
@@ -551,7 +643,10 @@ export const createTabStateManager = () => {
   const getAllImages = (tabId) => {
     const state = tabStates.get(tabId);
     if (!state) return [];
-    return Array.from(state.images.values());
+    return Array.from(state.images.values()).map((image) => ({
+      ...image,
+      hidden: state.hiddenIds.has(image.id)
+    }));
   };
 
   const toggleSelectImage = (tabId, imageId) => {
@@ -591,6 +686,22 @@ export const createTabStateManager = () => {
       .sort((a, b) => b.area - a.area);
   };
 
+  const setHiddenByIds = (tabId, imageIds = [], hidden = true) => {
+    const state = initTabState(tabId);
+    const ids = Array.isArray(imageIds) ? imageIds : [];
+    for (const imageId of ids) {
+      if (!state.images.has(imageId)) continue;
+      state.selectedIds.delete(imageId);
+      if (hidden) {
+        state.hiddenIds.add(imageId);
+      } else {
+        state.hiddenIds.delete(imageId);
+      }
+    }
+    schedulePersist();
+    return Array.from(state.hiddenIds);
+  };
+
   const setConfig = (tabId, config) => {
     const state = initTabState(tabId);
     state.config = { ...state.config, ...normalizeConfig(config, true) };
@@ -623,6 +734,7 @@ export const createTabStateManager = () => {
     return {
       total: state.images.size,
       selected: state.selectedIds.size,
+      hidden: state.hiddenIds.size,
       formats: formatStats,
       lastScanTime: state.lastScanTime
     };
@@ -658,7 +770,9 @@ export const createTabStateManager = () => {
     if (!state) return;
     state.images.clear();
     state.imagesByNormalized.clear();
+    state.imagesByHdSrc.clear();
     state.selectedIds.clear();
+    state.hiddenIds.clear();
     state.lastScanTime = null;
     schedulePersist();
   };
@@ -671,6 +785,7 @@ export const createTabStateManager = () => {
     toggleSelectImage,
     setSelectionByIds,
     getSelectedImages,
+    setHiddenByIds,
     setConfig,
     getConfig,
     getStats,
