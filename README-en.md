@@ -19,7 +19,7 @@ A Chrome extension for daily browsing scenarios, used to quickly collect web pag
 ### Install from GitHub Releases
 
 1. Go to the project's `Releases` page.
-2. Download the unpacked zip for the corresponding version, e.g., `page-image-collector-1.2.6-unpacked.zip`.
+2. Download the unpacked zip for the corresponding version, e.g., `page-image-collector-1.2.7-unpacked.zip`.
 3. Open `chrome://extensions/`.
 4. Enable "Developer mode".
 5. Unzip the downloaded ZIP file.
@@ -29,6 +29,13 @@ A Chrome extension for daily browsing scenarios, used to quickly collect web pag
 ## Documentation
 
 - Privacy Policy: [PRIVACY.md](./PRIVACY.md)
+
+## What's New in 1.2.7
+
+- Added Chinese and English UI support: first install follows the browser language, using Chinese for Chinese or Traditional Chinese browser locales and English for other locales.
+- Added a subtle language switch in the Popup header. Manual choices are persisted and then shared by both Popup and Workspace.
+- Added Chrome native locale metadata so the extension name and description can follow the browser language.
+- Refined the English layout to account for longer labels and avoid squeezed icons, header wrapping, or crowded filter controls.
 
 ## What's New in 1.2.6
 
@@ -260,5 +267,5 @@ For dynamic pages, it is recommended to perform a manual scan first, then enable
 
 ## Version Info
 
-- Version: `1.2.6`
+- Version: `1.2.7`
 - Manifest: `MV3`

@@ -1,0 +1,10 @@
+{
+  "extensionName": {
+    "message": "图片采集查看器 - 网页图片批量下载、筛选预览与ZIP打包",
+    "description": "Chrome 应用商店标题和扩展名称。"
+  },
+  "extensionDescription": {
+    "message": "采集网页图片，支持大图识别、格式与尺寸筛选、Workspace 预览整理、批量下载和 ZIP 打包。",
+    "description": "Chrome 应用商店短描述。"
+  }
+}

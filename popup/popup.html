@@ -12,7 +12,11 @@
       <div class="console-row row-top">
         <div class="top-left">
           <span class="logo-text">图片采集查看器</span>
-          <a class="author-signature" href="https://blog.liu-qi.cn/" target="_blank" rel="noopener noreferrer">Created by @liuqi</a>
+          <a class="author-signature" href="https://blog.liu-qi.cn/tools/" target="_blank" rel="noopener noreferrer">Created by @liuqi</a>
+        </div>
+        <div class="language-switch" id="language-switch" role="group" aria-label="Language">
+          <button class="language-option" type="button" data-language="en" aria-pressed="false">EN</button>
+          <button class="language-option" type="button" data-language="zh" aria-pressed="true">中</button>
         </div>
         <div class="top-right">
           <button id="btn-scan" class="btn btn-primary">开始扫描</button>
@@ -171,6 +175,8 @@
     </div>
   </div>
 
+  <script src="../shared/i18n.js"></script>
   <script src="popup.js"></script>
+  <script src="popup-i18n.js"></script>
 </body>
 </html>

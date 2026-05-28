@@ -1,0 +1,10 @@
+{
+  "extensionName": {
+    "message": "Page Image Collector - Batch Image Download, Preview & ZIP",
+    "description": "Chrome Web Store title and extension name."
+  },
+  "extensionDescription": {
+    "message": "Collect webpage images with HD detection, format and size filters, Workspace preview, batch download, and ZIP packaging.",
+    "description": "Chrome Web Store short description."
+  }
+}
