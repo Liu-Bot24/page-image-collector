@@ -1,0 +1,8 @@
+{
+  "extensionName": {
+    "message": "Page Image Collector"
+  },
+  "extensionDescription": {
+    "message": "A productivity-focused Chrome Manifest V3 extension for collecting visual assets from web pages"
+  }
+}

@@ -33,14 +33,56 @@ test("background fallback injection loads parser vendor before content script", 
 test("workspace runtime files exist and load virtual vendor before workspace app", () => {
   const html = readFileSync(resolve(rootDir, "workspace/workspace.html"), "utf8");
   const vendorPath = "../vendor/workspace-virtual.js";
+  const sharedI18nPath = "../shared/i18n.js";
   const appPath = "workspace.js";
+  const pageI18nPath = "workspace-i18n.js";
   const vendorIndex = html.indexOf(`src="${vendorPath}"`);
+  const sharedI18nIndex = html.indexOf(`src="${sharedI18nPath}"`);
   const appIndex = html.indexOf(`src="${appPath}"`);
+  const pageI18nIndex = html.indexOf(`src="${pageI18nPath}"`);
 
   assert.equal(existsSync(resolve(rootDir, "vendor/workspace-virtual.js")), true);
   assert.notEqual(vendorIndex, -1);
+  assert.notEqual(sharedI18nIndex, -1);
   assert.notEqual(appIndex, -1);
+  assert.notEqual(pageI18nIndex, -1);
   assert.ok(vendorIndex < appIndex, "workspace virtual vendor should load before workspace.js");
+  assert.ok(sharedI18nIndex < pageI18nIndex, "shared i18n should load before workspace page i18n");
+  assert.ok(appIndex < pageI18nIndex, "workspace i18n should run after workspace.js so it cannot block core rendering");
+});
+
+test("popup runtime files load shared i18n and page i18n around the existing app script", () => {
+  const html = readFileSync(resolve(rootDir, "popup/popup.html"), "utf8");
+  const sharedI18nPath = "../shared/i18n.js";
+  const appPath = "popup.js";
+  const pageI18nPath = "popup-i18n.js";
+  const sharedI18nIndex = html.indexOf(`src="${sharedI18nPath}"`);
+  const appIndex = html.indexOf(`src="${appPath}"`);
+  const pageI18nIndex = html.indexOf(`src="${pageI18nPath}"`);
+
+  assert.notEqual(sharedI18nIndex, -1);
+  assert.notEqual(appIndex, -1);
+  assert.notEqual(pageI18nIndex, -1);
+  assert.ok(sharedI18nIndex < appIndex, "shared i18n should load before popup.js for initial language state");
+  assert.ok(appIndex < pageI18nIndex, "popup i18n should run after popup.js so dynamic core labels can be translated");
+});
+
+test("popup exposes the only visible language switch", () => {
+  const popupHtml = readFileSync(resolve(rootDir, "popup/popup.html"), "utf8");
+  const workspaceHtml = readFileSync(resolve(rootDir, "workspace/workspace.html"), "utf8");
+
+  assert.match(popupHtml, /id="language-switch"/);
+  assert.match(popupHtml, /data-language="en"/);
+  assert.match(popupHtml, /data-language="zh"/);
+  assert.doesNotMatch(workspaceHtml, /id="language-switch"/);
+});
+
+test("language support stays outside core collection scripts", () => {
+  for (const file of ["popup/popup.js", "workspace/workspace.js"]) {
+    const source = readFileSync(resolve(rootDir, file), "utf8");
+    assert.doesNotMatch(source, /PageImageCollectorI18n/, `${file} should not import or call the i18n layer directly`);
+    assert.doesNotMatch(source, /pageImageCollector\.language/, `${file} should not own language persistence`);
+  }
 });
 
 test("vendor runtime files are bundled for MV3 extension pages", () => {
@@ -55,7 +97,14 @@ test("vendor runtime files are bundled for MV3 extension pages", () => {
 });
 
 test("classic extension scripts do not contain module-only syntax or eval-like code", () => {
-  for (const file of ["content/content.js", "popup/popup.js", "workspace/workspace.js"]) {
+  for (const file of [
+    "content/content.js",
+    "popup/popup.js",
+    "popup/popup-i18n.js",
+    "shared/i18n.js",
+    "workspace/workspace.js",
+    "workspace/workspace-i18n.js"
+  ]) {
     const source = readFileSync(resolve(rootDir, file), "utf8");
     assert.doesNotMatch(source, STATIC_IMPORT_PATTERN, `${file} should load as a classic script`);
     assert.doesNotMatch(source, DYNAMIC_IMPORT_PATTERN, `${file} should not use dynamic imports`);

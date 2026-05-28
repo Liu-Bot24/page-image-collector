@@ -1,0 +1,8 @@
+{
+  "extensionName": {
+    "message": "图片采集查看器"
+  },
+  "extensionDescription": {
+    "message": "一款基于 Chrome Manifest V3 的生产力级网页视觉资产采集器"
+  }
+}

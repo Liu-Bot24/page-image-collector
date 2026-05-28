@@ -1,9 +1,10 @@
 {
   "manifest_version": 3,
-  "name": "图片采集查看器",
-  "version": "1.2.6",
-  "version_name": "1.2.6",
-  "description": "一款基于 Chrome Manifest V3 的生产力级网页视觉资产采集器",
+  "name": "__MSG_extensionName__",
+  "version": "1.2.7",
+  "version_name": "1.2.7",
+  "default_locale": "zh_CN",
+  "description": "__MSG_extensionDescription__",
   "permissions": [
     "activeTab",
     "scripting",
@@ -24,6 +25,7 @@
   },
   "action": {
     "default_popup": "popup/popup.html",
+    "default_title": "__MSG_extensionName__",
     "default_icon": {
       "16": "icons/icon16.png",
       "48": "icons/icon48.png",

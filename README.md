@@ -23,12 +23,19 @@ Languages: [简体中文](README.md) · [English](README-en.md)
 ### 从 GitHub Releases 安装
 
 1. 进入项目的 `Releases` 页面
-2. 下载对应版本的解压包，例如 `page-image-collector-1.2.6-unpacked.zip`
+2. 下载对应版本的解压包，例如 `page-image-collector-1.2.7-unpacked.zip`
 3. 打开 `chrome://extensions/`
 4. 开启“开发者模式”
 5. 解压下载的 ZIP 文件
 6. 点击“加载已解压的扩展程序”
 7. 选择解压后的扩展目录
+
+## 1.2.7 更新
+
+- 新增中英文界面：首次安装时会根据浏览器语言自动选择中文或英文，中文与繁体中文环境默认中文，其他语言环境默认英文
+- Popup 顶部新增低调的中英文切换入口，用户手动切换后会持久化保存，之后 Popup 与 Workspace 都会沿用用户选择
+- 补充 Chrome 原生多语言元数据，让扩展名称和说明可以跟随浏览器语言显示
+- 优化英文界面布局，适配英文文案长度，避免顶部按钮、图标和筛选控件出现挤压或异常换行
 
 ## 1.2.6 更新
 
@@ -260,5 +267,5 @@ Languages: [简体中文](README.md) · [English](README-en.md)
 
 ## 版本信息
 
-- 版本：`1.2.6`
+- 版本：`1.2.7`
 - Manifest：`MV3`
