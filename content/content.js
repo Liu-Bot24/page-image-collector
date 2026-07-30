@@ -672,9 +672,41 @@ const scoreSourceHref = (url) => {
   }
 };
 
-const sourceContainerCache = new WeakMap();
-const sourceElementCache = new WeakMap();
+let sourceContainerCache = new WeakMap();
+let sourceElementCache = new WeakMap();
 const getCurrentPageSourceUrl = () => normalizeSourceUrl(location.href) || location.href;
+
+const SOURCE_CONTAINER_SELECTOR =
+  "article, [role='article'], [data-testid*='tweet'], [data-testid*='cellInnerDiv'], [mid], [action-type*='feed'], [class*='feed'], [class*='note'], section, li";
+
+const getSourceContainer = (element) => element?.closest?.(SOURCE_CONTAINER_SELECTOR) || null;
+
+const buildSourceCacheSignature = (element) => {
+  if (!element) return "";
+  const parts = [getCurrentPageSourceUrl()];
+  const ownSrc = element.currentSrc || element.getAttribute?.("src") || "";
+  if (ownSrc) parts.push(`src:${ownSrc}`);
+
+  let node = element;
+  for (let depth = 0; node && depth < 8; depth += 1) {
+    for (const name of ["href", "data-permalink", "data-href", "data-url", "mid"]) {
+      const value = node.getAttribute?.(name);
+      if (value) parts.push(`${name}:${value}`);
+    }
+    node = node.parentElement;
+  }
+
+  const scope = getSourceContainer(element) || element;
+  if (typeof scope.querySelectorAll === "function") {
+    const anchors = scope.querySelectorAll("a[href]");
+    const max = Math.min(anchors.length, 48);
+    for (let i = 0; i < max; i += 1) {
+      const href = anchors[i].getAttribute("href") || anchors[i].href;
+      if (href) parts.push(`a:${href}`);
+    }
+  }
+  return parts.join("\n");
+};
 
 const extractTelegramNumericId = (value) => {
   const raw = String(value || "").trim();
@@ -1170,18 +1202,19 @@ const collectScopedAnchorCandidates = (scope) => {
 };
 
 const getContainerSourceHref = (element) => {
-  const container = element?.closest?.(
-    "article, [role='article'], [data-testid*='tweet'], [data-testid*='cellInnerDiv'], [mid], [action-type*='feed'], [class*='feed'], [class*='note'], section, li"
-  );
+  const container = getSourceContainer(element);
   if (!container) return null;
-  if (!isXiaohongshuSite() && sourceContainerCache.has(container)) {
-    return sourceContainerCache.get(container) || null;
+  const cacheEnabled = !isXiaohongshuSite();
+  const signature = cacheEnabled ? buildSourceCacheSignature(container) : "";
+  const cached = cacheEnabled ? sourceContainerCache.get(container) : null;
+  if (cached?.signature === signature) {
+    return cached.value || null;
   }
 
   const candidates = collectScopedAnchorCandidates(container);
   const picked = pickBestSourceHref(candidates);
-  if (!isXiaohongshuSite()) {
-    sourceContainerCache.set(container, picked || null);
+  if (cacheEnabled) {
+    sourceContainerCache.set(container, { signature, value: picked || null });
   }
   return picked || null;
 };
@@ -1192,8 +1225,11 @@ const resolveSourceUrl = (element) => {
   }
 
   if (!element) return getCurrentPageSourceUrl();
-  if (!isXiaohongshuSite() && sourceElementCache.has(element)) {
-    return sourceElementCache.get(element) || getCurrentPageSourceUrl();
+  const cacheEnabled = !isXiaohongshuSite();
+  const signature = cacheEnabled ? buildSourceCacheSignature(element) : "";
+  const cached = cacheEnabled ? sourceElementCache.get(element) : null;
+  if (cached?.signature === signature) {
+    return cached.value || getCurrentPageSourceUrl();
   }
 
   const candidates = [location.href];
@@ -1260,8 +1296,11 @@ const resolveSourceUrl = (element) => {
   }
 
   const picked = pickBestSourceHref(candidates);
-  if (!isXiaohongshuSite()) {
-    sourceElementCache.set(element, picked || getCurrentPageSourceUrl());
+  if (cacheEnabled) {
+    sourceElementCache.set(element, {
+      signature,
+      value: picked || getCurrentPageSourceUrl()
+    });
   }
   return picked || getCurrentPageSourceUrl();
 };
@@ -1641,8 +1680,14 @@ const MAX_DEEP_IMAGES_PER_SOURCE = 36;
 const deepSourceCache = new Map();
 const deepSourceQueue = [];
 const deepSourceQueued = new Set();
-const deepSourceInFlight = new Set();
+const deepSourceInFlight = new Map();
+const deepSourceDeferred = new Set();
+const deepSourceAbortControllers = new Set();
+const deepSourceRetryTimers = new Set();
+const deepSourceFailureUntil = new Map();
 let deepSourceActiveCount = 0;
+let runtimeCacheGeneration = 0;
+const DEEP_SOURCE_FAILURE_TTL_MS = 30 * 1000;
 
 const isInstagramPostSourceUrl = (url) => {
   try {
@@ -1755,8 +1800,14 @@ const extractXhsImagesFromHtml = (htmlText) => {
   return Array.from(candidates);
 };
 
-const fetchSourceHtml = async (sourceUrl, timeoutMs = 12000) => {
+const fetchSourceHtml = async (sourceUrl, timeoutMs = 12000, externalSignal = null) => {
   const controller = new AbortController();
+  const abortFromExternal = () => controller.abort();
+  if (externalSignal?.aborted) {
+    controller.abort();
+  } else {
+    externalSignal?.addEventListener?.("abort", abortFromExternal, { once: true });
+  }
   const timer = setTimeout(() => controller.abort(), timeoutMs);
   try {
     const response = await fetch(sourceUrl, {
@@ -1771,6 +1822,7 @@ const fetchSourceHtml = async (sourceUrl, timeoutMs = 12000) => {
     return await response.text();
   } finally {
     clearTimeout(timer);
+    externalSignal?.removeEventListener?.("abort", abortFromExternal);
   }
 };
 
@@ -1792,10 +1844,10 @@ const buildDeepImageRecords = (urls, sourceUrl, sourceTag) => {
   return Array.from(map.values());
 };
 
-const expandSourceToImages = async (sourceUrl) => {
+const expandSourceToImages = async (sourceUrl, signal = null) => {
   if (!shouldDeepExpandSource(sourceUrl)) return [];
 
-  const htmlText = await fetchSourceHtml(sourceUrl);
+  const htmlText = await fetchSourceHtml(sourceUrl, 12000, signal);
   let urls = [];
 
   if (isInstagramPostSourceUrl(sourceUrl)) {
@@ -1848,38 +1900,63 @@ const processDeepSourceQueue = () => {
     if (!sourceUrl || deepSourceInFlight.has(sourceUrl) || deepSourceCache.has(sourceUrl)) {
       continue;
     }
+    const failureUntil = Number(deepSourceFailureUntil.get(sourceUrl)) || 0;
+    if (failureUntil > Date.now()) continue;
+    deepSourceFailureUntil.delete(sourceUrl);
 
+    const generation = runtimeCacheGeneration;
     deepSourceActiveCount += 1;
-    deepSourceInFlight.add(sourceUrl);
+    deepSourceInFlight.set(sourceUrl, generation);
+    const controller = new AbortController();
+    deepSourceAbortControllers.add(controller);
 
-    Promise.resolve(expandSourceToImages(sourceUrl))
+    Promise.resolve(expandSourceToImages(sourceUrl, controller.signal))
       .then(async (expandedImages) => {
+        if (generation !== runtimeCacheGeneration) return;
         const safeImages = Array.isArray(expandedImages) ? expandedImages : [];
+        deepSourceFailureUntil.delete(sourceUrl);
         deepSourceCache.set(sourceUrl, safeImages);
 
         const freshImages = safeImages.filter((image) => image?.normalized && !knownNormalizedUrls.has(image.normalized));
         if (freshImages.length === 0) return;
 
-        const acked = await sendIncrementalToBackground(freshImages);
+        const acked = await sendIncrementalToBackground(freshImages, generation);
+        if (generation !== runtimeCacheGeneration) return;
         if (acked) {
           recordKnownImages(freshImages);
           return;
         }
 
         deepSourceCache.delete(sourceUrl);
-        setTimeout(() => {
+        const retryTimer = setTimeout(() => {
+          deepSourceRetryTimers.delete(retryTimer);
+          if (generation !== runtimeCacheGeneration) return;
           if (deepSourceInFlight.has(sourceUrl) || deepSourceQueued.has(sourceUrl)) return;
           deepSourceQueue.push(sourceUrl);
           deepSourceQueued.add(sourceUrl);
           processDeepSourceQueue();
         }, 1200);
+        deepSourceRetryTimers.add(retryTimer);
       })
       .catch(() => {
-        deepSourceCache.set(sourceUrl, []);
+        if (generation === runtimeCacheGeneration) {
+          deepSourceFailureUntil.set(sourceUrl, Date.now() + DEEP_SOURCE_FAILURE_TTL_MS);
+        }
       })
       .finally(() => {
-        deepSourceInFlight.delete(sourceUrl);
+        deepSourceAbortControllers.delete(controller);
+        if (deepSourceInFlight.get(sourceUrl) === generation) {
+          deepSourceInFlight.delete(sourceUrl);
+        }
         deepSourceActiveCount = Math.max(0, deepSourceActiveCount - 1);
+        if (
+          deepSourceDeferred.delete(sourceUrl) &&
+          !deepSourceCache.has(sourceUrl) &&
+          !deepSourceQueued.has(sourceUrl)
+        ) {
+          deepSourceQueue.push(sourceUrl);
+          deepSourceQueued.add(sourceUrl);
+        }
         processDeepSourceQueue();
       });
   }
@@ -1896,7 +1973,15 @@ const scheduleDeepExpansionFromScan = (images = []) => {
 
   for (const sourceUrl of sourceUrls) {
     if (deepSourceCache.has(sourceUrl)) continue;
-    if (deepSourceInFlight.has(sourceUrl)) continue;
+    const failureUntil = Number(deepSourceFailureUntil.get(sourceUrl)) || 0;
+    if (failureUntil > Date.now()) continue;
+    deepSourceFailureUntil.delete(sourceUrl);
+    if (deepSourceInFlight.has(sourceUrl)) {
+      if (deepSourceInFlight.get(sourceUrl) !== runtimeCacheGeneration) {
+        deepSourceDeferred.add(sourceUrl);
+      }
+      continue;
+    }
     if (deepSourceQueued.has(sourceUrl)) continue;
     deepSourceQueue.push(sourceUrl);
     deepSourceQueued.add(sourceUrl);
@@ -2427,6 +2512,7 @@ const setRightClickEnabled = (enabled) => {
 let autoScanEnabled = false;
 let autoScanObserver = null;
 let autoScanTimer = null;
+const autoScanRetryTimers = new Set();
 let autoScanDirty = false;
 const knownNormalizedUrls = new Set();
 const autoScanMutationRoots = new Set();
@@ -2444,6 +2530,16 @@ let autoScrollStableCount = 0;
 let autoScrollStableSince = 0;
 let autoScrollExpectedTop = 0;
 let autoScrollElementRoot = null;
+let autoScrollMutationObserver = null;
+let autoScrollDomVersion = 0;
+let autoScrollRootSearchVersion = -1;
+let autoScrollRootSearchAt = 0;
+let autoScrollRootValidatedAt = 0;
+let comicSequenceCountCache = {
+  count: 0,
+  domVersion: -1,
+  updatedAt: 0
+};
 let autoScrollProgrammaticUntil = 0;
 let autoScrollUserIntentUntil = 0;
 let autoScrollIgnoreUserInterrupt = false;
@@ -2464,6 +2560,11 @@ const AUTO_SCROLL_COMIC_STEP_MAX = 820;
 const AUTO_SCROLL_COMIC_STEP_RATIO = 0.82;
 const AUTO_SCROLL_COMIC_EARLY_STOP_MS = 12000;
 const AUTO_SCROLL_COMIC_HEIGHT_GROWTH_THRESHOLD = 96;
+const AUTO_SCROLL_ROOT_VALIDATE_MS = 1500;
+const AUTO_SCROLL_ROOT_RESCAN_MS = 4000;
+const AUTO_SCROLL_ROOT_MUTATION_RESCAN_MS = 1200;
+const COMIC_SEQUENCE_COUNT_CACHE_MS = 2500;
+const COMIC_SEQUENCE_COUNT_MUTATION_CACHE_MS = 800;
 
 const recordKnownImages = (images) => {
   for (const image of images) {
@@ -2474,14 +2575,29 @@ const recordKnownImages = (images) => {
 };
 
 const resetRuntimeCaches = () => {
+  runtimeCacheGeneration += 1;
+  sourceContainerCache = new WeakMap();
+  sourceElementCache = new WeakMap();
   knownNormalizedUrls.clear();
   autoScanMutationRoots.clear();
   deepSourceCache.clear();
   deepSourceQueue.length = 0;
   deepSourceQueued.clear();
-  deepSourceInFlight.clear();
-  deepSourceActiveCount = 0;
+  deepSourceDeferred.clear();
+  deepSourceFailureUntil.clear();
+  for (const controller of deepSourceAbortControllers) {
+    controller.abort();
+  }
+  for (const retryTimer of deepSourceRetryTimers) {
+    clearTimeout(retryTimer);
+  }
+  deepSourceRetryTimers.clear();
+  for (const retryTimer of autoScanRetryTimers) {
+    clearTimeout(retryTimer);
+  }
+  autoScanRetryTimers.clear();
   autoScanDirty = false;
+  return runtimeCacheGeneration;
 };
 
 const addAutoScanMutationRoot = (node) => {
@@ -2510,12 +2626,12 @@ const consumeAutoScanMutationRoots = () => {
   return roots;
 };
 
-const sendIncrementalToBackground = async (images) => {
+const sendIncrementalToBackground = async (images, generation = runtimeCacheGeneration) => {
   if (!Array.isArray(images) || images.length === 0) return false;
   try {
     const response = await chrome.runtime.sendMessage({
       type: MSG.INCREMENTAL_SCAN,
-      payload: { images }
+      payload: { images, runtimeGeneration: generation }
     });
     return response?.success !== false;
   } catch {
@@ -2524,6 +2640,7 @@ const sendIncrementalToBackground = async (images) => {
 };
 
 const pushIncrementalImages = async () => {
+  const generation = runtimeCacheGeneration;
   const changedRoots = consumeAutoScanMutationRoots();
   const scanned = scanImagesFromRoots(changedRoots, {
     includeBackground: true,
@@ -2537,17 +2654,21 @@ const pushIncrementalImages = async () => {
   const newImages = merged.filter((image) => image?.normalized && !knownNormalizedUrls.has(image.normalized));
   if (newImages.length === 0) return;
 
-  const acked = await sendIncrementalToBackground(newImages);
+  const acked = await sendIncrementalToBackground(newImages, generation);
+  if (generation !== runtimeCacheGeneration) return;
   if (acked) {
     recordKnownImages(newImages);
     return;
   }
 
   addAutoScanMutationRoot(document);
-  setTimeout(() => {
+  const retryTimer = setTimeout(() => {
+    autoScanRetryTimers.delete(retryTimer);
+    if (generation !== runtimeCacheGeneration) return;
     if (!autoScanEnabled) return;
     scheduleIncrementalScan();
   }, 1200);
+  autoScanRetryTimers.add(retryTimer);
 };
 
 const scheduleIncrementalScan = () => {
@@ -2674,10 +2795,40 @@ const getScrollableElementScore = (element) => {
 };
 
 const getBestScrollableElement = () => {
-  if (autoScrollElementRoot && getScrollableElementScore(autoScrollElementRoot) >= 18) {
-    return autoScrollElementRoot;
+  const now = Date.now();
+  let cachedRootInvalidated = false;
+  if (autoScrollElementRoot) {
+    if (
+      autoScrollElementRoot.isConnected !== false &&
+      now - autoScrollRootValidatedAt < AUTO_SCROLL_ROOT_VALIDATE_MS
+    ) {
+      return autoScrollElementRoot;
+    }
+    if (
+      autoScrollElementRoot.isConnected !== false &&
+      getScrollableElementScore(autoScrollElementRoot) >= 18
+    ) {
+      autoScrollRootValidatedAt = now;
+      return autoScrollElementRoot;
+    }
+    autoScrollElementRoot = null;
+    cachedRootInvalidated = true;
   }
-  autoScrollElementRoot = null;
+
+  const domChanged = autoScrollRootSearchVersion !== autoScrollDomVersion;
+  const rescanDelay = domChanged
+    ? AUTO_SCROLL_ROOT_MUTATION_RESCAN_MS
+    : AUTO_SCROLL_ROOT_RESCAN_MS;
+  if (
+    !cachedRootInvalidated &&
+    autoScrollRootSearchAt > 0 &&
+    now - autoScrollRootSearchAt < rescanDelay
+  ) {
+    return null;
+  }
+
+  autoScrollRootSearchAt = now;
+  autoScrollRootSearchVersion = autoScrollDomVersion;
 
   const roots = collectShadowRoots(document);
   let best = null;
@@ -2689,6 +2840,7 @@ const getBestScrollableElement = () => {
       scanned += 1;
       if (scanned > 1800) {
         autoScrollElementRoot = bestScore >= 18 ? best : null;
+        autoScrollRootValidatedAt = now;
         return autoScrollElementRoot;
       }
       const score = getScrollableElementScore(element);
@@ -2699,6 +2851,7 @@ const getBestScrollableElement = () => {
     }
   }
   autoScrollElementRoot = bestScore >= 18 ? best : null;
+  autoScrollRootValidatedAt = now;
   return autoScrollElementRoot;
 };
 
@@ -2760,12 +2913,47 @@ const getScrollMetrics = () => {
 
 const getAutoScrollObservedCount = () => {
   if (autoScrollProfile === "comic") {
-    return buildComicSequence().length;
+    const now = Date.now();
+    const domChanged = comicSequenceCountCache.domVersion !== autoScrollDomVersion;
+    const cacheMs = domChanged
+      ? COMIC_SEQUENCE_COUNT_MUTATION_CACHE_MS
+      : COMIC_SEQUENCE_COUNT_CACHE_MS;
+    if (
+      comicSequenceCountCache.updatedAt > 0 &&
+      now - comicSequenceCountCache.updatedAt < cacheMs
+    ) {
+      return comicSequenceCountCache.count;
+    }
+    comicSequenceCountCache = {
+      count: buildComicSequence().length,
+      domVersion: autoScrollDomVersion,
+      updatedAt: now
+    };
+    return comicSequenceCountCache.count;
   }
   if (autoScanEnabled) {
     return knownNormalizedUrls.size;
   }
   return Number(document.images?.length) || 0;
+};
+
+const startAutoScrollMutationTracking = () => {
+  if (autoScrollMutationObserver) return;
+  autoScrollMutationObserver = new MutationObserver(() => {
+    autoScrollDomVersion += 1;
+  });
+  autoScrollMutationObserver.observe(document.documentElement || document.body, {
+    childList: true,
+    subtree: true,
+    attributes: true,
+    attributeFilter: ["class", "style", "src", "srcset"]
+  });
+};
+
+const stopAutoScrollMutationTracking = () => {
+  if (!autoScrollMutationObserver) return;
+  autoScrollMutationObserver.disconnect();
+  autoScrollMutationObserver = null;
 };
 
 const hasPendingAutoScrollGrowthSignals = () => {
@@ -2959,17 +3147,22 @@ const startAutoScroll = (profile = "normal", options = {}) => {
   autoScrollIgnoreUserInterrupt = options?.ignoreUserInterrupt === true;
   if (autoScrollEnabled) return;
   autoScrollEnabled = true;
+  autoScrollElementRoot = null;
+  autoScrollRootSearchVersion = -1;
+  autoScrollRootSearchAt = 0;
+  autoScrollRootValidatedAt = 0;
+  startAutoScrollMutationTracking();
   autoScrollStallCount = 0;
   autoScrollIdleCount = 0;
   autoScrollStartedAt = Date.now();
   autoScrollLastGrowthAt = autoScrollStartedAt;
-  autoScrollLastHeight = getScrollMetrics().scrollHeight;
+  const initialMetrics = getScrollMetrics();
+  autoScrollLastHeight = initialMetrics.scrollHeight;
   autoScrollLastObservedCount = getAutoScrollObservedCount();
   autoScrollStableHeight = autoScrollLastHeight;
   autoScrollStableCount = autoScrollLastObservedCount;
   autoScrollStableSince = autoScrollStartedAt;
-  autoScrollExpectedTop = getScrollMetrics().scrollTop;
-  autoScrollElementRoot = null;
+  autoScrollExpectedTop = initialMetrics.scrollTop;
   autoScrollProgrammaticUntil = 0;
   autoScrollUserIntentUntil = 0;
   scheduleAutoScrollTick(autoScrollProfile === "comic" ? 120 : 180);
@@ -2977,6 +3170,7 @@ const startAutoScroll = (profile = "normal", options = {}) => {
 
 const stopAutoScroll = () => {
   autoScrollEnabled = false;
+  stopAutoScrollMutationTracking();
   autoScrollStallCount = 0;
   autoScrollIdleCount = 0;
   autoScrollLastHeight = 0;
@@ -3088,8 +3282,8 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
     }
 
     case MSG.CLEAR_RUNTIME_CACHE: {
-      resetRuntimeCaches();
-      sendResponse({ success: true });
+      const runtimeGeneration = resetRuntimeCaches();
+      sendResponse({ success: true, runtimeGeneration });
       break;
     }
 

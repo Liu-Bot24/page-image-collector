@@ -145,6 +145,16 @@ const normalizeSourceUrl = (url) => {
   }
 };
 
+const normalizePageUrl = (url) => {
+  try {
+    const parsed = new URL(String(url || ""));
+    if (!/^https?:$/i.test(parsed.protocol)) return null;
+    return parsed.href;
+  } catch (_error) {
+    return null;
+  }
+};
+
 const sourceQualityScore = (url) => {
   if (!url) return -1;
   try {
@@ -261,7 +271,7 @@ const findTelegramEquivalentId = (state, incomingImage) => {
 };
 
 const getImageFormat = (url) => {
-  return formatFromUrl(url) || "unknown";
+  return formatFromUrl(url);
 };
 
 export const generateImageId = (normalizedUrl) => {
@@ -412,6 +422,37 @@ const indexImage = (state, image, imageId) => {
   }
 };
 
+const allocateImageId = (state, image) => {
+  const baseId = image?.id || generateImageId(image?.normalized);
+  if (!baseId) return null;
+
+  const baseImage = state.images.get(baseId);
+  if (!baseImage || baseImage.normalized === image.normalized) {
+    return baseId;
+  }
+
+  let suffix = 2;
+  while (suffix < 100000) {
+    const candidateId = `${baseId}_${suffix}`;
+    const candidateImage = state.images.get(candidateId);
+    if (!candidateImage || candidateImage.normalized === image.normalized) {
+      return candidateId;
+    }
+    suffix += 1;
+  }
+
+  return `${baseId}_${Date.now()}`;
+};
+
+const addNewImage = (state, image) => {
+  const imageId = allocateImageId(state, image);
+  if (!imageId) return null;
+  const storedImage = image.id === imageId ? image : { ...image, id: imageId };
+  state.images.set(imageId, storedImage);
+  indexImage(state, storedImage, imageId);
+  return storedImage;
+};
+
 const findExistingImageId = (state, image) => {
   if (!state || !image) return null;
   if (image.normalized && state.imagesByNormalized.has(image.normalized)) {
@@ -490,6 +531,7 @@ const createState = () => {
     selectedIds: new Set(),
     hiddenIds: new Set(),
     config: defaults.config,
+    pageUrl: null,
     lastScanTime: null,
     isScanning: false
   };
@@ -500,6 +542,7 @@ const serializeState = (state) => ({
   selectedIds: Array.from(state.selectedIds),
   hiddenIds: Array.from(state.hiddenIds || []),
   config: state.config,
+  pageUrl: state.pageUrl,
   lastScanTime: state.lastScanTime
 });
 
@@ -592,14 +635,14 @@ export const createTabStateManager = () => {
 
           const state = initTabState(tabId);
           state.config = { ...cloneDefaults().config, ...normalizeConfig(rawState.config) };
+          state.pageUrl = normalizePageUrl(rawState.pageUrl);
           state.lastScanTime = Number(rawState.lastScanTime) || null;
 
           const images = Array.isArray(rawState.images) ? rawState.images : [];
           for (const image of images) {
             const normalizedImage = sanitizeImage(image);
             if (!normalizedImage) continue;
-            state.images.set(normalizedImage.id, normalizedImage);
-            indexImage(state, normalizedImage, normalizedImage.id);
+            addNewImage(state, normalizedImage);
           }
 
           const selectedIds = Array.isArray(rawState.selectedIds) ? rawState.selectedIds : [];
@@ -637,17 +680,17 @@ export const createTabStateManager = () => {
 
       const existingId = findExistingImageId(state, image);
       if (!existingId) {
-        state.images.set(image.id, image);
-        indexImage(state, image, image.id);
-        added += 1;
+        if (addNewImage(state, image)) {
+          added += 1;
+        }
         continue;
       }
 
       const existing = state.images.get(existingId);
       if (!existing) {
-        state.images.set(image.id, image);
-        indexImage(state, image, image.id);
-        added += 1;
+        if (addNewImage(state, image)) {
+          added += 1;
+        }
         continue;
       }
 
@@ -659,10 +702,18 @@ export const createTabStateManager = () => {
 
       if (shouldReplace) {
         const maxDimensions = mergeMaxDimensions(existing, image);
+        const incomingFormat = String(image.format || "").toLowerCase();
+        const existingFormat = String(existing.format || "").toLowerCase();
         const merged = {
           ...existing,
           ...image,
           id: existingId,
+          format:
+            incomingFormat && incomingFormat !== "unknown"
+              ? image.format
+              : existingFormat && existingFormat !== "unknown"
+                ? existing.format
+                : "unknown",
           ...maxDimensions,
           ...preserveHdState(existing, image),
           ...mergeComicPageMetadata(existing, image)
@@ -724,6 +775,23 @@ export const createTabStateManager = () => {
     }));
   };
 
+  const getPageUrl = (tabId) => {
+    const state = tabStates.get(tabId);
+    return state?.pageUrl || null;
+  };
+
+  const hasTabState = (tabId) => tabStates.has(tabId);
+
+  const setPageUrl = (tabId, url) => {
+    const normalized = normalizePageUrl(url);
+    if (!normalized) return false;
+    const state = initTabState(tabId);
+    if (state.pageUrl === normalized) return false;
+    state.pageUrl = normalized;
+    schedulePersist();
+    return true;
+  };
+
   const toggleSelectImage = (tabId, imageId) => {
     const state = initTabState(tabId);
     if (!state.images.has(imageId)) return Array.from(state.selectedIds);
@@ -740,47 +808,77 @@ export const createTabStateManager = () => {
   const setSelectionByIds = (tabId, imageIds = [], selected = true) => {
     const state = initTabState(tabId);
     const ids = Array.isArray(imageIds) ? imageIds : [];
+    let changed = false;
     for (const imageId of ids) {
       if (!state.images.has(imageId)) continue;
       if (selected) {
-        state.selectedIds.add(imageId);
+        if (!state.selectedIds.has(imageId)) {
+          state.selectedIds.add(imageId);
+          changed = true;
+        }
       } else {
-        state.selectedIds.delete(imageId);
+        changed = state.selectedIds.delete(imageId) || changed;
       }
     }
-    schedulePersist();
+    if (changed) schedulePersist();
     return Array.from(state.selectedIds);
   };
 
-  const getSelectedImages = (tabId) => {
+  const getSelectedImages = (tabId, orderedImageIds = []) => {
     const state = tabStates.get(tabId);
     if (!state) return [];
-    return Array.from(state.selectedIds)
+    const selected = Array.from(state.selectedIds)
       .map((imageId) => state.images.get(imageId))
       .filter(Boolean)
       .sort((a, b) => b.area - a.area);
+    if (!Array.isArray(orderedImageIds) || orderedImageIds.length === 0) {
+      return selected;
+    }
+
+    const selectedById = new Map(selected.map((image) => [image.id, image]));
+    const ordered = [];
+    const seen = new Set();
+    for (const imageId of orderedImageIds) {
+      const image = selectedById.get(imageId);
+      if (!image || seen.has(imageId)) continue;
+      seen.add(imageId);
+      ordered.push(image);
+    }
+    for (const image of selected) {
+      if (seen.has(image.id)) continue;
+      ordered.push(image);
+    }
+    return ordered;
   };
 
   const setHiddenByIds = (tabId, imageIds = [], hidden = true) => {
     const state = initTabState(tabId);
     const ids = Array.isArray(imageIds) ? imageIds : [];
+    let changed = false;
     for (const imageId of ids) {
       if (!state.images.has(imageId)) continue;
-      state.selectedIds.delete(imageId);
+      changed = state.selectedIds.delete(imageId) || changed;
       if (hidden) {
-        state.hiddenIds.add(imageId);
+        if (!state.hiddenIds.has(imageId)) {
+          state.hiddenIds.add(imageId);
+          changed = true;
+        }
       } else {
-        state.hiddenIds.delete(imageId);
+        changed = state.hiddenIds.delete(imageId) || changed;
       }
     }
-    schedulePersist();
+    if (changed) schedulePersist();
     return Array.from(state.hiddenIds);
   };
 
   const setConfig = (tabId, config) => {
     const state = initTabState(tabId);
-    state.config = { ...state.config, ...normalizeConfig(config, true) };
-    schedulePersist();
+    const patch = normalizeConfig(config, true);
+    const changed = Object.entries(patch).some(([key, value]) => state.config[key] !== value);
+    if (changed) {
+      state.config = { ...state.config, ...patch };
+      schedulePersist();
+    }
     return { ...state.config };
   };
 
@@ -829,9 +927,11 @@ export const createTabStateManager = () => {
   };
 
   const setScanning = (tabId, isScanning) => {
-    const state = initTabState(tabId);
-    state.isScanning = Boolean(isScanning);
-    if (isScanning) {
+    const nextScanning = Boolean(isScanning);
+    const state = nextScanning ? initTabState(tabId) : tabStates.get(tabId);
+    if (!state) return;
+    state.isScanning = nextScanning;
+    if (nextScanning) {
       state.lastScanTime = Date.now();
       schedulePersist();
     }
@@ -848,8 +948,11 @@ export const createTabStateManager = () => {
     if (!state) return;
     const image = state.images.get(imageId);
     if (!image) return;
-    image.hdRejected = Boolean(rejected);
-    image.isHD = Boolean(image.hdSrc && image.hdSrc !== image.src && !image.hdRejected);
+    const nextRejected = Boolean(rejected);
+    const nextIsHD = Boolean(image.hdSrc && image.hdSrc !== image.src && !nextRejected);
+    if (image.hdRejected === nextRejected && image.isHD === nextIsHD) return;
+    image.hdRejected = nextRejected;
+    image.isHD = nextIsHD;
     schedulePersist();
   };
 
@@ -927,6 +1030,12 @@ export const createTabStateManager = () => {
   const clearTabImages = (tabId) => {
     const state = tabStates.get(tabId);
     if (!state) return;
+    const changed =
+      state.images.size > 0 ||
+      state.selectedIds.size > 0 ||
+      state.hiddenIds.size > 0 ||
+      state.lastScanTime !== null;
+    if (!changed) return;
     state.images.clear();
     state.imagesByNormalized.clear();
     state.imagesByHdSrc.clear();
@@ -941,6 +1050,9 @@ export const createTabStateManager = () => {
     initTabState,
     mergeImages,
     getAllImages,
+    getPageUrl,
+    hasTabState,
+    setPageUrl,
     toggleSelectImage,
     setSelectionByIds,
     getSelectedImages,

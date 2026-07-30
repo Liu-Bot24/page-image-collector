@@ -21,7 +21,7 @@ A Chrome extension for daily browsing scenarios, used to quickly collect web pag
 ### Install from GitHub Releases
 
 1. Go to the project's `Releases` page.
-2. Download the unpacked zip for the corresponding version, e.g., `page-image-collector-1.2.7-unpacked.zip`.
+2. Download the unpacked zip for the corresponding version, e.g., `page-image-collector-1.2.8-unpacked.zip`.
 3. Open `chrome://extensions/`.
 4. Enable "Developer mode".
 5. Unzip the downloaded ZIP file.
@@ -31,6 +31,15 @@ A Chrome extension for daily browsing scenarios, used to quickly collect web pag
 ## Documentation
 
 - Privacy Policy: [PRIVACY.md](./PRIVACY.md)
+
+## What's New in 1.2.8
+
+- Improved state stability across repeated scans, auto collection, and page navigation so stale tasks cannot overwrite or clear newer results.
+- Fixed stale images remaining after navigation in single-page apps while preserving collection state for ordinary same-page anchor changes.
+- Improved synchronization and cleanup of anti-hotlinking request rules so image loading rules do not become stale after clearing, rescanning, or background recovery.
+- Improved batch download and split ZIP reliability, including background recovery, image payload validation, and handoff between ZIP parts.
+- Completed Comic Mode pagination cancellation: background pagination now stops when Comic Mode closes, results are cleared, the page navigates, or a related tab closes.
+- Improved consistency for image metadata updates, format filters, and auto scrolling on long pages, reducing delayed UI updates and repeated probing.
 
 ## What's New in 1.2.7
 
@@ -269,5 +278,5 @@ For dynamic pages, it is recommended to perform a manual scan first, then enable
 
 ## Version Info
 
-- Version: `1.2.7`
+- Version: `1.2.8`
 - Manifest: `MV3`

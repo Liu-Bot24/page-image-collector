@@ -12,23 +12,25 @@
 
   const setText = (selector, key) => {
     const node = document.querySelector(selector);
-    if (node) node.textContent = i18n.t(currentLanguage, key);
+    i18n.setTextContent(node, i18n.t(currentLanguage, key));
   };
 
   const setAttrs = (selector, key) => {
     const node = document.querySelector(selector);
     if (!node) return;
     const text = i18n.t(currentLanguage, key);
-    node.setAttribute("aria-label", text);
-    node.title = text;
+    i18n.setAttributeIfChanged(node, "aria-label", text);
+    i18n.setAttributeIfChanged(node, "title", text);
   };
 
   const syncLanguageSwitch = () => {
     if (!languageSwitch) return;
     languageSwitch.querySelectorAll("[data-language]").forEach((button) => {
       const active = i18n.normalizeLanguage(button.dataset.language) === currentLanguage;
-      button.classList.toggle("active", active);
-      button.setAttribute("aria-pressed", active ? "true" : "false");
+      if (button.classList.contains("active") !== active) {
+        button.classList.toggle("active", active);
+      }
+      i18n.setAttributeIfChanged(button, "aria-pressed", active ? "true" : "false");
     });
   };
 
@@ -37,18 +39,18 @@
     if (!button) return;
     const text = button.textContent.trim();
     if (text === i18n.t("zh", "common.scanning") || text === i18n.t("en", "common.scanning")) {
-      button.textContent = i18n.t(currentLanguage, "common.scanning");
+      i18n.setTextContent(button, i18n.t(currentLanguage, "common.scanning"));
       return;
     }
     if (text === i18n.t("zh", "popup.scanContinue") || text === i18n.t("en", "popup.scanContinue")) {
-      button.textContent = i18n.t(currentLanguage, "popup.scanContinue");
+      i18n.setTextContent(button, i18n.t(currentLanguage, "popup.scanContinue"));
       return;
     }
-    button.textContent = i18n.t(currentLanguage, "popup.scanStart");
+    i18n.setTextContent(button, i18n.t(currentLanguage, "popup.scanStart"));
   };
 
   const syncStaticControls = () => {
-    document.title = i18n.t(currentLanguage, "popup.documentTitle");
+    i18n.setDocumentTitle(document, i18n.t(currentLanguage, "popup.documentTitle"));
     setText(".logo-text", "app.title");
     setText("#btn-workspace", "workspace.open");
     setAttrs("#btn-clear", "common.clearResults");

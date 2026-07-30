@@ -1,7 +1,26 @@
 import { createTabStateManager } from "./stateManager.js";
+import { createComicPaginationJobManager } from "./comicPaginationJobs.js";
 import { annotateComicPageImages } from "../shared/comicCore.js";
-import { buildRefererModifyRule, normalizeDnrHostname, normalizeRefererOrigin } from "../shared/dnrCore.js";
-import { DEFAULT_ZIP_PART_PRESET, formatFromUrl, inspectImagePayload, mimeFromFormat, normalizeZipPartOptions } from "../shared/zipCore.js";
+import {
+  buildRefererModifyRule,
+  normalizeDnrHostname,
+  normalizeRefererOrigin,
+  normalizeRefererTabOwners,
+  reconcileRefererRuleSet,
+  removeRefererTabOwner,
+  serializeRefererTabOwners,
+  setRefererTabOwner
+} from "../shared/dnrCore.js";
+import {
+  DEFAULT_ZIP_PART_PRESET,
+  formatFromUrl,
+  inspectImagePayload,
+  mimeFromFormat,
+  normalizeZipPartOptions,
+  resolveImagePayloadExtension,
+  shouldConvertImageToJpg
+} from "../shared/zipCore.js";
+import { shouldResetForUrlOnlyNavigation } from "../shared/navigationCore.js";
 
 const MSG = {
   SCAN: "SCAN",
@@ -24,6 +43,7 @@ const MSG = {
   GET_COMIC_SEQUENCE: "GET_COMIC_SEQUENCE",
   GET_COMIC_PAGINATION: "GET_COMIC_PAGINATION",
   LOAD_COMIC_PAGINATION_PAGES: "LOAD_COMIC_PAGINATION_PAGES",
+  CANCEL_COMIC_PAGINATION: "CANCEL_COMIC_PAGINATION",
   TOGGLE_RIGHT_CLICK: "TOGGLE_RIGHT_CLICK",
   START_AUTO_SCAN: "START_AUTO_SCAN",
   STOP_AUTO_SCAN: "STOP_AUTO_SCAN",
@@ -43,7 +63,8 @@ const MSG = {
   OFFSCREEN_ZIP_PROGRESS: "OFFSCREEN_ZIP_PROGRESS",
   OFFSCREEN_ZIP_PART_READY: "OFFSCREEN_ZIP_PART_READY",
   OFFSCREEN_ZIP_PART_DONE: "OFFSCREEN_ZIP_PART_DONE",
-  OFFSCREEN_ZIP_DONE: "OFFSCREEN_ZIP_DONE"
+  OFFSCREEN_ZIP_DONE: "OFFSCREEN_ZIP_DONE",
+  OFFSCREEN_ZIP_STATUS: "OFFSCREEN_ZIP_STATUS"
 };
 
 const CONTEXT_MENU_IDS = {
@@ -63,15 +84,33 @@ const DOWNLOAD_STATUS_STORAGE_KEY = "pic_collector_download_status_v1";
 const ZIP_PENDING_DOWNLOADS_STORAGE_KEY = "pic_collector_zip_pending_downloads_v1";
 const ZIP_PREFERENCES_STORAGE_KEY = "pic_collector_zip_preferences_v1";
 const IMAGE_REFERER_METADATA_STORAGE_KEY = "pic_collector_image_referer_rules_v1";
+const UI_LANGUAGE_STORAGE_KEY = "pageImageCollector.language";
 const DOWNLOAD_STATUS_PERSIST_DEBOUNCE_MS = 350;
 
 const stateManager = createTabStateManager();
 const TEXT_ENCODER = new TextEncoder();
 const pendingFilenameHints = new Map();
+const batchDownloadAdmissions = new Set();
 const activeBatchDownloads = new Set();
+const startingOffscreenZipTasks = new Set();
 const batchDownloadStatusByTab = new Map();
+const incrementalGenerationByTab = new Map();
+const runtimeCacheClearDepthByTab = new Map();
+const tabsNavigating = new Set();
+const removedTabIds = new Set();
+const collectionEpochByTab = new Map();
+const comicPaginationJobs = createComicPaginationJobManager({
+  closeTab: async (tabId) => {
+    await chrome.tabs.remove(tabId);
+  }
+});
+let collectionEpochSequence = 0;
 let downloadStatusPersistTimer = null;
+let downloadStatusesLoadTask = null;
+let downloadStatusPersistTail = Promise.resolve();
 const pendingZipPartDownloads = new Map();
+let pendingZipPartDownloadsLoadTask = null;
+let pendingZipPartDownloadsPersistTail = Promise.resolve();
 const DOWNLOAD_STATUS_TTL_MS = 15 * 1000;
 const CRC32_TABLE = (() => {
   const table = new Uint32Array(256);
@@ -86,6 +125,32 @@ const CRC32_TABLE = (() => {
 })();
 
 const cloneDownloadStatus = (status) => (status ? { ...status } : null);
+
+const getCollectionEpoch = (tabId) => collectionEpochByTab.get(tabId) || 0;
+
+const invalidateCollectionEpoch = (tabId) => {
+  if (!Number.isInteger(tabId)) return 0;
+  collectionEpochSequence += 1;
+  collectionEpochByTab.set(tabId, collectionEpochSequence);
+  return collectionEpochSequence;
+};
+
+const isRuntimeCacheClearActive = (tabId) =>
+  (runtimeCacheClearDepthByTab.get(tabId) || 0) > 0;
+
+const beginRuntimeCacheClear = (tabId) => {
+  if (!Number.isInteger(tabId)) return;
+  runtimeCacheClearDepthByTab.set(tabId, (runtimeCacheClearDepthByTab.get(tabId) || 0) + 1);
+};
+
+const endRuntimeCacheClear = (tabId) => {
+  const depth = runtimeCacheClearDepthByTab.get(tabId) || 0;
+  if (depth <= 1) {
+    runtimeCacheClearDepthByTab.delete(tabId);
+    return;
+  }
+  runtimeCacheClearDepthByTab.set(tabId, depth - 1);
+};
 
 const getZipPartPresetPreference = async () => {
   try {
@@ -111,32 +176,66 @@ const withZipPreferences = async (config = {}) => ({
   zipPartPreset: await getZipPartPresetPreference()
 });
 
+const ensureDownloadStatusesLoaded = async () => {
+  if (!downloadStatusesLoadTask) {
+    downloadStatusesLoadTask = (async () => {
+      const stored = await chrome.storage.local.get(DOWNLOAD_STATUS_STORAGE_KEY);
+      const raw = stored?.[DOWNLOAD_STATUS_STORAGE_KEY] || {};
+      const now = Date.now();
+      for (const [rawTabId, status] of Object.entries(raw)) {
+        const tabId = Number(rawTabId);
+        if (!Number.isInteger(tabId) || !status || batchDownloadStatusByTab.has(tabId)) continue;
+        if (status.active !== true && Number(status.expiresAt) > 0 && Number(status.expiresAt) <= now) {
+          continue;
+        }
+        batchDownloadStatusByTab.set(tabId, status);
+      }
+    })();
+  }
+
+  const task = downloadStatusesLoadTask;
+  try {
+    await task;
+    return true;
+  } catch (_error) {
+    if (downloadStatusesLoadTask === task) {
+      downloadStatusesLoadTask = null;
+    }
+    return false;
+  }
+};
+
 const persistDownloadStatuses = () => {
   if (downloadStatusPersistTimer) {
     clearTimeout(downloadStatusPersistTimer);
     downloadStatusPersistTimer = null;
   }
-  const payload = {};
-  const now = Date.now();
-  for (const [key, status] of batchDownloadStatusByTab.entries()) {
-    if (!status) continue;
-    if (status.active !== true && Number(status.expiresAt) > 0 && Number(status.expiresAt) <= now) {
-      continue;
+  const task = downloadStatusPersistTail.then(async () => {
+    if (!(await ensureDownloadStatusesLoaded())) return false;
+    const payload = {};
+    const now = Date.now();
+    for (const [key, status] of batchDownloadStatusByTab.entries()) {
+      if (!status) continue;
+      if (status.active !== true && Number(status.expiresAt) > 0 && Number(status.expiresAt) <= now) {
+        continue;
+      }
+      payload[String(key)] = status;
     }
-    payload[String(key)] = status;
-  }
-  chrome.storage.local.set({ [DOWNLOAD_STATUS_STORAGE_KEY]: payload }).catch(() => {});
+    await chrome.storage.local.set({ [DOWNLOAD_STATUS_STORAGE_KEY]: payload });
+    return true;
+  });
+  downloadStatusPersistTail = task.catch(() => {});
+  return task;
 };
 
 const schedulePersistDownloadStatuses = (immediate = false) => {
   if (immediate) {
-    persistDownloadStatuses();
-    return;
+    return persistDownloadStatuses().catch(() => false);
   }
   if (downloadStatusPersistTimer) return;
   downloadStatusPersistTimer = setTimeout(() => {
     downloadStatusPersistTimer = null;
-    persistDownloadStatuses();
+    persistDownloadStatuses().catch(() => {});
   }, DOWNLOAD_STATUS_PERSIST_DEBOUNCE_MS);
 };
 
@@ -162,11 +261,12 @@ const updateDownloadStatus = (tabId, patch = {}) => {
   if (!Number.isInteger(tabId)) return null;
   cleanupExpiredDownloadStatuses(tabId);
   const previous = batchDownloadStatusByTab.get(tabId) || {};
+  const updatedAt = Math.max(Date.now(), (Number(previous.updatedAt) || 0) + 1);
   const next = {
     ...previous,
     ...patch,
     tabId,
-    updatedAt: Date.now()
+    updatedAt
   };
 
   if (next.active === false) {
@@ -190,65 +290,120 @@ const emitDownloadStatus = (tabId, patch = {}) => {
   return status;
 };
 
-const getDownloadStatus = async (tabId) => {
-  if (!Number.isInteger(tabId)) return null;
-  cleanupExpiredDownloadStatuses(tabId);
-  const existing = batchDownloadStatusByTab.get(tabId);
-  if (existing) return cloneDownloadStatus(existing);
-
+const getOffscreenZipTaskLiveness = async (taskId) => {
+  if (!taskId) return false;
   try {
-    const stored = await chrome.storage.local.get(DOWNLOAD_STATUS_STORAGE_KEY);
-    const raw = stored?.[DOWNLOAD_STATUS_STORAGE_KEY]?.[String(tabId)] || null;
-    if (!raw) return null;
-    if (raw.active !== true && Number(raw.expiresAt) > 0 && Number(raw.expiresAt) <= Date.now()) {
-      return null;
-    }
-    batchDownloadStatusByTab.set(tabId, raw);
-    return cloneDownloadStatus(raw);
+    if (!(await hasOffscreenDocument())) return false;
+    const taskStatus = await chrome.runtime.sendMessage({
+      type: MSG.OFFSCREEN_ZIP_STATUS,
+      payload: { taskId }
+    });
+    if (taskStatus?.success !== true) return null;
+    return taskStatus.active === true;
   } catch (_error) {
     return null;
   }
 };
 
-const loadPendingZipPartDownloads = async () => {
-  try {
-    const stored = await chrome.storage.local.get(ZIP_PENDING_DOWNLOADS_STORAGE_KEY);
-    const raw = stored?.[ZIP_PENDING_DOWNLOADS_STORAGE_KEY] || {};
-    for (const [downloadId, record] of Object.entries(raw)) {
-      const id = Number(downloadId);
-      if (Number.isInteger(id) && record) {
-        pendingZipPartDownloads.set(id, { ...record, downloadId: id });
+const recoverActiveDownloadStatus = async (tabId, status) => {
+  if (status?.active !== true) return status;
+  const snapshotTaskId = String(status.taskId || "");
+  const snapshotUpdatedAt = Number(status.updatedAt) || 0;
+
+  let stillActive = null;
+  if (status.mode === "zip") {
+    stillActive = status.taskId
+      ? startingOffscreenZipTasks.has(status.taskId) || await getOffscreenZipTaskLiveness(status.taskId)
+      : activeBatchDownloads.has(tabId);
+  } else {
+    stillActive = activeBatchDownloads.has(tabId);
+  }
+
+  if (stillActive !== false) return status;
+  const current = batchDownloadStatusByTab.get(tabId);
+  if (
+    !current ||
+    current.active !== true ||
+    String(current.taskId || "") !== snapshotTaskId ||
+    (Number(current.updatedAt) || 0) !== snapshotUpdatedAt
+  ) {
+    return current || status;
+  }
+  activeBatchDownloads.delete(tabId);
+  return updateDownloadStatus(tabId, {
+    ...current,
+    active: false,
+    phase: "failed",
+    error: "上次批量下载任务已中断，请重新开始"
+  });
+};
+
+const getDownloadStatus = async (tabId) => {
+  if (!Number.isInteger(tabId)) return null;
+  await ensureDownloadStatusesLoaded();
+  cleanupExpiredDownloadStatuses(tabId);
+  const existing = batchDownloadStatusByTab.get(tabId);
+  if (!existing) return null;
+  const recovered = await recoverActiveDownloadStatus(tabId, existing);
+  return cloneDownloadStatus(recovered);
+};
+
+const ensurePendingZipPartDownloadsLoaded = async () => {
+  if (!pendingZipPartDownloadsLoadTask) {
+    pendingZipPartDownloadsLoadTask = (async () => {
+      const stored = await chrome.storage.local.get(ZIP_PENDING_DOWNLOADS_STORAGE_KEY);
+      const raw = stored?.[ZIP_PENDING_DOWNLOADS_STORAGE_KEY] || {};
+      for (const [downloadId, record] of Object.entries(raw)) {
+        const id = Number(downloadId);
+        if (Number.isInteger(id) && record && !pendingZipPartDownloads.has(id)) {
+          pendingZipPartDownloads.set(id, { ...record, downloadId: id });
+        }
       }
-    }
+    })();
+  }
+
+  const task = pendingZipPartDownloadsLoadTask;
+  try {
+    await task;
+    return true;
   } catch (_error) {
-    // Ignore load errors; downloads.onChanged will simply skip unknown ids.
+    if (pendingZipPartDownloadsLoadTask === task) {
+      pendingZipPartDownloadsLoadTask = null;
+    }
+    return false;
   }
 };
 
 const persistPendingZipPartDownloads = async () => {
-  const payload = {};
-  for (const [downloadId, record] of pendingZipPartDownloads.entries()) {
-    payload[String(downloadId)] = record;
-  }
-  await chrome.storage.local.set({ [ZIP_PENDING_DOWNLOADS_STORAGE_KEY]: payload });
+  const task = pendingZipPartDownloadsPersistTail.then(async () => {
+    if (!(await ensurePendingZipPartDownloadsLoaded())) return false;
+    const payload = {};
+    for (const [downloadId, record] of pendingZipPartDownloads.entries()) {
+      payload[String(downloadId)] = record;
+    }
+    await chrome.storage.local.set({ [ZIP_PENDING_DOWNLOADS_STORAGE_KEY]: payload });
+    return true;
+  });
+  pendingZipPartDownloadsPersistTail = task.catch(() => {});
+  return await task.catch(() => false);
 };
 
 const savePendingZipPartDownload = async (record) => {
   if (!Number.isInteger(record?.downloadId)) return;
+  await ensurePendingZipPartDownloadsLoaded();
   pendingZipPartDownloads.set(record.downloadId, record);
   await persistPendingZipPartDownloads();
 };
 
 const getPendingZipPartDownload = async (downloadId) => {
   if (!Number.isInteger(downloadId)) return null;
-  if (pendingZipPartDownloads.size === 0) {
-    await loadPendingZipPartDownloads();
-  }
+  await ensurePendingZipPartDownloadsLoaded();
   return pendingZipPartDownloads.get(downloadId) || null;
 };
 
 const removePendingZipPartDownload = async (downloadId) => {
   if (!Number.isInteger(downloadId)) return;
+  await ensurePendingZipPartDownloadsLoaded();
   if (pendingZipPartDownloads.delete(downloadId)) {
     await persistPendingZipPartDownloads();
   }
@@ -257,6 +412,7 @@ const removePendingZipPartDownload = async (downloadId) => {
 const removePendingZipPartDownloadByObjectUrl = async (objectUrl) => {
   const url = String(objectUrl || "");
   if (!url) return;
+  await ensurePendingZipPartDownloadsLoaded();
   let changed = false;
   for (const [downloadId, record] of pendingZipPartDownloads.entries()) {
     if (record?.objectUrl === url) {
@@ -330,7 +486,39 @@ const IMAGE_REFERER_RULE_TTL_MS = 30 * 60 * 1000;
 const IMAGE_REFERER_RESOURCE_TYPES = ["image", "xmlhttprequest", "media", "other"];
 const SINAIMG_REFERER_RESOURCE_TYPES = ["main_frame", "sub_frame", "image", "xmlhttprequest", "media", "other"];
 const imageRefererRuleMap = new Map();
-let imageRefererMetadataLoaded = false;
+const imageRefererOwnerByTab = new Map();
+let imageRefererMetadataLoadTask = null;
+let imageRefererMutationTail = Promise.resolve();
+let imageRefererOwnerSequence = 0;
+const IMAGE_REFERER_OWNER_SESSION_ID =
+  `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 10)}`;
+
+const createImageRefererOwnerToken = (tabId) => {
+  imageRefererOwnerSequence += 1;
+  return `${IMAGE_REFERER_OWNER_SESSION_ID}:${tabId}:${imageRefererOwnerSequence}`;
+};
+
+const getImageRefererOwnerToken = (tabId) => {
+  if (!Number.isInteger(tabId)) return "";
+  let ownerToken = imageRefererOwnerByTab.get(tabId);
+  if (!ownerToken) {
+    ownerToken = createImageRefererOwnerToken(tabId);
+    imageRefererOwnerByTab.set(tabId, ownerToken);
+  }
+  return ownerToken;
+};
+
+const rotateImageRefererOwnerToken = (tabId) => {
+  if (!Number.isInteger(tabId)) return "";
+  const ownerToken = createImageRefererOwnerToken(tabId);
+  imageRefererOwnerByTab.set(tabId, ownerToken);
+  return ownerToken;
+};
+
+const isImageRefererOwnerCurrent = (tabId, ownerToken) =>
+  Number.isInteger(tabId) &&
+  Boolean(ownerToken) &&
+  imageRefererOwnerByTab.get(tabId) === ownerToken;
 
 const imageRefererRuleIds = () =>
   Array.from(
@@ -402,7 +590,10 @@ const serializeImageRefererMetadata = () => {
       hostname,
       sourceOrigin: record.sourceOrigin,
       expiresAt: record.expiresAt,
-      tabIds: Array.from(record.tabIds || [])
+      tabIds: record.tabOwners instanceof Map
+        ? Array.from(record.tabOwners.keys())
+        : [],
+      tabOwners: serializeRefererTabOwners(record.tabOwners)
     };
   }
   return metadata;
@@ -428,25 +619,40 @@ const normalizeImageRefererRecord = (hostname, record) => {
     hostname: normalizedHostname,
     sourceOrigin,
     expiresAt,
-    tabIds: new Set((Array.isArray(record?.tabIds) ? record.tabIds : [])
-      .map((id) => Number(id))
-      .filter(Number.isInteger))
+    tabOwners: normalizeRefererTabOwners(record?.tabOwners, record?.tabIds)
   };
 };
 
 const loadImageRefererMetadata = async () => {
-  if (imageRefererMetadataLoaded) return;
-  imageRefererMetadataLoaded = true;
-  try {
-    const stored = await chrome.storage.local.get(IMAGE_REFERER_METADATA_STORAGE_KEY);
-    const raw = stored?.[IMAGE_REFERER_METADATA_STORAGE_KEY] || {};
-    for (const [hostname, record] of Object.entries(raw)) {
-      const normalized = normalizeImageRefererRecord(hostname, record);
-      if (normalized) {
-        imageRefererRuleMap.set(normalized.hostname, normalized);
+  if (!imageRefererMetadataLoadTask) {
+    imageRefererMetadataLoadTask = (async () => {
+      const stored = await chrome.storage.local.get(IMAGE_REFERER_METADATA_STORAGE_KEY);
+      const raw = stored?.[IMAGE_REFERER_METADATA_STORAGE_KEY] || {};
+      for (const [hostname, record] of Object.entries(raw)) {
+        const normalized = normalizeImageRefererRecord(hostname, record);
+        if (normalized && !imageRefererRuleMap.has(normalized.hostname)) {
+          imageRefererRuleMap.set(normalized.hostname, normalized);
+        }
       }
+    })();
+  }
+
+  const task = imageRefererMetadataLoadTask;
+  try {
+    await task;
+    return true;
+  } catch (_error) {
+    if (imageRefererMetadataLoadTask === task) {
+      imageRefererMetadataLoadTask = null;
     }
-  } catch { /* ignore */ }
+    return false;
+  }
+};
+
+const queueImageRefererMutation = (operation) => {
+  const task = imageRefererMutationTail.then(operation);
+  imageRefererMutationTail = task.catch(() => {});
+  return task;
 };
 
 const nextImageRefererRuleId = () => {
@@ -457,42 +663,50 @@ const nextImageRefererRuleId = () => {
   return null;
 };
 
-const cleanupStaleImageRefererRules = async () => {
+const cleanupStaleImageRefererRulesUnlocked = async () => {
   if (!chrome.declarativeNetRequest) return;
-  await loadImageRefererMetadata();
+  if (!(await loadImageRefererMetadata())) return;
   try {
     const now = Date.now();
     const removeRuleIds = [];
     for (const [hostname, record] of imageRefererRuleMap.entries()) {
-      if (Number(record.expiresAt) <= now || record.tabIds.size === 0) {
+      if (Number(record.expiresAt) <= now || record.tabOwners.size === 0) {
         removeRuleIds.push(record.ruleId);
         imageRefererRuleMap.delete(hostname);
       }
     }
 
-    const activeRuleIds = new Set(Array.from(imageRefererRuleMap.values()).map((record) => record.ruleId));
     const scopedRules = await getScopedDnrRules();
-    for (const rule of scopedRules) {
-      if (rule.id >= IMAGE_REFERER_RULE_ID_START && rule.id < IMAGE_REFERER_RULE_ID_MAX && !activeRuleIds.has(rule.id)) {
-        removeRuleIds.push(rule.id);
-      }
-    }
+    const reconciliation = reconcileRefererRuleSet({
+      records: Array.from(imageRefererRuleMap.values()),
+      scopedRules,
+      ruleIdStart: IMAGE_REFERER_RULE_ID_START,
+      ruleIdMax: IMAGE_REFERER_RULE_ID_MAX,
+      resourceTypes: IMAGE_REFERER_RESOURCE_TYPES
+    });
+    removeRuleIds.push(...reconciliation.removeRuleIds);
 
     const uniqueRemoveIds = [...new Set(removeRuleIds)];
-    if (uniqueRemoveIds.length > 0) {
-      await updateScopedDnrRules({ removeRuleIds: uniqueRemoveIds });
+    if (uniqueRemoveIds.length > 0 || reconciliation.addRules.length > 0) {
+      await updateScopedDnrRules({
+        removeRuleIds: uniqueRemoveIds,
+        addRules: reconciliation.addRules
+      });
     }
   } catch { /* ignore */ }
   await persistImageRefererMetadata().catch(() => {});
 };
 
-const clearImageRefererRulesForTab = async (tabId) => {
+const cleanupStaleImageRefererRules = () =>
+  queueImageRefererMutation(cleanupStaleImageRefererRulesUnlocked);
+
+const clearImageRefererRulesForTabUnlocked = async (tabId, options = {}) => {
   if (!Number.isInteger(tabId)) return;
-  await loadImageRefererMetadata();
+  if (!(await loadImageRefererMetadata())) return;
   const removeRuleIds = [];
   for (const [hostname, record] of imageRefererRuleMap.entries()) {
-    record.tabIds.delete(tabId);
-    if (record.tabIds.size === 0) {
+    removeRefererTabOwner(record, tabId, options);
+    if (record.tabOwners.size === 0) {
       removeRuleIds.push(record.ruleId);
       imageRefererRuleMap.delete(hostname);
     }
@@ -505,14 +719,32 @@ const clearImageRefererRulesForTab = async (tabId) => {
   await persistImageRefererMetadata().catch(() => {});
 };
 
-const ensureImageHostRefererRule = async (imageHostname, sourceOrigin, tabId) => {
+const clearImageRefererRulesForTab = (tabId, options = {}) =>
+  queueImageRefererMutation(() => {
+    const resolvedOptions = options.preserveCurrentOwner === true
+      ? {
+          ...options,
+          preserveOwnerToken: imageRefererOwnerByTab.get(tabId) || ""
+        }
+      : options;
+    return clearImageRefererRulesForTabUnlocked(tabId, resolvedOptions);
+  });
+
+const ensureImageHostRefererRuleUnlocked = async (
+  imageHostname,
+  sourceOrigin,
+  tabId,
+  ownerToken
+) => {
   if (!chrome.declarativeNetRequest) return;
   const hostname = normalizeDnrHostname(imageHostname);
   const normalizedOrigin = normalizeRefererOrigin(sourceOrigin);
   if (!hostname || !normalizedOrigin) return;
+  if (!isImageRefererOwnerCurrent(tabId, ownerToken)) return;
 
-  await loadImageRefererMetadata();
-  await cleanupStaleImageRefererRules();
+  if (!(await loadImageRefererMetadata())) return;
+  await cleanupStaleImageRefererRulesUnlocked();
+  if (!isImageRefererOwnerCurrent(tabId, ownerToken)) return;
 
   let record = imageRefererRuleMap.get(hostname);
   if (!record) {
@@ -523,13 +755,14 @@ const ensureImageHostRefererRule = async (imageHostname, sourceOrigin, tabId) =>
       hostname,
       sourceOrigin: normalizedOrigin,
       expiresAt: 0,
-      tabIds: new Set()
+      tabOwners: new Map()
     };
   }
 
   record.sourceOrigin = normalizedOrigin;
   record.expiresAt = Date.now() + IMAGE_REFERER_RULE_TTL_MS;
-  if (Number.isInteger(tabId)) record.tabIds.add(tabId);
+  setRefererTabOwner(record, tabId, ownerToken);
+  if (!isImageRefererOwnerCurrent(tabId, ownerToken)) return;
 
   try {
     await updateScopedDnrRules({
@@ -546,6 +779,12 @@ const ensureImageHostRefererRule = async (imageHostname, sourceOrigin, tabId) =>
   } catch { /* ignore */ }
 };
 
+const ensureImageHostRefererRule = (imageHostname, sourceOrigin, tabId, ownerToken) =>
+  queueImageRefererMutation(async () => {
+    if (!isImageRefererOwnerCurrent(tabId, ownerToken)) return;
+    await ensureImageHostRefererRuleUnlocked(imageHostname, sourceOrigin, tabId, ownerToken);
+  });
+
 const originAndHostnameFromUrl = (url) => {
   try {
     const parsed = new URL(String(url || ""));
@@ -557,6 +796,22 @@ const originAndHostnameFromUrl = (url) => {
 };
 
 const updateImageRefererRulesForTab = async (tabId) => {
+  const collectionEpoch = getCollectionEpoch(tabId);
+  const ownerToken = getImageRefererOwnerToken(tabId);
+  const collectionIsStale = () =>
+    removedTabIds.has(tabId) ||
+    tabsNavigating.has(tabId) ||
+    isRuntimeCacheClearActive(tabId) ||
+    getCollectionEpoch(tabId) !== collectionEpoch ||
+    !isImageRefererOwnerCurrent(tabId, ownerToken);
+  const clearStaleRules = async () => {
+    await clearImageRefererRulesForTab(tabId, { ownerToken }).catch(() => {});
+  };
+
+  if (collectionIsStale()) {
+    await clearStaleRules();
+    return;
+  }
   let sourceOrigin, sourceHostname;
   try {
     const tab = await chrome.tabs.get(tabId);
@@ -566,11 +821,19 @@ const updateImageRefererRulesForTab = async (tabId) => {
     sourceOrigin = parsed.origin;
     sourceHostname = parsed.hostname;
   } catch { return; }
+  if (collectionIsStale()) {
+    await clearStaleRules();
+    return;
+  }
 
   const images = stateManager.getAllImages(tabId);
   const seen = new Set();
   for (const img of images) {
     for (const url of [img.src, img.hdSrc, img.originalSrc]) {
+      if (collectionIsStale()) {
+        await clearStaleRules();
+        return;
+      }
       if (!url) continue;
       try {
         const hostname = new URL(url).hostname;
@@ -578,7 +841,11 @@ const updateImageRefererRulesForTab = async (tabId) => {
         const key = `${hostname}|${source.origin}`;
         if (hostname !== source.hostname && !seen.has(key)) {
           seen.add(key);
-          await ensureImageHostRefererRule(hostname, source.origin, tabId);
+          await ensureImageHostRefererRule(hostname, source.origin, tabId, ownerToken);
+          if (collectionIsStale()) {
+            await clearStaleRules();
+            return;
+          }
         }
       } catch { /* ignore */ }
     }
@@ -1000,7 +1267,7 @@ const COMIC_PAGE_GRACE_MS = 500;
 const COMIC_PAGE_SETTLE_MIN_MS = 1000;
 const COMIC_PAGE_SETTLE_MAX_MS = 12000;
 
-const waitForTabComplete = (tabId, timeoutMs = 30000) =>
+const waitForTabComplete = (tabId, timeoutMs = 30000, cancellation = null) =>
   new Promise((resolve) => {
     let settled = false;
     const cleanup = () => {
@@ -1019,33 +1286,76 @@ const waitForTabComplete = (tabId, timeoutMs = 30000) =>
     chrome.tabs.get(tabId)
       .then((tab) => { if (tab?.status === "complete" && !settled) { cleanup(); resolve(); } })
       .catch(() => { cleanup(); resolve(); });
+    if (cancellation) {
+      Promise.resolve(cancellation).then(() => {
+        if (!settled) {
+          cleanup();
+          resolve();
+        }
+      });
+    }
   });
 
 const loadComicPaginationPages = async (sourceTabId, startUrl, options = {}) => {
+  const paginationJob = options.job || null;
+  const paginationJobIsCurrent = () =>
+    !paginationJob || comicPaginationJobs.isCurrent(sourceTabId, paginationJob);
+  if (
+    removedTabIds.has(sourceTabId) ||
+    isRuntimeCacheClearActive(sourceTabId) ||
+    tabsNavigating.has(sourceTabId) ||
+    !paginationJobIsCurrent()
+  ) {
+    return {
+      success: false,
+      cancelled: true,
+      error: "页面正在加载或清理采集结果"
+    };
+  }
   const maxPages = Math.max(1, Math.min(48, Number(options.limit) || 48));
   const waitMs = Math.max(1000, Math.min(30000, (Number(options.waitSeconds) || 6) * 1000));
   const results = [];
   const seen = new Set();
+  const sourceCollectionEpoch = getCollectionEpoch(sourceTabId);
+  const collectionChanged = () => getCollectionEpoch(sourceTabId) !== sourceCollectionEpoch;
+  const paginationCancelled = () => !paginationJobIsCurrent();
+  const operationCancelled = () => collectionChanged() || paginationCancelled();
   const pageIndexBase = stateManager.getMaxComicPageIndex(sourceTabId);
   let nextUrl = startUrl;
   let retryUrl = "";
+  let cancelled = false;
+
+  const waitForPaginationDelay = async (delayMs) => {
+    if (!paginationJob?.cancellation) {
+      await timeout(delayMs);
+      return;
+    }
+    await Promise.race([timeout(delayMs), paginationJob.cancellation]);
+  };
 
   const prepareComicPageForScan = async (tabId, budgetMs) => {
     const settleMs = Math.max(
       COMIC_PAGE_SETTLE_MIN_MS,
       Math.min(COMIC_PAGE_SETTLE_MAX_MS, Number(budgetMs) || COMIC_PAGE_SETTLE_MIN_MS)
     );
+    if (operationCancelled()) return;
     await sendMessageToTab(tabId, { type: MSG.START_AUTO_SCAN }).catch(() => null);
+    if (operationCancelled()) return;
     await sendMessageToTab(tabId, {
       type: MSG.START_AUTO_SCROLL,
       payload: { profile: "comic", ignoreUserInterrupt: true }
     }).catch(() => null);
-    await timeout(settleMs);
+    await waitForPaginationDelay(settleMs);
+    if (operationCancelled()) return;
     await sendMessageToTab(tabId, { type: MSG.STOP_AUTO_SCROLL }).catch(() => null);
-    await timeout(COMIC_PAGE_GRACE_MS);
+    await waitForPaginationDelay(COMIC_PAGE_GRACE_MS);
   };
 
   while (nextUrl && results.length < maxPages) {
+    if (operationCancelled()) {
+      cancelled = true;
+      break;
+    }
     if (seen.has(nextUrl)) {
       nextUrl = "";
       break;
@@ -1057,14 +1367,40 @@ const loadComicPaginationPages = async (sourceTabId, startUrl, options = {}) => 
     try {
       const startedAt = Date.now();
       tab = await chrome.tabs.create({ url, active: false });
-      await waitForTabComplete(tab.id, waitMs);
+      if (
+        paginationJob &&
+        !comicPaginationJobs.attachTemporaryTab(sourceTabId, paginationJob, tab.id)
+      ) {
+        cancelled = true;
+        break;
+      }
+      await waitForTabComplete(tab.id, waitMs, paginationJob?.cancellation);
+      if (operationCancelled()) {
+        cancelled = true;
+        break;
+      }
       const remainingWaitMs = Math.max(COMIC_PAGE_SETTLE_MIN_MS, waitMs - (Date.now() - startedAt));
       await prepareComicPageForScan(tab.id, remainingWaitMs);
+      if (operationCancelled()) {
+        cancelled = true;
+        break;
+      }
 
       const scan = await sendMessageToTab(tab.id, { type: MSG.SCAN_IMAGES });
+      if (operationCancelled()) {
+        cancelled = true;
+        break;
+      }
       const pageIndex = pageIndexBase + results.length + 1;
-      if (scan?.success && Array.isArray(scan.images) && scan.images.length > 0) {
+      if (scan?.success !== true || !Array.isArray(scan.images)) {
+        throw new Error(scan?.error || "分页图片扫描失败");
+      }
+      if (scan.images.length > 0) {
         const sequenceResult = await sendMessageToTab(tab.id, { type: MSG.GET_COMIC_SEQUENCE });
+        if (operationCancelled()) {
+          cancelled = true;
+          break;
+        }
         const annotatedImages = annotateComicPageImages(scan.images, sequenceResult?.sequence || [], {
           pageIndex,
           pageUrl: url
@@ -1076,28 +1412,53 @@ const loadComicPaginationPages = async (sourceTabId, startUrl, options = {}) => 
       }
 
       const paginationResult = await sendMessageToTab(tab.id, { type: MSG.GET_COMIC_PAGINATION });
+      if (operationCancelled()) {
+        cancelled = true;
+        break;
+      }
       if (paginationResult?.success && paginationResult.pagination?.nextUrl) {
         nextUrl = paginationResult.pagination.nextUrl;
       }
 
       await updateImageRefererRulesForTab(sourceTabId).catch(() => {});
+      if (operationCancelled()) {
+        cancelled = true;
+        break;
+      }
       notifyImagesUpdated(sourceTabId);
     } catch (error) {
+      if (operationCancelled()) {
+        cancelled = true;
+        break;
+      }
       retryUrl = url;
       results.push({ url, success: false, error: error?.message || "加载失败" });
     } finally {
-      if (tab?.id) {
+      if (tab?.id && !paginationCancelled()) {
         try { await sendMessageToTab(tab.id, { type: MSG.STOP_AUTO_SCAN }); } catch { /* ignore */ }
         try { await sendMessageToTab(tab.id, { type: MSG.STOP_AUTO_SCROLL }); } catch { /* ignore */ }
       }
       if (tab?.id) { try { await chrome.tabs.remove(tab.id); } catch { /* ignore */ } }
+      if (tab?.id && paginationJob) {
+        comicPaginationJobs.releaseTemporaryTab(paginationJob, tab.id);
+      }
     }
   }
 
-  notifyImagesUpdated(sourceTabId);
+  if (!cancelled) {
+    notifyImagesUpdated(sourceTabId);
+  }
   const resumeUrl = nextUrl || retryUrl || "";
   return {
-    success: true,
+    success: !cancelled,
+    cancelled,
+    error: cancelled
+      ? (
+          collectionChanged()
+            ? "原网页已切换或采集结果已清空"
+            : "漫画分页加载已取消"
+        )
+      : "",
     results,
     loadedPages: results.length,
     nextUrl: resumeUrl,
@@ -1180,18 +1541,6 @@ const buildBatchZipPartFilename = (baseZipFilename, partIndex, totalParts) => {
   const withoutExt = base.replace(/\.zip$/i, "");
   const current = String(partIndex + 1).padStart(3, "0");
   return `${withoutExt}.part${current}.zip`;
-};
-
-const mimeToExtension = (mimeType, fallback = "jpg") => {
-  const normalized = String(mimeType || "").toLowerCase();
-  if (normalized.includes("jpeg") || normalized.includes("jpg")) return "jpg";
-  if (normalized.includes("png")) return "png";
-  if (normalized.includes("webp")) return "webp";
-  if (normalized.includes("gif")) return "gif";
-  if (normalized.includes("svg")) return "svg";
-  if (normalized.includes("avif")) return "avif";
-  if (normalized.includes("bmp")) return "bmp";
-  return fallback;
 };
 
 const ensureUniqueArchiveFilename = (filename, usedNames) => {
@@ -1703,18 +2052,6 @@ const downloadByBlob = async (blob, filename) => {
   return await downloadBlobAsFile(blob, filename, "image/jpeg");
 };
 
-const shouldConvertToJpg = (mimeType, url) => {
-  const type = String(mimeType || "").toLowerCase();
-  if (type.includes("jpeg") || type.includes("jpg")) return false;
-  if (type.includes("gif") || type.includes("svg")) return false;
-
-  const format = formatFromUrl(url);
-  if (format === "jpg" || format === "jpeg") return false;
-  if (format === "gif" || format === "svg") return false;
-
-  return true;
-};
-
 const buildZipEntryFromImage = async (image, options = {}) => {
   const { convertToJpg = false, index = 0, preferHD = true } = options;
   const candidates = getDownloadCandidates(image, preferHD);
@@ -1742,20 +2079,26 @@ const buildZipEntryFromImage = async (image, options = {}) => {
         continue;
       }
 
-      if (convertToJpg && shouldConvertToJpg(type, url)) {
+      if (convertToJpg && shouldConvertImageToJpg({ inspection, mimeType: type, url })) {
         try {
           blob = await convertBlobToJpg(blob);
           filename = `${baseFilename(image, index)}.jpg`;
           converted = true;
         } catch (_convertError) {
           // Conversion failure should not break ZIP download; fallback to original blob.
-          const extFromUrl = extensionFromUrl(url, "");
-          const ext = inspection.extension || extFromUrl || mimeToExtension(blob.type, "jpg");
+          const ext = resolveImagePayloadExtension({
+            inspection,
+            mimeType: blob.type,
+            url
+          });
           filename = `${baseFilename(image, index)}.${ext}`;
         }
       } else {
-        const extFromUrl = extensionFromUrl(url, "");
-        const ext = inspection.extension || extFromUrl || mimeToExtension(blob.type, "jpg");
+        const ext = resolveImagePayloadExtension({
+          inspection,
+          mimeType: blob.type,
+          url
+        });
         filename = `${baseFilename(image, index)}.${ext}`;
       }
 
@@ -1975,9 +2318,11 @@ const downloadBatchAsZip = async (tabId, selectedImages, options = {}) => {
   emitDownloadStatus(tabId, {
     active: false,
     mode: "zip",
-    phase: "completed",
-    current: selectedImages.length,
+    phase: packedCount < selectedImages.length ? "completed_with_errors" : "completed",
+    current: packedCount,
     total: selectedImages.length,
+    succeeded: packedCount,
+    failed: selectedImages.length - packedCount,
     partIndex: zipFileNames.length,
     partCount: zipFileNames.length,
     error: ""
@@ -2008,6 +2353,10 @@ const startOffscreenZipPartDownload = async (payload = {}) => {
   if (!Number.isInteger(tabId) || !taskId || !partId || !objectUrl) {
     return { success: false, error: "Invalid ZIP part download payload" };
   }
+  const activeStatus = batchDownloadStatusByTab.get(tabId);
+  if (activeStatus && activeStatus.taskId !== taskId) {
+    return { success: false, error: "Stale ZIP task" };
+  }
 
   emitDownloadStatus(tabId, {
     active: true,
@@ -2015,6 +2364,7 @@ const startOffscreenZipPartDownload = async (payload = {}) => {
     phase: "zip_part_download",
     partIndex,
     partCount,
+    taskId,
     error: ""
   });
 
@@ -2075,19 +2425,34 @@ const startOffscreenZipTask = async (tabId, selectedImages, options = {}) => {
   const taskId = createZipTaskId(tabId);
   const baseZipFilename = await buildBatchZipFilename(tabId);
   const zipPartOptions = normalizeZipPartOptions(options);
-  const response = await sendOffscreenMessage(MSG.OFFSCREEN_ZIP_START, {
+  emitDownloadStatus(tabId, {
+    active: true,
+    mode: "zip",
+    phase: "zip_prepare",
+    current: 0,
+    total: selectedImages.length,
     taskId,
-    tabId,
-    images: selectedImages,
-    options: {
-      convertToJpg: options.convertToJpg === true,
-      preferHD: options.preferHD !== false,
-      baseZipFilename,
-      zipPartPreset: zipPartOptions.zipPartPreset,
-      zipPartMaxBytes: zipPartOptions.zipPartMaxBytes,
-      zipPartMaxFiles: zipPartOptions.zipPartMaxFiles
-    }
+    error: ""
   });
+  startingOffscreenZipTasks.add(taskId);
+  let response;
+  try {
+    response = await sendOffscreenMessage(MSG.OFFSCREEN_ZIP_START, {
+      taskId,
+      tabId,
+      images: selectedImages,
+      options: {
+        convertToJpg: options.convertToJpg === true,
+        preferHD: options.preferHD !== false,
+        baseZipFilename,
+        zipPartPreset: zipPartOptions.zipPartPreset,
+        zipPartMaxBytes: zipPartOptions.zipPartMaxBytes,
+        zipPartMaxFiles: zipPartOptions.zipPartMaxFiles
+      }
+    });
+  } finally {
+    startingOffscreenZipTasks.delete(taskId);
+  }
 
   if (!response?.success) {
     throw new Error(response?.error || "启动 ZIP 任务失败");
@@ -2110,8 +2475,13 @@ const startOffscreenZipTask = async (tabId, selectedImages, options = {}) => {
 
 const finishOffscreenZipTask = (payload = {}) => {
   const tabId = Number(payload.tabId);
+  const taskId = String(payload.taskId || "");
   const result = payload.result || {};
   if (!Number.isInteger(tabId)) return { success: false, error: "Invalid tab id" };
+  const activeStatus = batchDownloadStatusByTab.get(tabId);
+  if (activeStatus && taskId && activeStatus.taskId !== taskId) {
+    return { success: true, ignored: true };
+  }
 
   activeBatchDownloads.delete(tabId);
 
@@ -2123,14 +2493,22 @@ const finishOffscreenZipTask = (payload = {}) => {
   }
 
   if (result.success === true) {
+    const packed = Number(result.packed) || results.filter((item) => item?.success === true).length;
+    const total = Number(result.total) || results.length || packed;
+    const failed = Number.isFinite(Number(result.failed))
+      ? Math.max(0, Number(result.failed))
+      : Math.max(0, total - packed);
     emitDownloadStatus(tabId, {
       active: false,
       mode: "zip",
-      phase: "completed",
-      current: Number(result.packed) || results.length || 0,
-      total: Number(result.total) || Number(result.packed) || results.length || 0,
+      phase: failed > 0 ? "completed_with_errors" : "completed",
+      current: packed,
+      total,
+      succeeded: packed,
+      failed,
       partIndex: Number(result.zipPartCount) || 1,
       partCount: Number(result.zipPartCount) || 1,
+      taskId,
       error: ""
     });
     return { success: true };
@@ -2144,6 +2522,7 @@ const finishOffscreenZipTask = (payload = {}) => {
     total: Number(result.total) || 0,
     partIndex: Number(result.downloadedPartCount) || 0,
     partCount: Number(result.zipPartCount) || 0,
+    taskId,
     error: result.error || "ZIP 任务失败"
   });
   return { success: true };
@@ -2170,7 +2549,11 @@ const downloadImage = async (image, options = {}) => {
     if (!inspection.ok) {
       throw new Error(inspection.reason || "Non-image response");
     }
-    const ext = inspection.extension || extensionFromUrl(url, "") || mimeToExtension(blob.type, "jpg");
+    const ext = resolveImagePayloadExtension({
+      inspection,
+      mimeType: blob.type,
+      url
+    });
     const filename = `${baseFilename(image, index)}.${ext}`;
     return {
       ...(await downloadBlobAsFile(
@@ -2189,7 +2572,12 @@ const downloadImage = async (image, options = {}) => {
       try {
         const blob = await fetchBlob(url);
         const type = String(blob.type || "").toLowerCase() || mimeFromFormat(formatFromUrl(url)).toLowerCase();
-        if (shouldConvertToJpg(type, url)) {
+        const bytes = new Uint8Array(await blob.arrayBuffer());
+        const inspection = inspectImagePayload({ bytes, mimeType: type, url });
+        if (!inspection.ok) {
+          throw new Error(inspection.reason || "Non-image response");
+        }
+        if (shouldConvertImageToJpg({ inspection, mimeType: type, url })) {
           const jpgBlob = await convertBlobToJpg(blob);
           try {
             return {
@@ -2201,6 +2589,21 @@ const downloadImage = async (image, options = {}) => {
             // Conversion result download failed, continue and fallback to direct URL.
             lastError = downloadError;
           }
+        } else {
+          const ext = resolveImagePayloadExtension({
+            inspection,
+            mimeType: blob.type,
+            url
+          });
+          return {
+            ...(await downloadBlobAsFile(
+              blob,
+              `${baseFilename(image, index)}.${ext}`,
+              inspection.mimeType || blob.type || mimeFromFormat(ext) || "application/octet-stream"
+            )),
+            converted: false,
+            fallbackUsed: i > 0
+          };
         }
       } catch (error) {
         lastError = error;
@@ -2308,6 +2711,20 @@ const withDisplaySource = (image, enableHD) => {
 };
 
 const runScanForTab = async (tabId) => {
+  if (removedTabIds.has(tabId) || isRuntimeCacheClearActive(tabId) || tabsNavigating.has(tabId)) {
+    return {
+      success: false,
+      stale: true,
+      error: "页面正在加载或清理采集结果"
+    };
+  }
+  const collectionEpoch = getCollectionEpoch(tabId);
+  try {
+    const tab = await chrome.tabs.get(tabId);
+    if (tab?.url) {
+      stateManager.setPageUrl(tabId, tab.url);
+    }
+  } catch { /* scan can continue without navigation metadata */ }
   stateManager.setScanning(tabId, true);
   try {
     const response = await sendMessageToTab(tabId, { type: MSG.SCAN_IMAGES });
@@ -2315,9 +2732,28 @@ const runScanForTab = async (tabId) => {
       const error = response?.error || "Content script unavailable";
       return { success: false, error };
     }
+    if (getCollectionEpoch(tabId) !== collectionEpoch) {
+      return {
+        success: false,
+        stale: true,
+        error: "原网页已切换或采集结果已清空"
+      };
+    }
 
     const merge = stateManager.mergeImages(tabId, response.images || []);
     await updateImageRefererRulesForTab(tabId).catch(() => {});
+    if (
+      removedTabIds.has(tabId) ||
+      tabsNavigating.has(tabId) ||
+      isRuntimeCacheClearActive(tabId) ||
+      getCollectionEpoch(tabId) !== collectionEpoch
+    ) {
+      return {
+        success: false,
+        stale: true,
+        error: "原网页已切换或采集结果已清空"
+      };
+    }
     notifyImagesUpdated(tabId);
     return {
       success: true,
@@ -2389,23 +2825,39 @@ const handleMessage = async (message, sender) => {
   await stateManager.ensureReady();
   const tabId = getTabIdFromMessage(message, sender);
   const payload = message?.payload || {};
+  if (
+    Number.isInteger(sender?.tab?.id) &&
+    sender.tab.url &&
+    !tabsNavigating.has(sender.tab.id) &&
+    !isRuntimeCacheClearActive(sender.tab.id)
+  ) {
+    stateManager.setPageUrl(sender.tab.id, sender.tab.url);
+  }
 
   switch (message?.type) {
     case MSG.OFFSCREEN_ZIP_PROGRESS: {
+      await ensureDownloadStatusesLoaded();
       const progressTabId = Number(payload.tabId);
+      const taskId = String(payload.taskId || "");
       const patch = payload.patch || {};
-      if (!Number.isInteger(progressTabId)) {
-        return { success: false, error: "Invalid tab id" };
+      if (!Number.isInteger(progressTabId) || !taskId) {
+        return { success: false, error: "Invalid ZIP progress payload" };
       }
-      emitDownloadStatus(progressTabId, patch);
+      const activeStatus = batchDownloadStatusByTab.get(progressTabId);
+      if (activeStatus && activeStatus.taskId !== taskId) {
+        return { success: true, ignored: true };
+      }
+      emitDownloadStatus(progressTabId, { ...patch, taskId });
       return { success: true };
     }
 
     case MSG.OFFSCREEN_ZIP_PART_READY: {
+      await ensureDownloadStatusesLoaded();
       return await startOffscreenZipPartDownload(payload);
     }
 
     case MSG.OFFSCREEN_ZIP_DONE: {
+      await ensureDownloadStatusesLoaded();
       return finishOffscreenZipTask(payload);
     }
 
@@ -2445,6 +2897,21 @@ const handleMessage = async (message, sender) => {
 
     case MSG.INCREMENTAL_SCAN: {
       if (!tabId) return { success: false, error: "No active tab id" };
+      if (removedTabIds.has(tabId)) {
+        return { success: false, stale: true, error: "Source tab was closed" };
+      }
+      if (isRuntimeCacheClearActive(tabId) || tabsNavigating.has(tabId)) {
+        return { success: false, stale: true, error: "Runtime cache is being cleared" };
+      }
+      const runtimeGeneration = Number(payload.runtimeGeneration);
+      const expectedGeneration = incrementalGenerationByTab.get(tabId);
+      if (
+        Number.isInteger(expectedGeneration) &&
+        (!Number.isInteger(runtimeGeneration) || runtimeGeneration !== expectedGeneration)
+      ) {
+        return { success: false, stale: true, error: "Stale incremental scan" };
+      }
+      const collectionEpoch = getCollectionEpoch(tabId);
       const images = payload.images || message.images || [];
       if (!Array.isArray(images)) {
         return { success: false, error: "Invalid incremental payload" };
@@ -2452,6 +2919,18 @@ const handleMessage = async (message, sender) => {
       const merged = stateManager.mergeImages(tabId, images);
       if ((merged.added || 0) > 0 || (merged.updated || 0) > 0) {
         await updateImageRefererRulesForTab(tabId).catch(() => {});
+        if (
+          removedTabIds.has(tabId) ||
+          tabsNavigating.has(tabId) ||
+          isRuntimeCacheClearActive(tabId) ||
+          getCollectionEpoch(tabId) !== collectionEpoch
+        ) {
+          return {
+            success: false,
+            stale: true,
+            error: "原网页已切换或采集结果已清空"
+          };
+        }
         notifyImagesUpdated(tabId);
       }
       return { success: true, ...merged };
@@ -2515,7 +2994,10 @@ const handleMessage = async (message, sender) => {
 
     case MSG.GET_SELECTED: {
       if (!tabId) return { success: false, error: "No active tab id" };
-      return { success: true, images: stateManager.getSelectedImages(tabId) };
+      return {
+        success: true,
+        images: stateManager.getSelectedImages(tabId, payload.orderedImageIds)
+      };
     }
 
     case MSG.GET_STATS: {
@@ -2525,12 +3007,29 @@ const handleMessage = async (message, sender) => {
 
     case MSG.CLEAR_IMAGES: {
       if (!tabId) return { success: false, error: "No active tab id" };
-      stateManager.clearTabImages(tabId);
-      await sendMessageToTab(tabId, {
-        type: MSG.CLEAR_RUNTIME_CACHE
-      }, { retryOnNoReceiver: false });
-      notifyImagesUpdated(tabId);
-      return { success: true };
+      rotateImageRefererOwnerToken(tabId);
+      invalidateCollectionEpoch(tabId);
+      await comicPaginationJobs.cancel(tabId);
+      beginRuntimeCacheClear(tabId);
+      try {
+        const resetResult = await sendMessageToTab(tabId, {
+          type: MSG.CLEAR_RUNTIME_CACHE
+        }, { retryOnNoReceiver: false });
+        const runtimeGeneration = Number(resetResult?.runtimeGeneration);
+        if (Number.isInteger(runtimeGeneration)) {
+          incrementalGenerationByTab.set(tabId, runtimeGeneration);
+        } else {
+          incrementalGenerationByTab.delete(tabId);
+        }
+        stateManager.clearTabImages(tabId);
+        await clearImageRefererRulesForTab(tabId, {
+          preserveCurrentOwner: true
+        }).catch(() => {});
+        notifyImagesUpdated(tabId);
+        return { success: true };
+      } finally {
+        endRuntimeCacheClear(tabId);
+      }
     }
 
     case MSG.DOWNLOAD: {
@@ -2551,34 +3050,44 @@ const handleMessage = async (message, sender) => {
 
     case MSG.DOWNLOAD_BATCH: {
       if (!tabId) return { success: false, error: "No active tab id" };
-      const activeStatus = await getDownloadStatus(tabId);
-      if (activeBatchDownloads.has(tabId) || activeStatus?.active === true) {
+      if (batchDownloadAdmissions.has(tabId) || activeBatchDownloads.has(tabId)) {
         return { success: false, error: "当前已有批量下载任务进行中，请稍后再试" };
       }
 
-      const selected = stateManager.getSelectedImages(tabId);
-      if (selected.length === 0) return { success: false, error: "No selected images" };
-
-      const config = stateManager.getConfig(tabId);
-      const convertToJpg = typeof payload.enableConvertToJpg === "boolean"
-        ? payload.enableConvertToJpg
-        : config.enableWebPConvert === true;
-      const useZip =
-        isTruthyFlag(payload.enableBatchZipDownload) ||
-        isTruthyFlag(payload.enableBatchZip) ||
-        isTruthyFlag(payload.zip) ||
-        String(payload.downloadMode || payload.mode || "").toLowerCase() === "zip";
-      const storedZipPartPreset = await getZipPartPresetPreference();
-      const zipPartOptions = normalizeZipPartOptions({
-        zipPartPreset: payload.zipPartPreset || storedZipPartPreset,
-        zipPartMaxBytes: payload.zipPartMaxBytes,
-        zipPartMaxMb: payload.zipPartMaxMb,
-        zipPartMaxFiles: payload.zipPartMaxFiles
-      });
-
-      activeBatchDownloads.add(tabId);
+      batchDownloadAdmissions.add(tabId);
       let keepActiveAfterReturn = false;
+      let ownsActiveDownload = false;
+      let useZip = false;
       try {
+        const activeStatus = await getDownloadStatus(tabId);
+        if (activeStatus?.active === true) {
+          return { success: false, error: "当前已有批量下载任务进行中，请稍后再试" };
+        }
+
+        activeBatchDownloads.add(tabId);
+        ownsActiveDownload = true;
+        const selected = stateManager.getSelectedImages(tabId, payload.orderedImageIds);
+        if (selected.length === 0) {
+          return { success: false, error: "No selected images" };
+        }
+
+        const config = stateManager.getConfig(tabId);
+        const convertToJpg = typeof payload.enableConvertToJpg === "boolean"
+          ? payload.enableConvertToJpg
+          : config.enableWebPConvert === true;
+        useZip =
+          isTruthyFlag(payload.enableBatchZipDownload) ||
+          isTruthyFlag(payload.enableBatchZip) ||
+          isTruthyFlag(payload.zip) ||
+          String(payload.downloadMode || payload.mode || "").toLowerCase() === "zip";
+        const storedZipPartPreset = await getZipPartPresetPreference();
+        const zipPartOptions = normalizeZipPartOptions({
+          zipPartPreset: payload.zipPartPreset || storedZipPartPreset,
+          zipPartMaxBytes: payload.zipPartMaxBytes,
+          zipPartMaxMb: payload.zipPartMaxMb,
+          zipPartMaxFiles: payload.zipPartMaxFiles
+        });
+
         if (useZip) {
           emitDownloadStatus(tabId, {
             active: true,
@@ -2588,6 +3097,7 @@ const handleMessage = async (message, sender) => {
             total: selected.length,
             partIndex: 0,
             partCount: 0,
+            taskId: "",
             error: ""
           });
           if (chrome.offscreen?.createDocument) {
@@ -2612,6 +3122,7 @@ const handleMessage = async (message, sender) => {
           phase: "direct_prepare",
           current: 0,
           total: selected.length,
+          taskId: "",
           error: ""
         });
 
@@ -2642,18 +3153,24 @@ const handleMessage = async (message, sender) => {
           }
         }
 
+        const succeeded = results.filter((item) => item?.success === true).length;
+        const failed = results.length - succeeded;
         emitDownloadStatus(tabId, {
           active: false,
           mode: "direct",
-          phase: "completed",
-          current: selected.length,
+          phase: failed > 0 ? "completed_with_errors" : "completed",
+          current: succeeded,
           total: selected.length,
+          succeeded,
+          failed,
           error: ""
         });
 
         return {
           success: true,
           results,
+          succeeded,
+          failed,
           zipped: false
         };
       } catch (error) {
@@ -2665,7 +3182,8 @@ const handleMessage = async (message, sender) => {
         });
         throw error;
       } finally {
-        if (!keepActiveAfterReturn) {
+        batchDownloadAdmissions.delete(tabId);
+        if (ownsActiveDownload && !keepActiveAfterReturn) {
           activeBatchDownloads.delete(tabId);
         }
       }
@@ -2804,10 +3322,27 @@ const handleMessage = async (message, sender) => {
       if (!tabId) return { success: false, error: "No active tab id" };
       const startUrl = payload.nextUrl;
       if (!startUrl) return { success: false, error: "No next URL provided" };
-      return await loadComicPaginationPages(tabId, startUrl, {
-        limit: payload.limit,
-        waitSeconds: payload.waitSeconds
-      });
+      const paginationJob = comicPaginationJobs.start(
+        tabId,
+        payload.clientId,
+        sender?.tab?.id
+      );
+      await paginationJob.ready;
+      try {
+        return await loadComicPaginationPages(tabId, startUrl, {
+          limit: payload.limit,
+          waitSeconds: payload.waitSeconds,
+          job: paginationJob
+        });
+      } finally {
+        comicPaginationJobs.finish(tabId, paginationJob);
+      }
+    }
+
+    case MSG.CANCEL_COMIC_PAGINATION: {
+      if (!tabId) return { success: false, error: "No active tab id" };
+      const cancelled = await comicPaginationJobs.cancel(tabId, payload.clientId);
+      return { success: true, cancelled };
     }
 
     case MSG.GET_DOWNLOAD_STATUS: {
@@ -2883,26 +3418,104 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   return true;
 });
 
-chrome.tabs.onRemoved.addListener((tabId) => {
+const handleTabRemoved = async (tabId) => {
+  removedTabIds.add(tabId);
+  const removedRefererOwnerToken = rotateImageRefererOwnerToken(tabId);
+  invalidateCollectionEpoch(tabId);
+  await comicPaginationJobs.cancel(tabId);
+  await comicPaginationJobs.cancelByRequesterTab(tabId);
+  await Promise.all([
+    stateManager.ensureReady(),
+    ensureDownloadStatusesLoaded()
+  ]);
   stateManager.removeTabState(tabId);
+  incrementalGenerationByTab.delete(tabId);
+  runtimeCacheClearDepthByTab.delete(tabId);
+  tabsNavigating.delete(tabId);
   batchDownloadStatusByTab.delete(tabId);
+  await schedulePersistDownloadStatuses(true).catch(() => {});
+  batchDownloadAdmissions.delete(tabId);
   activeBatchDownloads.delete(tabId);
-  clearImageRefererRulesForTab(tabId).catch(() => {});
+  await clearImageRefererRulesForTab(tabId, {
+    preserveCurrentOwner: true
+  }).catch(() => {});
+  if (
+    removedTabIds.has(tabId) &&
+    imageRefererOwnerByTab.get(tabId) === removedRefererOwnerToken
+  ) {
+    imageRefererOwnerByTab.delete(tabId);
+  }
+};
+
+chrome.tabs.onRemoved.addListener((tabId) => {
+  handleTabRemoved(tabId).catch(() => {});
 });
 
-const handleTabUpdated = async (tabId, changeInfo) => {
-  if (!Number.isInteger(tabId) || !changeInfo?.status) return;
+const resetTabCollectionForUrlNavigation = async (tabId) => {
+  rotateImageRefererOwnerToken(tabId);
+  invalidateCollectionEpoch(tabId);
+  await comicPaginationJobs.cancel(tabId);
+  beginRuntimeCacheClear(tabId);
+  try {
+    const resetResult = await sendMessageToTab(tabId, {
+      type: MSG.CLEAR_RUNTIME_CACHE
+    }, { retryOnNoReceiver: false });
+    const runtimeGeneration = Number(resetResult?.runtimeGeneration);
+    if (Number.isInteger(runtimeGeneration)) {
+      incrementalGenerationByTab.set(tabId, runtimeGeneration);
+    } else {
+      incrementalGenerationByTab.delete(tabId);
+    }
+    stateManager.clearTabImages(tabId);
+    await clearImageRefererRulesForTab(tabId, {
+      preserveCurrentOwner: true
+    }).catch(() => {});
+    notifyImagesUpdated(tabId);
+  } finally {
+    endRuntimeCacheClear(tabId);
+  }
+};
 
-  await stateManager.ensureReady();
+const handleTabUpdated = async (tabId, changeInfo, tab) => {
+  if (!Number.isInteger(tabId) || !changeInfo) return;
+  removedTabIds.delete(tabId);
 
   if (changeInfo.status === "loading") {
+    rotateImageRefererOwnerToken(tabId);
+    invalidateCollectionEpoch(tabId);
+    tabsNavigating.add(tabId);
+    await comicPaginationJobs.cancel(tabId);
+  }
+  await stateManager.ensureReady();
+  const hasTrackedState = stateManager.hasTabState(tabId);
+  const previousUrl = stateManager.getPageUrl(tabId);
+  const nextUrl = String(changeInfo.url || tab?.url || "");
+  if (nextUrl && hasTrackedState) {
+    stateManager.setPageUrl(tabId, nextUrl);
+  }
+
+  if (changeInfo.status === "loading") {
+    incrementalGenerationByTab.delete(tabId);
     stateManager.clearTabImages(tabId);
-    await clearImageRefererRulesForTab(tabId).catch(() => {});
+    await clearImageRefererRulesForTab(tabId, {
+      preserveCurrentOwner: true
+    }).catch(() => {});
+    notifyImagesUpdated(tabId);
+    return;
+  }
+
+  if (
+    !changeInfo.status &&
+    changeInfo.url &&
+    shouldResetForUrlOnlyNavigation(previousUrl, changeInfo.url)
+  ) {
+    await resetTabCollectionForUrlNavigation(tabId);
     return;
   }
 
   if (changeInfo.status !== "complete") return;
 
+  tabsNavigating.delete(tabId);
   const config = stateManager.getConfig(tabId);
   if (config.enableRightClick) {
     await syncRightClickForTab(tabId, true);
@@ -2922,11 +3535,45 @@ const handleTabUpdated = async (tabId, changeInfo) => {
   }
 };
 
-chrome.tabs.onUpdated.addListener((tabId, changeInfo) => {
-  handleTabUpdated(tabId, changeInfo).catch(() => {});
+chrome.tabs.onUpdated.addListener((tabId, changeInfo, tab) => {
+  handleTabUpdated(tabId, changeInfo, tab).catch(() => {});
 });
 
 let contextMenuBuildTask = null;
+let contextMenuRebuildQueued = false;
+const CONTEXT_MENU_TITLES = {
+  zh: {
+    scan: "扫描当前页面图片",
+    scanComic: "扫描当前页面图片（漫画模式）",
+    unlockRightClick: "解锁右键",
+    imageActions: "图片操作",
+    viewOriginal: "查看原图",
+    copyOriginal: "复制原图",
+    downloadOriginal: "下载原图"
+  },
+  en: {
+    scan: "Scan images on this page",
+    scanComic: "Scan images in comic mode",
+    unlockRightClick: "Unlock right-click",
+    imageActions: "Image actions",
+    viewOriginal: "View original",
+    copyOriginal: "Copy original",
+    downloadOriginal: "Download original"
+  }
+};
+
+const getBackgroundUiLanguage = async () => {
+  try {
+    const stored = await chrome.storage.local.get(UI_LANGUAGE_STORAGE_KEY);
+    const value = String(stored?.[UI_LANGUAGE_STORAGE_KEY] || "").trim().toLowerCase();
+    if (value === "zh" || value.startsWith("zh-")) return "zh";
+    if (value === "en" || value.startsWith("en-")) return "en";
+  } catch (_error) {
+    // Fall through to the browser UI language.
+  }
+  const browserLanguage = String(chrome.i18n?.getUILanguage?.() || "").toLowerCase();
+  return browserLanguage === "zh" || browserLanguage.startsWith("zh-") ? "zh" : "en";
+};
 
 const isContextMenuNotFoundError = (message) =>
   /Cannot find menu item with id|No item with id|not found/i.test(String(message || ""));
@@ -2970,52 +3617,56 @@ const upsertContextMenuItem = async (options) => {
 };
 
 const createContextMenu = async () => {
-  if (contextMenuBuildTask) return contextMenuBuildTask;
+  if (contextMenuBuildTask) {
+    contextMenuRebuildQueued = true;
+    return contextMenuBuildTask;
+  }
 
   contextMenuBuildTask = (async () => {
+    const language = await getBackgroundUiLanguage();
+    const titles = CONTEXT_MENU_TITLES[language] || CONTEXT_MENU_TITLES.en;
     await upsertContextMenuItem({
       id: CONTEXT_MENU_IDS.SCAN_OPEN_WORKSPACE,
-      title: "扫描当前页面图片",
+      title: titles.scan,
       contexts: ["page"]
     });
 
     await upsertContextMenuItem({
       id: CONTEXT_MENU_IDS.SCAN_OPEN_WORKSPACE_COMIC,
-      title: "扫描当前页面图片（漫画模式）",
+      title: titles.scanComic,
       contexts: ["page"]
     });
 
     await upsertContextMenuItem({
       id: CONTEXT_MENU_IDS.TOGGLE_UNLOCK_RIGHT_CLICK,
-      title: "解锁右键",
+      title: titles.unlockRightClick,
       contexts: ["page"],
-      type: "checkbox",
-      checked: false
+      type: "checkbox"
     });
 
     await upsertContextMenuItem({
       id: CONTEXT_MENU_IDS.IMAGE_ACTIONS_PARENT,
-      title: "图片操作",
+      title: titles.imageActions,
       contexts: ["image"]
     });
 
     await upsertContextMenuItem({
       id: CONTEXT_MENU_IDS.VIEW_ORIGINAL_IMAGE,
-      title: "查看原图",
+      title: titles.viewOriginal,
       contexts: ["image"],
       parentId: CONTEXT_MENU_IDS.IMAGE_ACTIONS_PARENT
     });
 
     await upsertContextMenuItem({
       id: CONTEXT_MENU_IDS.COPY_ORIGINAL_IMAGE,
-      title: "复制原图",
+      title: titles.copyOriginal,
       contexts: ["image"],
       parentId: CONTEXT_MENU_IDS.IMAGE_ACTIONS_PARENT
     });
 
     await upsertContextMenuItem({
       id: CONTEXT_MENU_IDS.DOWNLOAD_ORIGINAL_IMAGE,
-      title: "下载原图",
+      title: titles.downloadOriginal,
       contexts: ["image"],
       parentId: CONTEXT_MENU_IDS.IMAGE_ACTIONS_PARENT
     });
@@ -3025,6 +3676,10 @@ const createContextMenu = async () => {
     })
     .finally(() => {
       contextMenuBuildTask = null;
+      if (contextMenuRebuildQueued) {
+        contextMenuRebuildQueued = false;
+        createContextMenu().catch(() => {});
+      }
     });
 
   return contextMenuBuildTask;
@@ -3042,8 +3697,31 @@ chrome.runtime.onStartup.addListener(() => {
   createContextMenu().catch(() => {});
 });
 
+chrome.storage.onChanged.addListener((changes, areaName) => {
+  if (areaName !== "local" || !changes?.[UI_LANGUAGE_STORAGE_KEY]) return;
+  createContextMenu().catch(() => {});
+});
+
+if (chrome.contextMenus.onShown) {
+  chrome.contextMenus.onShown.addListener((_info, tab) => {
+    if (!Number.isInteger(tab?.id)) return;
+    stateManager.ensureReady()
+      .then(async () => {
+        const config = stateManager.getConfig(tab.id);
+        await updateContextMenuItem(CONTEXT_MENU_IDS.TOGGLE_UNLOCK_RIGHT_CLICK, {
+          checked: config.enableRightClick === true
+        });
+        if (typeof chrome.contextMenus.refresh === "function") {
+          await chrome.contextMenus.refresh();
+        }
+      })
+      .catch(() => {});
+  });
+}
+
 chrome.contextMenus.onClicked.addListener(async (info, tab) => {
   if (!tab?.id) return;
+  await stateManager.ensureReady();
 
   if (info.menuItemId === CONTEXT_MENU_IDS.SCAN_OPEN_WORKSPACE) {
     await openWorkspaceAndScan(tab.id);

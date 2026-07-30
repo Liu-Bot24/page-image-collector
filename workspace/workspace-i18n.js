@@ -7,18 +7,19 @@
   let currentLanguage = "zh";
   let applying = false;
   let scheduled = false;
+  const pendingRoots = new Set();
 
   const setText = (selector, key) => {
     const node = document.querySelector(selector);
-    if (node) node.textContent = i18n.t(currentLanguage, key);
+    i18n.setTextContent(node, i18n.t(currentLanguage, key));
   };
 
   const setAttrs = (selector, key) => {
     const node = document.querySelector(selector);
     if (!node) return;
     const text = i18n.t(currentLanguage, key);
-    node.setAttribute("aria-label", text);
-    node.title = text;
+    i18n.setAttributeIfChanged(node, "aria-label", text);
+    i18n.setAttributeIfChanged(node, "title", text);
   };
 
   const syncScanButton = () => {
@@ -26,18 +27,18 @@
     if (!button) return;
     const text = button.textContent.trim();
     if (text === i18n.t("zh", "common.scanning") || text === i18n.t("en", "common.scanning")) {
-      button.textContent = i18n.t(currentLanguage, "common.scanning");
+      i18n.setTextContent(button, i18n.t(currentLanguage, "common.scanning"));
       return;
     }
     if (text === i18n.t("zh", "workspace.scanContinue") || text === i18n.t("en", "workspace.scanContinue")) {
-      button.textContent = i18n.t(currentLanguage, "workspace.scanContinue");
+      i18n.setTextContent(button, i18n.t(currentLanguage, "workspace.scanContinue"));
       return;
     }
-    button.textContent = i18n.t(currentLanguage, "workspace.scanStart");
+    i18n.setTextContent(button, i18n.t(currentLanguage, "workspace.scanStart"));
   };
 
   const syncStaticControls = () => {
-    document.title = i18n.t(currentLanguage, "workspace.documentTitle");
+    i18n.setDocumentTitle(document, i18n.t(currentLanguage, "workspace.documentTitle"));
     setText(".logo-text", "workspace.logo");
     setAttrs("#btn-clear", "common.clearResults");
     setAttrs("#comic-banner-pagination-go", "workspace.comicStartPagination");
@@ -49,23 +50,41 @@
     syncScanButton();
   };
 
-  const applyTranslations = () => {
+  const applyTranslations = (root = document.body, syncStatic = true) => {
     if (applying) return;
     applying = true;
     try {
-      syncStaticControls();
-      i18n.applyDomTranslations(currentLanguage);
+      if (syncStatic) syncStaticControls();
+      i18n.applyDomTranslations(currentLanguage, root);
     } finally {
       applying = false;
     }
   };
 
-  const scheduleApplyTranslations = () => {
-    if (applying || scheduled) return;
+  const addPendingRoot = (node) => {
+    if (!node) return;
+    const root = node.nodeType === 1 ? node : node.parentElement;
+    if (root) pendingRoots.add(root);
+  };
+
+  const scheduleApplyTranslations = (mutations = []) => {
+    if (applying) return;
+    for (const mutation of mutations) {
+      if (mutation.type === "childList") {
+        mutation.addedNodes.forEach(addPendingRoot);
+        if (mutation.addedNodes.length === 0) addPendingRoot(mutation.target);
+      } else {
+        addPendingRoot(mutation.target);
+      }
+    }
+    if (pendingRoots.size === 0) pendingRoots.add(document.body);
+    if (scheduled) return;
     scheduled = true;
     requestAnimationFrame(() => {
       scheduled = false;
-      applyTranslations();
+      const roots = Array.from(pendingRoots);
+      pendingRoots.clear();
+      roots.forEach((root) => applyTranslations(root, false));
     });
   };
 

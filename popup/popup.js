@@ -79,6 +79,10 @@ let manualScanInProgress = false;
 let batchDownloadInProgress = false;
 let activeDownloadStatus = null;
 let downloadStatusPollTimer = null;
+let imageRenderToken = 0;
+let committedImageRenderToken = 0;
+let metadataRefreshTimer = null;
+let metadataRefreshRequested = false;
 let transientActionStatus = "";
 let transientActionStatusTitle = "";
 let pinnedActionStatus = "";
@@ -305,13 +309,30 @@ const formatDownloadStatusText = (status) => {
   if (phase === "zip_part_download") return `正在下载ZIP第 ${partIndex} 卷`;
   if (phase === "direct_prepare") return "正在准备批量下载…";
   if (phase === "direct") return Number.isInteger(current) && Number.isInteger(total) ? `下载中 ${current}/${total}` : "下载中…";
+  if (phase === "completed_with_errors") {
+    const succeeded = Math.max(0, Number(status.succeeded) || current || 0);
+    const failed = Math.max(0, Number(status.failed) || Math.max(0, total - succeeded));
+    return mode === "zip"
+      ? `打包完成 ${succeeded}/${total}，失败 ${failed}`
+      : `下载完成 ${succeeded}/${total}，失败 ${failed}`;
+  }
   if (phase === "completed") return mode === "zip" ? "打包下载完毕" : "批量下载完毕";
   if (phase === "failed") return `下载失败: ${status.error || "未知错误"}`;
   return "";
 };
 
 const applyDownloadStatus = (status) => {
-  activeDownloadStatus = status || null;
+  const incomingUpdatedAt = Number(status?.updatedAt) || 0;
+  const currentUpdatedAt = Number(activeDownloadStatus?.updatedAt) || 0;
+  if (incomingUpdatedAt > 0 && currentUpdatedAt > 0 && incomingUpdatedAt < currentUpdatedAt) {
+    return;
+  }
+  activeDownloadStatus = status
+    ? {
+        ...status,
+        updatedAt: incomingUpdatedAt || Math.max(Date.now(), currentUpdatedAt + 1)
+      }
+    : null;
   batchDownloadInProgress = activeDownloadStatus?.active === true;
   syncBatchDownloadButtonState();
   const text = formatDownloadStatusText(activeDownloadStatus);
@@ -325,7 +346,11 @@ const applyDownloadStatus = (status) => {
     setPinnedActionStatus("");
     return;
   }
-  const timeoutMs = activeDownloadStatus?.active === true ? -1 : activeDownloadStatus?.phase === "failed" ? 4200 : 2600;
+  const timeoutMs = activeDownloadStatus?.active === true
+    ? -1
+    : ["failed", "completed_with_errors"].includes(activeDownloadStatus?.phase)
+      ? 4200
+      : 2600;
   setPinnedActionStatus(text, timeoutMs);
 };
 
@@ -356,6 +381,17 @@ const scheduleRenderRefresh = () => {
         }
       });
   }, 120);
+};
+
+const scheduleMetadataRenderRefresh = () => {
+  if (metadataRefreshTimer) return;
+  metadataRefreshRequested = true;
+  if (committedImageRenderToken !== imageRenderToken) return;
+  metadataRefreshRequested = false;
+  metadataRefreshTimer = setTimeout(() => {
+    metadataRefreshTimer = null;
+    renderImages().catch(() => {});
+  }, 160);
 };
 
 const cleanupClipboardCache = () => {
@@ -425,8 +461,18 @@ const getImageDimensions = async (url) => {
   const domProbe = () =>
     new Promise((resolve) => {
       const probe = new Image();
-      probe.onload = () => resolve({ width: probe.naturalWidth || 0, height: probe.naturalHeight || 0 });
-      probe.onerror = () => resolve({ width: 0, height: 0 });
+      let settled = false;
+      const finish = (result) => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        probe.onload = null;
+        probe.onerror = null;
+        resolve(result);
+      };
+      const timer = setTimeout(() => finish({ width: 0, height: 0 }), 8000);
+      probe.onload = () => finish({ width: probe.naturalWidth || 0, height: probe.naturalHeight || 0 });
+      probe.onerror = () => finish({ width: 0, height: 0 });
       probe.src = normalizedUrl;
     });
 
@@ -447,7 +493,11 @@ const getImageDimensions = async (url) => {
   })();
 
   imageDimensionCache.set(normalizedUrl, promise);
-  return await promise;
+  const result = await promise;
+  if ((Number(result?.width) || 0) <= 0 || (Number(result?.height) || 0) <= 0) {
+    imageDimensionCache.delete(normalizedUrl);
+  }
+  return result;
 };
 
 const computeArea = (width, height) => Math.max(0, (Number(width) || 0) * (Number(height) || 0));
@@ -471,6 +521,8 @@ const sendImageFormatUpdate = (image, meta = {}) => {
     maxArea: Number(meta.area) || Number(image.maxArea) || Number(image.area) || 0,
     format,
     formatTrusted: meta.formatTrusted === true
+  }).then((response) => {
+    if (response?.updated) scheduleMetadataRenderRefresh();
   }).catch(() => {});
 };
 
@@ -776,6 +828,14 @@ const getFilters = () => ({
   formats: getSelectedFormatFilters()
 });
 
+const hasRestrictiveFormatFilter = (selectedFormats = []) => {
+  if (!Array.isArray(selectedFormats) || selectedFormats.length === 0) return false;
+  const inputs = Array.from(elements.formatFilters.querySelectorAll("input[type=\"checkbox\"]"));
+  if (inputs.length === 0) return false;
+  const selectedCount = inputs.reduce((count, input) => count + (input.checked ? 1 : 0), 0);
+  return selectedCount > 0 && selectedCount < inputs.length;
+};
+
 const normalizeFormatStats = (stats = {}) => {
   const normalized = {};
   for (const [formatKey, count] of Object.entries(stats)) {
@@ -887,9 +947,10 @@ const refreshSelectedState = async () => {
   return new Set(response.images.map((image) => image.id));
 };
 
-const updateStats = async ({ visibleImages = [], facetStats = {} } = {}) => {
+const updateStats = async ({ visibleImages = [], facetStats = {}, renderToken = null } = {}) => {
   const response = await sendMessage(MSG.GET_STATS);
-  if (!response.success) return;
+  if (!response.success) return false;
+  if (renderToken !== null && renderToken !== imageRenderToken) return false;
   const { total, selected } = response.stats;
   elements.statTotal.textContent = String(total);
   elements.statFiltered.textContent = String(visibleImages.length);
@@ -897,6 +958,7 @@ const updateStats = async ({ visibleImages = [], facetStats = {} } = {}) => {
   elements.btnDownloadSelected.disabled = batchDownloadInProgress || selected === 0;
   elements.btnCopySelected.disabled = selected === 0;
   renderFormatFilters(facetStats);
+  return true;
 };
 
 const getVisibleSelectionInfo = () => {
@@ -972,6 +1034,8 @@ const createCard = (image, index) => {
   });
 
   resolveCardMaxDimensions(image).then((resolved) => {
+    dimensions.textContent = `${resolved.width} × ${resolved.height}`;
+    area.textContent = formatAreaMp(resolved.area);
     if (applyDetectedFormat(image, resolved)) {
       formatBadge.textContent = String(image.format || "unknown").toUpperCase();
     }
@@ -980,8 +1044,11 @@ const createCard = (image, index) => {
 };
 
 const renderImages = async () => {
+  const renderToken = imageRenderToken + 1;
+  imageRenderToken = renderToken;
   const filters = getFilters();
   const allResponse = await sendMessage(MSG.GET_IMAGES, { filtered: false });
+  if (renderToken !== imageRenderToken) return;
   if (!allResponse.success) {
     setActionStatus(`加载失败: ${allResponse.error || "未知错误"}`, 3200);
     return;
@@ -995,7 +1062,7 @@ const renderImages = async () => {
       currentConfig.enableSizeSort ||
       currentConfig.enablePortraitOnly ||
       filters.preset !== "all" ||
-      filters.formats.length > 0 ||
+      hasRestrictiveFormatFilter(filters.formats) ||
       filters.minShort > 0 ||
       filters.minLong > 0 ||
       filters.minArea > 0
@@ -1009,6 +1076,7 @@ const renderImages = async () => {
       }),
       DIMENSION_PROBE_CONCURRENCY
     );
+    if (renderToken !== imageRenderToken) return;
   }
 
   const metricAndOrientationFiltered = visibleAllImages
@@ -1028,6 +1096,7 @@ const renderImages = async () => {
   }
 
   selectedIds = await refreshSelectedState();
+  if (renderToken !== imageRenderToken) return;
 
   if (elements.lightbox.classList.contains("active") && lightboxImage) {
     const nextIndex = currentImages.findIndex((item) => item.id === lightboxImage.id);
@@ -1045,7 +1114,14 @@ const renderImages = async () => {
     elements.emptyState.style.display = "flex";
     elements.imageGrid.appendChild(elements.emptyState);
     elements.btnSelectAll.textContent = SELECT_ALL_LABEL;
-    await updateStats({ visibleImages: currentImages, facetStats });
+    const statsUpdated = await updateStats({
+      visibleImages: currentImages,
+      facetStats,
+      renderToken
+    });
+    if (!statsUpdated) return;
+    committedImageRenderToken = renderToken;
+    if (metadataRefreshRequested) scheduleMetadataRenderRefresh();
     hasScannedOnce = hasScannedOnce || allImages.length > 0;
     syncScanButtonLabel();
     return;
@@ -1058,7 +1134,14 @@ const renderImages = async () => {
   }
   elements.imageGrid.appendChild(fragment);
   syncSelectAllButtonLabel();
-  await updateStats({ visibleImages: currentImages, facetStats });
+  const statsUpdated = await updateStats({
+    visibleImages: currentImages,
+    facetStats,
+    renderToken
+  });
+  if (!statsUpdated) return;
+  committedImageRenderToken = renderToken;
+  if (metadataRefreshRequested) scheduleMetadataRenderRefresh();
   hasScannedOnce = true;
   syncScanButtonLabel();
 };
@@ -1229,6 +1312,11 @@ const clearImages = async () => {
   }
 
   closeLightbox();
+  if (metadataRefreshTimer) {
+    clearTimeout(metadataRefreshTimer);
+    metadataRefreshTimer = null;
+  }
+  metadataRefreshRequested = false;
   currentImages = [];
   selectedIds = new Set();
   hasScannedOnce = false;
@@ -1286,23 +1374,32 @@ const downloadSelected = async () => {
       return;
     }
     if (response.zipped) {
+      const succeeded = Number(response.packed) || 0;
+      const failed = Number(response.failed) || 0;
+      const total = succeeded + failed || Number(response.results?.length) || 0;
       applyDownloadStatus({
         active: false,
         mode: "zip",
-        phase: "completed",
-        current: Number(response.packed) || Number(response.results?.length) || 0,
-        total: Number(response.packed) || Number(response.results?.length) || 0,
+        phase: failed > 0 ? "completed_with_errors" : "completed",
+        current: succeeded,
+        total,
+        succeeded,
+        failed,
         partIndex: Number(response.zipPartCount) || 1,
         partCount: Number(response.zipPartCount) || 1
       });
       return;
     }
+    const succeeded = Number(response.succeeded) || response.results.filter((item) => item.success).length;
+    const failed = Number(response.failed) || Math.max(0, response.results.length - succeeded);
     applyDownloadStatus({
       active: false,
       mode: "direct",
-      phase: "completed",
-      current: response.results.filter((item) => item.success).length,
-      total: response.results.length
+      phase: failed > 0 ? "completed_with_errors" : "completed",
+      current: succeeded,
+      total: response.results.length,
+      succeeded,
+      failed
     });
   } finally {
     batchDownloadInProgress = activeDownloadStatus?.active === true;
@@ -1321,8 +1418,12 @@ const copySelected = async () => {
     })
     .filter(Boolean)
     .join("\n");
-  await navigator.clipboard.writeText(urls);
-  setActionStatus(`已复制 ${response.images.length} 条链接`);
+  try {
+    await navigator.clipboard.writeText(urls);
+    setActionStatus(`已复制 ${response.images.length} 条链接`);
+  } catch (error) {
+    setActionStatus(`复制失败: ${error?.message || "剪贴板不可用"}`, 3200);
+  }
 };
 
 const openWorkspace = async () => {
@@ -1386,12 +1487,14 @@ const bindEvents = () => {
   });
 
   elements.toggleHd.addEventListener("change", async (event) => {
-    const response = await sendMessage(MSG.SET_CONFIG, { enableHD: event.target.checked });
+    const checked = event.target.checked;
+    const response = await sendMessage(MSG.SET_CONFIG, { enableHD: checked });
     if (!response.success) {
       setActionStatus(`设置失败: ${response.error || "未知错误"}`, 3200);
+      event.target.checked = !checked;
       return;
     }
-    currentConfig.enableHD = event.target.checked;
+    currentConfig.enableHD = checked;
     if (elements.lightbox.classList.contains("active") && lightboxImage) {
       openLightbox(lightboxImage, lightboxIndex);
     }

@@ -85,3 +85,89 @@ test("manifest declares Chrome locale metadata", () => {
   assert.equal(existsSync(resolve(rootDir, "_locales/zh_CN/messages.json")), true);
   assert.equal(existsSync(resolve(rootDir, "_locales/en/messages.json")), true);
 });
+
+test("shared i18n DOM setters do not rewrite unchanged content", () => {
+  const { api } = loadI18n();
+  let textWrites = 0;
+  let attributeWrites = 0;
+  let titleWrites = 0;
+  let textValue = "Start Scan";
+  let titleValue = "Page Image Collector";
+  const attributes = new Map([["aria-label", "Download"]]);
+  const node = {
+    get textContent() {
+      return textValue;
+    },
+    set textContent(value) {
+      textWrites += 1;
+      textValue = value;
+    }
+  };
+  const element = {
+    getAttribute: (name) => attributes.get(name) ?? null,
+    setAttribute: (name, value) => {
+      attributeWrites += 1;
+      attributes.set(name, value);
+    }
+  };
+  const documentRef = {
+    get title() {
+      return titleValue;
+    },
+    set title(value) {
+      titleWrites += 1;
+      titleValue = value;
+    }
+  };
+
+  assert.equal(api.setTextContent(node, "Start Scan"), false);
+  assert.equal(api.setAttributeIfChanged(element, "aria-label", "Download"), false);
+  assert.equal(api.setDocumentTitle(documentRef, "Page Image Collector"), false);
+  assert.equal(textWrites, 0);
+  assert.equal(attributeWrites, 0);
+  assert.equal(titleWrites, 0);
+
+  assert.equal(api.setTextContent(node, "Scan More"), true);
+  assert.equal(api.setAttributeIfChanged(element, "aria-label", "Save"), true);
+  assert.equal(api.setDocumentTitle(documentRef, "Workspace"), true);
+  assert.equal(textWrites, 1);
+  assert.equal(attributeWrites, 1);
+  assert.equal(titleWrites, 1);
+});
+
+test("shared i18n translates partial batch download results", () => {
+  const { api } = loadI18n();
+
+  assert.equal(
+    api.translateText("en", "打包完成 8/10，失败 2"),
+    "ZIP complete: 8/10, 2 failed"
+  );
+  assert.equal(
+    api.translateText("en", "下载完成 8/10，失败 2"),
+    "Downloads complete: 8/10, 2 failed"
+  );
+  assert.equal(
+    api.translateText("zh", "Downloads complete: 8/10, 2 failed"),
+    "下载完成 8/10，失败 2"
+  );
+});
+
+test("shared i18n translates dynamic viewer labels and nested runtime errors", () => {
+  const { api } = loadI18n();
+
+  assert.equal(api.translateText("en", "加载原图..."), "Loading original...");
+  assert.equal(api.translateText("en", "原图模式"), "Original mode");
+  assert.equal(api.translateText("en", "预览模式"), "Preview mode");
+  assert.equal(
+    api.translateText("en", "复制失败: 剪贴板不可用"),
+    "Copy failed: Clipboard unavailable"
+  );
+  assert.equal(
+    api.translateText("en", "下载失败: 当前已有批量下载任务进行中，请稍后再试"),
+    "Download failed: A batch download is already running. Try again later"
+  );
+  assert.equal(
+    api.translateText("en", "分页加载失败: 漫画分页加载已取消"),
+    "Pagination load failed: Comic pagination was cancelled"
+  );
+});

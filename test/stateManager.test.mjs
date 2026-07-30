@@ -10,9 +10,15 @@ globalThis.chrome = {
   }
 };
 
-const { createTabStateManager } = await import("../background/stateManager.js");
+const { createTabStateManager, generateImageId } = await import("../background/stateManager.js");
 
 const tabId = 101;
+const storageKey = "pic_collector_tab_states_v2";
+
+const waitForPersistence = async () => {
+  await new Promise((resolve) => setImmediate(resolve));
+  await new Promise((resolve) => setImmediate(resolve));
+};
 
 test("merges full-size-first and thumbnail-later records through HD indexes", () => {
   const manager = createTabStateManager();
@@ -460,4 +466,231 @@ test("does not persist temporary blob URLs as HD sources when updating dimension
   assert.equal(stored.hdSrc, src);
   assert.equal(stored.maxWidth, 1920);
   assert.equal(stored.maxHeight, 1080);
+});
+
+test("persists the last source page URL for navigation comparisons", async () => {
+  await waitForPersistence();
+  const originalGet = chrome.storage.local.get;
+  const originalSet = chrome.storage.local.set;
+  const storageState = {};
+
+  chrome.storage.local.get = async () => structuredClone(storageState);
+  chrome.storage.local.set = async (values) => {
+    Object.assign(storageState, structuredClone(values));
+  };
+
+  try {
+    const manager = createTabStateManager();
+    await manager.ensureReady();
+    assert.equal(manager.hasTabState(601), false);
+    assert.equal(manager.setPageUrl(601, "https://example.com/gallery?page=1#top"), true);
+    assert.equal(manager.hasTabState(601), true);
+    assert.equal(manager.setPageUrl(601, "https://example.com/gallery?page=1#top"), false);
+    await waitForPersistence();
+
+    assert.equal(
+      storageState[storageKey]["601"].pageUrl,
+      "https://example.com/gallery?page=1#top"
+    );
+
+    const restored = createTabStateManager();
+    await restored.ensureReady();
+    assert.equal(
+      restored.getPageUrl(601),
+      "https://example.com/gallery?page=1#top"
+    );
+  } finally {
+    chrome.storage.local.get = originalGet;
+    chrome.storage.local.set = originalSet;
+  }
+});
+
+test("hydrates all persisted tabs before removing a closed tab", async () => {
+  await waitForPersistence();
+  const originalGet = chrome.storage.local.get;
+  const originalSet = chrome.storage.local.set;
+  const storageState = {
+    [storageKey]: {
+      "501": {
+        images: [{ src: "https://cdn.example.com/closed.jpg", width: 100, height: 100 }],
+        selectedIds: [],
+        hiddenIds: [],
+        config: { enableHD: true },
+        lastScanTime: 1
+      },
+      "502": {
+        images: [{ src: "https://cdn.example.com/kept.jpg", width: 200, height: 100 }],
+        selectedIds: [],
+        hiddenIds: [],
+        config: { enableHD: true },
+        lastScanTime: 2
+      }
+    }
+  };
+
+  chrome.storage.local.get = async () => structuredClone(storageState);
+  chrome.storage.local.set = async (values) => {
+    Object.assign(storageState, structuredClone(values));
+  };
+
+  try {
+    const manager = createTabStateManager();
+    await manager.ensureReady();
+    manager.removeTabState(501);
+    await waitForPersistence();
+
+    assert.equal(storageState[storageKey]["501"], undefined);
+    assert.equal(storageState[storageKey]["502"].images.length, 1);
+    assert.equal(storageState[storageKey]["502"].images[0].src, "https://cdn.example.com/kept.jpg");
+  } finally {
+    chrome.storage.local.get = originalGet;
+    chrome.storage.local.set = originalSet;
+  }
+});
+
+test("falls back to the original URL format when the HD URL has no extension", () => {
+  const manager = createTabStateManager();
+  manager.mergeImages(tabId, [{
+    src: "https://cdn.example.com/photo.jpg",
+    hdSrc: "https://cdn.example.com/photo-original",
+    width: 1200,
+    height: 800
+  }]);
+
+  const [stored] = manager.getAllImages(tabId);
+  assert.equal(stored.format, "jpg");
+});
+
+test("does not replace a known format with unknown metadata from a larger record", () => {
+  const manager = createTabStateManager();
+  const src = "https://cdn.example.com/photo";
+
+  manager.mergeImages(tabId, [{
+    src,
+    normalized: src,
+    format: "jpg",
+    width: 400,
+    height: 300,
+    timestamp: 1
+  }]);
+  manager.mergeImages(tabId, [{
+    src,
+    normalized: src,
+    format: "unknown",
+    width: 1600,
+    height: 1200,
+    timestamp: 2
+  }]);
+
+  const [stored] = manager.getAllImages(tabId);
+  assert.equal(stored.format, "jpg");
+  assert.equal(stored.width, 1600);
+});
+
+test("keeps both images when different normalized URLs produce the same base hash", () => {
+  const manager = createTabStateManager();
+  const first = "https://x.example/Aa";
+  const second = "https://x.example/BB";
+
+  assert.equal(generateImageId(first), generateImageId(second));
+
+  manager.mergeImages(tabId, [
+    { src: first, normalized: first, width: 100, height: 100 },
+    { src: second, normalized: second, width: 200, height: 100 }
+  ]);
+
+  const images = manager.getAllImages(tabId);
+  assert.equal(images.length, 2);
+  assert.equal(new Set(images.map((image) => image.id)).size, 2);
+  assert.deepEqual(new Set(images.map((image) => image.normalized)), new Set([first, second]));
+});
+
+test("does not persist state operations that change nothing", async () => {
+  await waitForPersistence();
+  const originalSet = chrome.storage.local.set;
+  let writeCount = 0;
+  chrome.storage.local.set = async () => {
+    writeCount += 1;
+  };
+
+  try {
+    const manager = createTabStateManager();
+    manager.mergeImages(tabId, [{
+      src: "https://cdn.example.com/no-op.jpg",
+      width: 100,
+      height: 100
+    }]);
+    await waitForPersistence();
+    const [image] = manager.getAllImages(tabId);
+    const baseline = writeCount;
+
+    manager.setSelectionByIds(tabId, [], true);
+    manager.setSelectionByIds(tabId, ["missing"], true);
+    manager.setHiddenByIds(tabId, [image.id], false);
+    manager.setConfig(tabId, { enableHD: true });
+    manager.markHdRejected(tabId, image.id, false);
+    await waitForPersistence();
+
+    assert.equal(writeCount, baseline);
+
+    manager.clearTabImages(tabId);
+    await waitForPersistence();
+    const afterClear = writeCount;
+    manager.clearTabImages(tabId);
+    await waitForPersistence();
+    assert.equal(writeCount, afterClear);
+  } finally {
+    chrome.storage.local.set = originalSet;
+  }
+});
+
+test("uses caller order for selected images without dropping selected items", () => {
+  const manager = createTabStateManager();
+  manager.mergeImages(tabId, [
+    { src: "https://cdn.example.com/large.jpg", width: 1000, height: 1000 },
+    { src: "https://cdn.example.com/first.jpg", width: 100, height: 100 },
+    { src: "https://cdn.example.com/second.jpg", width: 200, height: 100 }
+  ]);
+  const images = manager.getAllImages(tabId);
+  manager.setSelectionByIds(tabId, images.map((image) => image.id), true);
+
+  const first = images.find((image) => image.src.endsWith("/first.jpg"));
+  const second = images.find((image) => image.src.endsWith("/second.jpg"));
+  const ordered = manager.getSelectedImages(tabId, [first.id, second.id, first.id, "missing"]);
+
+  assert.deepEqual(
+    ordered.map((image) => image.src),
+    [
+      "https://cdn.example.com/first.jpg",
+      "https://cdn.example.com/second.jpg",
+      "https://cdn.example.com/large.jpg"
+    ]
+  );
+});
+
+test("finishing a scan after tab removal does not recreate the removed tab state", async () => {
+  await waitForPersistence();
+  const originalSet = chrome.storage.local.set;
+  let latestPayload = {};
+  chrome.storage.local.set = async (values) => {
+    latestPayload = structuredClone(values);
+  };
+
+  try {
+    const manager = createTabStateManager();
+    manager.setScanning(701, true);
+    manager.removeTabState(701);
+    manager.setScanning(701, false);
+    manager.mergeImages(702, [{
+      src: "https://cdn.example.com/kept-after-removal.jpg",
+      width: 100,
+      height: 100
+    }]);
+    await waitForPersistence();
+
+    assert.equal(latestPayload[storageKey]["701"], undefined);
+    assert.equal(latestPayload[storageKey]["702"].images.length, 1);
+  } finally {
+    chrome.storage.local.set = originalSet;
+  }
 });

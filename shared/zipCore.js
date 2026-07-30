@@ -12,7 +12,7 @@ const CRC32_TABLE = (() => {
   return table;
 })();
 
-const IMAGE_EXTENSIONS = new Set(["jpg", "jpeg", "png", "webp", "gif", "svg", "avif", "bmp"]);
+const IMAGE_EXTENSIONS = new Set(["jpg", "jpeg", "png", "webp", "gif", "svg", "avif", "bmp", "heic"]);
 const MB = 1024 * 1024;
 
 export const DEFAULT_ZIP_PART_PRESET = "balanced";
@@ -116,6 +116,7 @@ export const mimeFromFormat = (format) => {
   if (normalized === "svg") return "image/svg+xml";
   if (normalized === "avif") return "image/avif";
   if (normalized === "bmp") return "image/bmp";
+  if (normalized === "heic") return "image/heic";
   return "";
 };
 
@@ -128,6 +129,7 @@ export const mimeToExtension = (mimeType, fallback = "jpg") => {
   if (normalized.includes("svg")) return "svg";
   if (normalized.includes("avif")) return "avif";
   if (normalized.includes("bmp")) return "bmp";
+  if (normalized.includes("heic") || normalized.includes("heif")) return "heic";
   return fallback;
 };
 
@@ -172,12 +174,12 @@ const detectMagicFormat = (bytes) => {
     bytes[4] === 0x66 &&
     bytes[5] === 0x74 &&
     bytes[6] === 0x79 &&
-    bytes[7] === 0x70 &&
-    (
-      (bytes[8] === 0x61 && bytes[9] === 0x76 && bytes[10] === 0x69 && bytes[11] === 0x66) ||
-      (bytes[8] === 0x68 && bytes[9] === 0x65 && bytes[10] === 0x69 && bytes[11] === 0x63)
-    )
-  ) return "avif";
+    bytes[7] === 0x70
+  ) {
+    const brand = String.fromCharCode(bytes[8], bytes[9], bytes[10], bytes[11]).toLowerCase();
+    if (brand === "avif" || brand === "avis") return "avif";
+    if (["heic", "heix", "hevc", "hevx"].includes(brand)) return "heic";
+  }
 
   const text = firstAscii(bytes);
   if (/^<\?xml\b/.test(text) && /<svg\b/.test(text)) return "svg";
@@ -228,6 +230,34 @@ export const inspectImagePayload = ({ bytes, mimeType = "", url = "" } = {}) => 
     extension: "",
     mimeType: normalizedMime
   };
+};
+
+export const resolveImagePayloadExtension = ({
+  inspection = null,
+  mimeType = "",
+  url = "",
+  fallback = "jpg"
+} = {}) => {
+  const inspected = normalizeImageExtension(inspection?.extension);
+  if (inspected) return inspected;
+
+  const normalizedMime = String(mimeType || "").split(";")[0].trim().toLowerCase();
+  if (normalizedMime.startsWith("image/")) {
+    const fromMime = mimeToExtension(normalizedMime, "");
+    if (fromMime) return fromMime;
+  }
+
+  return formatFromUrl(url) || fallback;
+};
+
+export const shouldConvertImageToJpg = ({ inspection = null, mimeType = "", url = "" } = {}) => {
+  const format = resolveImagePayloadExtension({
+    inspection,
+    mimeType,
+    url,
+    fallback: ""
+  });
+  return !["jpg", "gif", "svg"].includes(format);
 };
 
 const calculateCrc32 = (bytes) => {

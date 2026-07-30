@@ -15,6 +15,7 @@ const MSG = {
   GET_COMIC_SEQUENCE: "GET_COMIC_SEQUENCE",
   GET_COMIC_PAGINATION: "GET_COMIC_PAGINATION",
   LOAD_COMIC_PAGINATION_PAGES: "LOAD_COMIC_PAGINATION_PAGES",
+  CANCEL_COMIC_PAGINATION: "CANCEL_COMIC_PAGINATION",
   START_AUTO_SCAN: "START_AUTO_SCAN",
   STOP_AUTO_SCAN: "STOP_AUTO_SCAN",
   START_AUTO_SCROLL: "START_AUTO_SCROLL",
@@ -145,6 +146,11 @@ let comicAssistState = {
 };
 let comicPaginationInfo = null;
 let comicPaginationLoading = false;
+let comicPaginationRefreshId = 0;
+let comicPaginationLoadId = 0;
+const COMIC_PAGINATION_CLIENT_ID =
+  globalThis.crypto?.randomUUID?.() ||
+  `workspace-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 10)}`;
 const COMIC_PAGINATION_DETECT_TIMEOUT_MS = 8000;
 const COMIC_PAGINATION_LIMIT_STORAGE_KEY = "comic_pagination_limit";
 const COMIC_PAGINATION_WAIT_STORAGE_KEY = "comic_pagination_wait_seconds";
@@ -158,9 +164,12 @@ const cardDimensionTasks = new Map();
 let imageMetadataGeneration = 0;
 const fullscreenCache = new Map();
 const fullscreenPendingTasks = new Map();
+let fullscreenCacheGeneration = 0;
 let actionStatusTimer = null;
 let pinnedActionStatusTimer = null;
 let autoRefreshTimer = null;
+let metadataRefreshTimer = null;
+let metadataRefreshRequested = false;
 let manualScanInProgress = false;
 let batchDownloadInProgress = false;
 let activeDownloadStatus = null;
@@ -187,6 +196,7 @@ let transientActionStatusTitle = "";
 let pinnedActionStatus = "";
 let pinnedActionStatusTitle = "";
 const FULLSCREEN_PRELOAD_RADIUS = 4;
+const FULLSCREEN_FETCH_TIMEOUT_MS = 15 * 1000;
 const DIMENSION_PROBE_CONCURRENCY = 8;
 const DRAG_SELECT_MOVE_THRESHOLD = 6;
 const DRAG_CLICK_SUPPRESS_MS = 260;
@@ -231,8 +241,9 @@ const shouldAutoScanOnOpen = workspaceQueryParams.get("autoScan") === "1";
 const shouldComicModeOnOpen = workspaceQueryParams.get("comicMode") === "1";
 const sourceTabIdFromQuery = (() => {
   const urlTabId = workspaceQueryParams.get("tabId");
+  if (!String(urlTabId || "").trim()) return null;
   const numeric = Number(urlTabId);
-  return Number.isInteger(numeric) ? numeric : null;
+  return Number.isInteger(numeric) && numeric > 0 ? numeric : null;
 })();
 
 const withPromiseTimeout = (promise, timeoutMs, errorMessage) =>
@@ -446,7 +457,8 @@ const getImageDimensions = async (url) => {
       probe.src = normalizedUrl;
     });
 
-  const promise = (async () => {
+  let promise;
+  promise = (async () => {
     if (/^https?:/i.test(normalizedUrl)) {
       const response = await sendMessage(MSG.PROBE_IMAGE_DIMENSIONS, { url: normalizedUrl });
       if (response?.success) {
@@ -460,7 +472,11 @@ const getImageDimensions = async (url) => {
       }
       const fallback = await domProbe();
       if (fallback.width <= 0 || fallback.height <= 0) {
-        setTimeout(() => imageDimensionCache.delete(normalizedUrl), 30000);
+        setTimeout(() => {
+          if (imageDimensionCache.get(normalizedUrl) === promise) {
+            imageDimensionCache.delete(normalizedUrl);
+          }
+        }, 30000);
       }
       return fallback;
     }
@@ -556,6 +572,10 @@ const sendImageMetadataUpdate = (image, meta, options = {}) => {
     maxArea: normalized.area,
     format: options.format || "",
     formatTrusted: options.formatTrusted === true
+  }).then((response) => {
+    if (response?.updated && options.refreshFormatFacets === true) {
+      scheduleMetadataRenderRefresh();
+    }
   }).catch(() => {});
 };
 
@@ -622,11 +642,20 @@ const rememberImageDimensions = (image, meta, options = {}) => {
     image.maxWidth = normalized.width;
     image.maxHeight = normalized.height;
     image.maxArea = normalized.area;
-    sendImageMetadataUpdate(image, normalized, options);
+    sendImageMetadataUpdate(image, normalized, {
+      ...options,
+      refreshFormatFacets: shouldUpdateFormat
+    });
   } else if (loadedIsLargerThanBase) {
-    sendImageMetadataUpdate(image, storedMax, options);
+    sendImageMetadataUpdate(image, storedMax, {
+      ...options,
+      refreshFormatFacets: shouldUpdateFormat
+    });
   } else if (shouldUpdateFormat) {
-    sendImageMetadataUpdate(image, storedMax, options);
+    sendImageMetadataUpdate(image, storedMax, {
+      ...options,
+      refreshFormatFacets: true
+    });
   }
 
   return true;
@@ -670,7 +699,8 @@ const resolveCardMaxDimensions = async (image, options = {}) => {
   const pendingTask = cardDimensionTasks.get(image.id);
   if (pendingTask) return await pendingTask;
 
-  const task = (async () => {
+  let task;
+  task = (async () => {
     cardDimensionPending.add(image.id);
     try {
       const probes = [getImageDimensions(image.src)];
@@ -734,12 +764,22 @@ const resolveCardMaxDimensions = async (image, options = {}) => {
         metadataGeneration
       });
       if (hasHdCandidate && !hdResolved) {
-        setTimeout(() => cardDimensionCache.delete(image.id), 30000);
+        const failedProbeCacheEntry = cardDimensionCache.get(image.id);
+        setTimeout(() => {
+          if (
+            metadataGeneration === imageMetadataGeneration &&
+            cardDimensionCache.get(image.id) === failedProbeCacheEntry
+          ) {
+            cardDimensionCache.delete(image.id);
+          }
+        }, 30000);
       }
       return resolved;
     } finally {
-      cardDimensionPending.delete(image.id);
-      cardDimensionTasks.delete(image.id);
+      if (cardDimensionTasks.get(image.id) === task) {
+        cardDimensionPending.delete(image.id);
+        cardDimensionTasks.delete(image.id);
+      }
     }
   })();
 
@@ -877,6 +917,19 @@ const getFilters = () => ({
   formats: getSelectedFormatFilters()
 });
 
+const hasRestrictiveFormatFilter = (selectedFormats = []) => {
+  if (!Array.isArray(selectedFormats) || selectedFormats.length === 0) return false;
+  const inputs = Array.from(elements.formatFilters.querySelectorAll("input[type=\"checkbox\"]"));
+  if (inputs.length === 0) return false;
+  const visibleInputs = inputs.filter((input) => input.value !== "_hidden");
+  const hiddenSelected = inputs.some((input) => input.value === "_hidden" && input.checked);
+  const selectedVisibleCount = visibleInputs.reduce(
+    (count, input) => count + (input.checked ? 1 : 0),
+    0
+  );
+  return hiddenSelected || (selectedVisibleCount > 0 && selectedVisibleCount < visibleInputs.length);
+};
+
 const normalizeFormatStats = (stats = {}) => {
   const normalized = {};
   for (const [formatKey, count] of Object.entries(stats)) {
@@ -975,7 +1028,7 @@ const fetchComicSequence = async () => {
   }
 };
 
-const applyComicSequenceOrder = async (images = []) => {
+const applyComicSequenceOrder = async (images = [], options = {}) => {
   if (!comicModeEnabled || !Array.isArray(images) || images.length <= 1) {
     return images;
   }
@@ -985,7 +1038,9 @@ const applyComicSequenceOrder = async (images = []) => {
     const baselineSequence = await fetchComicSequence();
     sequence = baselineSequence;
   } catch (error) {
-    setActionStatus(`漫画模式顺序分析失败: ${error?.message || "未知错误"}`, 3200);
+    if (options.showError !== false) {
+      setActionStatus(`漫画模式顺序分析失败: ${error?.message || "未知错误"}`, 3200);
+    }
     return images;
   }
 
@@ -1103,7 +1158,7 @@ const persistComicPaginationSettings = () => {
     chrome.storage.local.set({
       [COMIC_PAGINATION_LIMIT_STORAGE_KEY]: getComicPaginationLimit(),
       [COMIC_PAGINATION_WAIT_STORAGE_KEY]: getComicPaginationWaitSeconds()
-    });
+    }).catch(() => {});
   } catch { /* ignore */ }
 };
 
@@ -1153,6 +1208,8 @@ const refreshComicPaginationInfo = async () => {
     return;
   }
 
+  const refreshId = ++comicPaginationRefreshId;
+  let nextPaginationInfo = null;
   try {
     const response = await withPromiseTimeout(
       sendMessage(MSG.GET_COMIC_PAGINATION),
@@ -1160,21 +1217,29 @@ const refreshComicPaginationInfo = async () => {
       "分页检测超时"
     );
     if (response?.success && response.pagination?.supported) {
-      comicPaginationInfo = response.pagination;
-    } else {
-      comicPaginationInfo = null;
+      nextPaginationInfo = response.pagination;
     }
-  } catch {
-    comicPaginationInfo = null;
-  }
+  } catch { /* ignore */ }
 
+  if (refreshId !== comicPaginationRefreshId || !comicModeEnabled) return;
+  comicPaginationInfo = nextPaginationInfo;
   updateComicPaginationUi();
 };
 
 const resetComicPaginationState = () => {
+  comicPaginationRefreshId += 1;
+  comicPaginationLoadId += 1;
   comicPaginationInfo = null;
   comicPaginationLoading = false;
   updateComicPaginationUi();
+};
+
+const cancelComicPaginationLoad = async () => {
+  resetComicPaginationState();
+  if (!Number.isInteger(sourceTabId)) return;
+  await sendMessage(MSG.CANCEL_COMIC_PAGINATION, {
+    clientId: COMIC_PAGINATION_CLIENT_ID
+  }).catch(() => {});
 };
 
 const loadComicPaginationPages = async () => {
@@ -1183,6 +1248,7 @@ const loadComicPaginationPages = async () => {
 
   const limit = getComicPaginationLimit();
   const waitSeconds = getComicPaginationWaitSeconds();
+  const loadId = ++comicPaginationLoadId;
 
   comicPaginationLoading = true;
   updateComicPaginationUi();
@@ -1193,9 +1259,11 @@ const loadComicPaginationPages = async () => {
     const response = await sendMessage(MSG.LOAD_COMIC_PAGINATION_PAGES, {
       nextUrl: comicPaginationInfo.nextUrl,
       limit,
-      waitSeconds
+      waitSeconds,
+      clientId: COMIC_PAGINATION_CLIENT_ID
     });
 
+    if (loadId !== comicPaginationLoadId || !comicModeEnabled) return;
     if (response?.success) {
       const results = Array.isArray(response.results) ? response.results : [];
       const loaded = results.filter((item) => item?.success).length;
@@ -1221,10 +1289,13 @@ const loadComicPaginationPages = async () => {
       setActionStatus(`分页加载失败: ${response?.error || "未知错误"}`, 8000);
     }
   } catch (error) {
+    if (loadId !== comicPaginationLoadId || !comicModeEnabled) return;
     setActionStatus(`分页加载出错: ${error?.message || "未知错误"}`, 8000);
   } finally {
-    comicPaginationLoading = false;
-    updateComicPaginationUi();
+    if (loadId === comicPaginationLoadId) {
+      comicPaginationLoading = false;
+      updateComicPaginationUi();
+    }
   }
 };
 
@@ -1286,6 +1357,7 @@ const setComicModeEnabled = async (enabled, options = {}) => {
       return false;
     }
   } else {
+    await cancelComicPaginationLoad();
     await releaseComicRuntimeAssist();
   }
 
@@ -1295,8 +1367,6 @@ const setComicModeEnabled = async (enabled, options = {}) => {
 
   if (nextValue) {
     refreshComicPaginationInfo().catch(() => {});
-  } else {
-    resetComicPaginationState();
   }
 
   if (options.showStatus !== false) {
@@ -1427,6 +1497,13 @@ const formatDownloadStatusText = (status) => {
   if (phase === "zip_part_download") return `正在下载ZIP第 ${partIndex} 卷`;
   if (phase === "direct_prepare") return "正在准备批量下载…";
   if (phase === "direct") return Number.isInteger(current) && Number.isInteger(total) ? `下载中 ${current}/${total}` : "下载中…";
+  if (phase === "completed_with_errors") {
+    const succeeded = Math.max(0, Number(status.succeeded) || current || 0);
+    const failed = Math.max(0, Number(status.failed) || Math.max(0, total - succeeded));
+    return mode === "zip"
+      ? `打包完成 ${succeeded}/${total}，失败 ${failed}`
+      : `下载完成 ${succeeded}/${total}，失败 ${failed}`;
+  }
   if (phase === "completed") return mode === "zip" ? "打包下载完毕" : "批量下载完毕";
   if (phase === "failed") return `下载失败: ${status.error || "未知错误"}`;
   return "";
@@ -1455,7 +1532,17 @@ const syncBatchDownloadUiState = () => {
 };
 
 const applyDownloadStatus = (status) => {
-  activeDownloadStatus = status || null;
+  const incomingUpdatedAt = Number(status?.updatedAt) || 0;
+  const currentUpdatedAt = Number(activeDownloadStatus?.updatedAt) || 0;
+  if (incomingUpdatedAt > 0 && currentUpdatedAt > 0 && incomingUpdatedAt < currentUpdatedAt) {
+    return;
+  }
+  activeDownloadStatus = status
+    ? {
+        ...status,
+        updatedAt: incomingUpdatedAt || Math.max(Date.now(), currentUpdatedAt + 1)
+      }
+    : null;
   batchDownloadInProgress = activeDownloadStatus?.active === true;
   syncBatchDownloadUiState();
   const text = formatDownloadStatusText(activeDownloadStatus);
@@ -1469,7 +1556,11 @@ const applyDownloadStatus = (status) => {
     setPinnedActionStatus("");
     return;
   }
-  const timeoutMs = activeDownloadStatus?.active === true ? -1 : activeDownloadStatus?.phase === "failed" ? 4200 : 2600;
+  const timeoutMs = activeDownloadStatus?.active === true
+    ? -1
+    : ["failed", "completed_with_errors"].includes(activeDownloadStatus?.phase)
+      ? 4200
+      : 2600;
   setPinnedActionStatus(text, timeoutMs);
 };
 
@@ -1500,6 +1591,17 @@ const scheduleRenderRefresh = () => {
         }
       });
   }, 120);
+};
+
+const scheduleMetadataRenderRefresh = () => {
+  if (metadataRefreshTimer) return;
+  metadataRefreshRequested = true;
+  if (committedGalleryRenderToken !== galleryRenderToken) return;
+  metadataRefreshRequested = false;
+  metadataRefreshTimer = setTimeout(() => {
+    metadataRefreshTimer = null;
+    renderGallery().catch(() => {});
+  }, 160);
 };
 
 const syncScanButtonLabel = () => {
@@ -1737,10 +1839,14 @@ const releaseFullscreenCacheEntry = (url) => {
 };
 
 const clearFullscreenCache = () => {
+  fullscreenCacheGeneration += 1;
+  for (const pending of fullscreenPendingTasks.values()) {
+    pending?.controller?.abort();
+  }
+  fullscreenPendingTasks.clear();
   for (const url of fullscreenCache.keys()) {
     releaseFullscreenCacheEntry(url);
   }
-  fullscreenPendingTasks.clear();
 };
 
 const ensureFullscreenCache = async (url) => {
@@ -1753,15 +1859,25 @@ const ensureFullscreenCache = async (url) => {
   }
 
   const pending = fullscreenPendingTasks.get(url);
-  if (pending) {
-    return await pending;
+  if (pending?.task) {
+    return await pending.task;
   }
 
-  const task = (async () => {
+  const generation = fullscreenCacheGeneration;
+  const controller = new AbortController();
+  const timeoutId = setTimeout(() => controller.abort(), FULLSCREEN_FETCH_TIMEOUT_MS);
+  let task;
+  task = (async () => {
     try {
-      const response = await fetch(url, { cache: "no-store" });
+      const response = await fetch(url, {
+        cache: "no-store",
+        signal: controller.signal
+      });
       if (!response.ok) throw new Error(`HTTP ${response.status}`);
       const blob = await response.blob();
+      if (generation !== fullscreenCacheGeneration || controller.signal.aborted) {
+        return { displayUrl: url, cached: false };
+      }
       const objectUrl = URL.createObjectURL(blob);
       fullscreenCache.set(url, {
         objectUrl,
@@ -1770,19 +1886,24 @@ const ensureFullscreenCache = async (url) => {
       });
       return { displayUrl: objectUrl, cached: true };
     } catch {
-      fullscreenCache.set(url, {
-        objectUrl: "",
-        size: 0,
-        lastUsed: Date.now(),
-        failed: true
-      });
+      if (generation === fullscreenCacheGeneration) {
+        fullscreenCache.set(url, {
+          objectUrl: "",
+          size: 0,
+          lastUsed: Date.now(),
+          failed: true
+        });
+      }
       return { displayUrl: url, cached: false };
     } finally {
-      fullscreenPendingTasks.delete(url);
+      clearTimeout(timeoutId);
+      if (fullscreenPendingTasks.get(url)?.task === task) {
+        fullscreenPendingTasks.delete(url);
+      }
     }
   })();
 
-  fullscreenPendingTasks.set(url, task);
+  fullscreenPendingTasks.set(url, { task, controller, generation });
   return await task;
 };
 
@@ -2245,6 +2366,21 @@ const getVisibleSelectionInfo = () => {
   );
   const allVisibleSelected = visibleIds.length > 0 && selectedVisibleCount === visibleIds.length;
   return { visibleIds, selectedVisibleCount, allVisibleSelected };
+};
+
+const getComicOrderedImageIds = async () => {
+  if (!comicModeEnabled) return [];
+  let images = currentImages;
+  try {
+    const response = await sendMessage(MSG.GET_IMAGES, { filtered: false });
+    if (response?.success && Array.isArray(response.images)) {
+      images = response.images;
+    }
+    images = await applyComicSequenceOrder(images, { showError: false });
+  } catch {
+    images = currentImages;
+  }
+  return images.map((image) => image.id);
 };
 
 const syncSelectAllButtonLabel = () => {
@@ -2739,7 +2875,7 @@ const renderGallery = async () => {
       currentConfig.enableSizeSort ||
       currentConfig.enablePortraitOnly ||
       filters.preset !== "all" ||
-      filters.formats.length > 0 ||
+      hasRestrictiveFormatFilter(filters.formats) ||
       filters.minShort > 0 ||
       filters.minLong > 0 ||
       filters.minArea > 0
@@ -2821,6 +2957,7 @@ const renderGallery = async () => {
     const statsUpdated = await updateStats({ visibleImages: currentImages, facetStats, renderToken });
     if (!statsUpdated) return;
     committedGalleryRenderToken = renderToken;
+    if (metadataRefreshRequested) scheduleMetadataRenderRefresh();
     hasScannedOnce = hasScannedOnce || allImages.length > 0;
     syncScanButtonLabel();
     return;
@@ -2836,6 +2973,7 @@ const renderGallery = async () => {
     const statsUpdated = await updateStats({ visibleImages: currentImages, facetStats, renderToken });
     if (!statsUpdated) return;
     committedGalleryRenderToken = renderToken;
+    if (metadataRefreshRequested) scheduleMetadataRenderRefresh();
     hasScannedOnce = true;
     syncScanButtonLabel();
     return;
@@ -2853,6 +2991,7 @@ const renderGallery = async () => {
   const statsUpdated = await updateStats({ visibleImages: currentImages, facetStats, renderToken });
   if (!statsUpdated) return;
   committedGalleryRenderToken = renderToken;
+  if (metadataRefreshRequested) scheduleMetadataRenderRefresh();
   hasScannedOnce = true;
   syncScanButtonLabel();
 };
@@ -3270,6 +3409,11 @@ const clearImages = async () => {
   cardDimensionCache.clear();
   cardDimensionTasks.clear();
   cardDimensionPending.clear();
+  if (metadataRefreshTimer) {
+    clearTimeout(metadataRefreshTimer);
+    metadataRefreshTimer = null;
+  }
+  metadataRefreshRequested = false;
   imageMetadataGeneration += 1;
   clipboardPayloadCache.clear();
   clearFullscreenCache();
@@ -3306,6 +3450,7 @@ const downloadBatch = async () => {
     total: selectedIds.size
   });
   try {
+    const orderedImageIds = await getComicOrderedImageIds();
     const response = await sendMessage(MSG.DOWNLOAD_BATCH, {
       enableBatchZipDownload,
       enableBatchZip: enableBatchZipDownload,
@@ -3313,7 +3458,8 @@ const downloadBatch = async () => {
       mode: enableBatchZipDownload ? "zip" : "direct",
       downloadMode: enableBatchZipDownload ? "zip" : "direct",
       enableConvertToJpg,
-      zipPartPreset: getZipPartPreset()
+      zipPartPreset: getZipPartPreset(),
+      orderedImageIds
     });
     if (!response.success) {
       if (response?.zipped && Number(response?.zipPartCount) > 1) {
@@ -3344,23 +3490,32 @@ const downloadBatch = async () => {
       return;
     }
     if (response.zipped) {
+      const succeeded = Number(response.packed) || 0;
+      const failed = Number(response.failed) || 0;
+      const total = succeeded + failed || Number(response.results?.length) || 0;
       applyDownloadStatus({
         active: false,
         mode: "zip",
-        phase: "completed",
-        current: Number(response.packed) || Number(response.results?.length) || 0,
-        total: Number(response.packed) || Number(response.results?.length) || 0,
+        phase: failed > 0 ? "completed_with_errors" : "completed",
+        current: succeeded,
+        total,
+        succeeded,
+        failed,
         partIndex: Number(response.zipPartCount) || 1,
         partCount: Number(response.zipPartCount) || 1
       });
       return;
     }
+    const succeeded = Number(response.succeeded) || response.results.filter((item) => item.success).length;
+    const failed = Number(response.failed) || Math.max(0, response.results.length - succeeded);
     applyDownloadStatus({
       active: false,
       mode: "direct",
-      phase: "completed",
-      current: response.results.filter((item) => item.success).length,
-      total: response.results.length
+      phase: failed > 0 ? "completed_with_errors" : "completed",
+      current: succeeded,
+      total: response.results.length,
+      succeeded,
+      failed
     });
   } finally {
     batchDownloadInProgress = activeDownloadStatus?.active === true;
@@ -3369,7 +3524,10 @@ const downloadBatch = async () => {
 };
 
 const copyBatch = async () => {
-  const response = await sendMessage(MSG.GET_SELECTED);
+  const orderedImageIds = await getComicOrderedImageIds();
+  const response = await sendMessage(MSG.GET_SELECTED, {
+    orderedImageIds
+  });
   if (!response.success || response.images.length === 0) return;
 
   const useOriginal = currentConfig.enableHD;
@@ -3381,8 +3539,12 @@ const copyBatch = async () => {
     .filter(Boolean)
     .join("\n");
 
-  await navigator.clipboard.writeText(urls);
-  setActionStatus(`已复制 ${response.images.length} 条链接`);
+  try {
+    await navigator.clipboard.writeText(urls);
+    setActionStatus(`已复制 ${response.images.length} 条链接`);
+  } catch (error) {
+    setActionStatus(`复制失败: ${error?.message || "剪贴板不可用"}`, 3200);
+  }
 };
 
 const bindEvents = () => {
@@ -3730,6 +3892,15 @@ const bindEvents = () => {
     teardownVirtualGrid();
     unlockFullscreenPageScroll();
     clearFullscreenCache();
+    if (Number.isInteger(sourceTabId)) {
+      chrome.runtime.sendMessage({
+        type: MSG.CANCEL_COMIC_PAGINATION,
+        tabId: sourceTabId,
+        payload: {
+          clientId: COMIC_PAGINATION_CLIENT_ID
+        }
+      }).catch(() => {});
+    }
     if (comicAssistState.ownedAutoScan) {
       chrome.runtime.sendMessage({ type: MSG.STOP_AUTO_SCAN, tabId: sourceTabId }).catch(() => {});
     }
@@ -3778,6 +3949,7 @@ const init = async () => {
   setMetricInputs(RESOLUTION_PRESETS.all);
   setActivePreset("all");
   await renderGallery();
+  await restoreDownloadStatus();
 
   if (shouldAutoScanOnOpen) {
     await scanImages();
@@ -3791,7 +3963,6 @@ const init = async () => {
       await scanImages();
     }
   }
-  await restoreDownloadStatus();
 };
 
 chrome.runtime.onMessage.addListener((message) => {

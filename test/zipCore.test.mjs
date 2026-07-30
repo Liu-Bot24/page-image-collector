@@ -1,7 +1,13 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 
-import { formatFromUrl, inspectImagePayload, normalizeZipPartOptions } from "../shared/zipCore.js";
+import {
+  formatFromUrl,
+  inspectImagePayload,
+  normalizeZipPartOptions,
+  resolveImagePayloadExtension,
+  shouldConvertImageToJpg
+} from "../shared/zipCore.js";
 
 const bytes = (...values) => new Uint8Array(values);
 const textBytes = (value) => new TextEncoder().encode(value);
@@ -44,6 +50,51 @@ test("trusts payload bytes over a misleading URL extension", () => {
   assert.equal(result.ok, true);
   assert.equal(result.extension, "webp");
   assert.equal(result.mimeType, "image/webp");
+  assert.equal(resolveImagePayloadExtension({
+    inspection: result,
+    mimeType: "image/jpeg",
+    url: "https://cdn.example.com/photo.jpg"
+  }), "webp");
+  assert.equal(shouldConvertImageToJpg({
+    inspection: result,
+    mimeType: "image/jpeg",
+    url: "https://cdn.example.com/photo.jpg"
+  }), true);
+});
+
+test("keeps JPEG, GIF, and SVG payloads out of JPG conversion", () => {
+  assert.equal(shouldConvertImageToJpg({
+    inspection: { extension: "jpg" },
+    mimeType: "image/webp",
+    url: "https://cdn.example.com/photo.webp"
+  }), false);
+  assert.equal(shouldConvertImageToJpg({
+    inspection: { extension: "gif" },
+    mimeType: "image/gif",
+    url: "https://cdn.example.com/animation"
+  }), false);
+  assert.equal(shouldConvertImageToJpg({
+    inspection: { extension: "svg" },
+    mimeType: "image/svg+xml",
+    url: "https://cdn.example.com/vector"
+  }), false);
+});
+
+test("keeps HEIC payloads labeled as HEIC instead of AVIF", () => {
+  const result = inspectImagePayload({
+    bytes: bytes(
+      0x00, 0x00, 0x00, 0x18,
+      0x66, 0x74, 0x79, 0x70,
+      0x68, 0x65, 0x69, 0x63
+    ),
+    mimeType: "application/octet-stream",
+    url: "https://cdn.example.com/image"
+  });
+
+  assert.equal(result.ok, true);
+  assert.equal(result.extension, "heic");
+  assert.equal(result.mimeType, "image/heic");
+  assert.equal(resolveImagePayloadExtension({ inspection: result }), "heic");
 });
 
 test("accepts SVG text as an image payload but rejects generic non-image text", () => {

@@ -3,8 +3,9 @@ import {
   formatFromUrl,
   inspectImagePayload,
   mimeFromFormat,
-  mimeToExtension,
-  normalizeZipPartOptions
+  normalizeZipPartOptions,
+  resolveImagePayloadExtension,
+  shouldConvertImageToJpg
 } from "../shared/zipCore.js";
 
 const MSG = {
@@ -12,7 +13,8 @@ const MSG = {
   OFFSCREEN_ZIP_PROGRESS: "OFFSCREEN_ZIP_PROGRESS",
   OFFSCREEN_ZIP_PART_READY: "OFFSCREEN_ZIP_PART_READY",
   OFFSCREEN_ZIP_PART_DONE: "OFFSCREEN_ZIP_PART_DONE",
-  OFFSCREEN_ZIP_DONE: "OFFSCREEN_ZIP_DONE"
+  OFFSCREEN_ZIP_DONE: "OFFSCREEN_ZIP_DONE",
+  OFFSCREEN_ZIP_STATUS: "OFFSCREEN_ZIP_STATUS"
 };
 
 const JPG_CONVERT_QUALITY = 1.0;
@@ -29,13 +31,6 @@ const safeFilenamePart = (text) =>
 const baseFilename = (image, index = 0) => {
   const idPart = safeFilenamePart(image?.id || `img_${Date.now()}`);
   return index > 0 ? `${idPart}_${index}` : idPart;
-};
-
-const extensionFromUrl = (url, fallback = "jpg") => {
-  if (!url) return fallback;
-  const format = formatFromUrl(url);
-  if (format) return format;
-  return fallback;
 };
 
 const buildBatchZipPartFilename = (baseZipFilename, partIndex, totalParts) => {
@@ -82,18 +77,6 @@ const getDownloadCandidates = (image, preferHD = true) => {
     }
   }
   return [...new Set(expanded)];
-};
-
-const shouldConvertToJpg = (mimeType, url) => {
-  const type = String(mimeType || "").toLowerCase();
-  if (type.includes("jpeg") || type.includes("jpg")) return false;
-  if (type.includes("gif") || type.includes("svg")) return false;
-
-  const format = formatFromUrl(url);
-  if (format === "jpg" || format === "jpeg") return false;
-  if (format === "gif" || format === "svg") return false;
-
-  return true;
 };
 
 const fetchBlob = async (url, timeoutMs = 8000) => {
@@ -152,10 +135,10 @@ const convertBlobToJpg = async (blob) => {
   }
 };
 
-const sendProgress = async (tabId, patch = {}) => {
+const sendProgress = async (tabId, taskId, patch = {}) => {
   await chrome.runtime.sendMessage({
     type: MSG.OFFSCREEN_ZIP_PROGRESS,
-    payload: { tabId, patch }
+    payload: { tabId, taskId, patch }
   }).catch(() => {});
 };
 
@@ -208,19 +191,25 @@ const buildZipEntryFromImage = async (image, options = {}) => {
         continue;
       }
 
-      if (convertToJpg && shouldConvertToJpg(type, url)) {
+      if (convertToJpg && shouldConvertImageToJpg({ inspection, mimeType: type, url })) {
         try {
           blob = await convertBlobToJpg(blob);
           filename = `${baseFilename(image, index)}.jpg`;
           converted = true;
         } catch (_convertError) {
-          const extFromUrl = extensionFromUrl(url, "");
-          const ext = extFromUrl || inspection.extension || mimeToExtension(blob.type, "jpg");
+          const ext = resolveImagePayloadExtension({
+            inspection,
+            mimeType: blob.type,
+            url
+          });
           filename = `${baseFilename(image, index)}.${ext}`;
         }
       } else {
-        const extFromUrl = extensionFromUrl(url, "");
-        const ext = extFromUrl || inspection.extension || mimeToExtension(blob.type, "jpg");
+        const ext = resolveImagePayloadExtension({
+          inspection,
+          mimeType: blob.type,
+          url
+        });
         filename = `${baseFilename(image, index)}.${ext}`;
       }
 
@@ -257,7 +246,7 @@ const requestPartDownload = async (task, entries, expectMoreParts = false) => {
   const partId = `${task.taskId}_part_${partIndex + 1}`;
   const filename = buildBatchZipPartFilename(task.baseZipFilename, partIndex, partCount);
 
-  await sendProgress(task.tabId, {
+  await sendProgress(task.tabId, task.taskId, {
     active: true,
     mode: "zip",
     phase: "zip_part_build",
@@ -402,7 +391,7 @@ const runZipTask = async (payload = {}) => {
         });
       }
 
-      await sendProgress(tabId, {
+      await sendProgress(tabId, taskId, {
         active: true,
         mode: "zip",
         current: i + 1,
@@ -457,6 +446,20 @@ const runZipTask = async (payload = {}) => {
 
 chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
   const payload = message?.payload || {};
+
+  if (message?.type === MSG.OFFSCREEN_ZIP_STATUS) {
+    const taskId = String(payload.taskId || "");
+    const task = activeTasks.get(taskId);
+    sendResponse({
+      success: true,
+      active: Boolean(task),
+      taskId,
+      tabId: Number(task?.tabId),
+      processed: Number(task?.processed) || 0,
+      total: Number(task?.total) || 0
+    });
+    return false;
+  }
 
   if (message?.type === MSG.OFFSCREEN_ZIP_PART_DONE) {
     const partId = String(payload.partId || "");

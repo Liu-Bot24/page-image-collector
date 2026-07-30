@@ -37,6 +37,8 @@
       "common.noSource": "未记录图片来源",
       "common.unknownError": "未知错误",
       "common.loading": "加载中...",
+      "common.loadingOriginal": "加载原图...",
+      "common.clipboardUnavailable": "剪贴板不可用",
       "stats.total": "总图片",
       "stats.filtered": "已筛选",
       "stats.selected": "已选中",
@@ -86,6 +88,8 @@
       "workspace.emptyTitle": "暂无图片",
       "workspace.emptyHint": "点击「扫描」按钮获取本页图片",
       "workspace.preview": "预览图",
+      "workspace.previewMode": "预览模式",
+      "workspace.originalMode": "原图模式",
       "workspace.viewOriginal": "查看大图",
       "workspace.viewOneToOne": "1:1查看",
       "workspace.fullscreen": "全屏看图",
@@ -122,7 +126,13 @@
       "status.comicLoadingPages": "正在获取后续分页图片，请稍候…",
       "status.zipPartsUpdated": "已更新ZIP分卷设置",
       "status.workspaceNoSourceTab": "未绑定原网页标签页，请从原网页重新打开 Workspace",
-      "status.comicStartFailed": "漫画模式启动失败"
+      "status.comicStartFailed": "漫画模式启动失败",
+      "error.previousBatchInterrupted": "上次批量下载任务已中断，请重新开始",
+      "error.batchAlreadyRunning": "当前已有批量下载任务进行中，请稍后再试",
+      "error.paginationScanFailed": "分页图片扫描失败",
+      "error.paginationCancelled": "漫画分页加载已取消",
+      "error.collectionChanged": "原网页已切换或采集结果已清空",
+      "error.collectionBusy": "页面正在加载或清理采集结果"
     },
     en: {
       "app.title": "Page Image Collector",
@@ -156,6 +166,8 @@
       "common.noSource": "No image source recorded",
       "common.unknownError": "Unknown error",
       "common.loading": "Loading...",
+      "common.loadingOriginal": "Loading original...",
+      "common.clipboardUnavailable": "Clipboard unavailable",
       "stats.total": "Images",
       "stats.filtered": "Filtered",
       "stats.selected": "Selected",
@@ -205,6 +217,8 @@
       "workspace.emptyTitle": "No Images",
       "workspace.emptyHint": "Click Scan to collect images on this page",
       "workspace.preview": "Preview",
+      "workspace.previewMode": "Preview mode",
+      "workspace.originalMode": "Original mode",
       "workspace.viewOriginal": "View Original",
       "workspace.viewOneToOne": "1:1 View",
       "workspace.fullscreen": "Fullscreen",
@@ -241,7 +255,13 @@
       "status.comicLoadingPages": "Collecting later page images...",
       "status.zipPartsUpdated": "Updated ZIP part settings",
       "status.workspaceNoSourceTab": "No source tab is bound. Reopen Workspace from the source page",
-      "status.comicStartFailed": "Comic mode failed to start"
+      "status.comicStartFailed": "Comic mode failed to start",
+      "error.previousBatchInterrupted": "The previous batch download was interrupted. Start it again",
+      "error.batchAlreadyRunning": "A batch download is already running. Try again later",
+      "error.paginationScanFailed": "Pagination image scan failed",
+      "error.paginationCancelled": "Comic pagination was cancelled",
+      "error.collectionChanged": "The source page changed or the collected results were cleared",
+      "error.collectionBusy": "The page is loading or collected results are being cleared"
     }
   };
 
@@ -310,11 +330,25 @@
     if (language === "en") {
       return text
         .replaceAll("未知错误", t("en", "common.unknownError"))
-        .replaceAll("未记录来源", "No source recorded");
+        .replaceAll("未记录来源", "No source recorded")
+        .replaceAll("剪贴板不可用", t("en", "common.clipboardUnavailable"))
+        .replaceAll("上次批量下载任务已中断，请重新开始", t("en", "error.previousBatchInterrupted"))
+        .replaceAll("当前已有批量下载任务进行中，请稍后再试", t("en", "error.batchAlreadyRunning"))
+        .replaceAll("分页图片扫描失败", t("en", "error.paginationScanFailed"))
+        .replaceAll("漫画分页加载已取消", t("en", "error.paginationCancelled"))
+        .replaceAll("原网页已切换或采集结果已清空", t("en", "error.collectionChanged"))
+        .replaceAll("页面正在加载或清理采集结果", t("en", "error.collectionBusy"));
     }
     return text
       .replaceAll("Unknown error", t("zh", "common.unknownError"))
-      .replaceAll("No source recorded", "未记录来源");
+      .replaceAll("No source recorded", "未记录来源")
+      .replaceAll("Clipboard unavailable", t("zh", "common.clipboardUnavailable"))
+      .replaceAll(t("en", "error.previousBatchInterrupted"), t("zh", "error.previousBatchInterrupted"))
+      .replaceAll(t("en", "error.batchAlreadyRunning"), t("zh", "error.batchAlreadyRunning"))
+      .replaceAll(t("en", "error.paginationScanFailed"), t("zh", "error.paginationScanFailed"))
+      .replaceAll(t("en", "error.paginationCancelled"), t("zh", "error.paginationCancelled"))
+      .replaceAll(t("en", "error.collectionChanged"), t("zh", "error.collectionChanged"))
+      .replaceAll(t("en", "error.collectionBusy"), t("zh", "error.collectionBusy"));
   };
 
   const translateActionName = (language, value) => {
@@ -363,6 +397,18 @@
       en: /^Downloading (\d+)\/(\d+)$/,
       toEn: (match) => `Downloading ${match[1]}/${match[2]}`,
       toZh: (match) => `下载中 ${match[1]}/${match[2]}`
+    },
+    {
+      zh: /^打包完成 (\d+)\/(\d+)，失败 (\d+)$/,
+      en: /^ZIP complete: (\d+)\/(\d+), (\d+) failed$/,
+      toEn: (match) => `ZIP complete: ${match[1]}/${match[2]}, ${match[3]} failed`,
+      toZh: (match) => `打包完成 ${match[1]}/${match[2]}，失败 ${match[3]}`
+    },
+    {
+      zh: /^下载完成 (\d+)\/(\d+)，失败 (\d+)$/,
+      en: /^Downloads complete: (\d+)\/(\d+), (\d+) failed$/,
+      toEn: (match) => `Downloads complete: ${match[1]}/${match[2]}, ${match[3]} failed`,
+      toZh: (match) => `下载完成 ${match[1]}/${match[2]}，失败 ${match[3]}`
     },
     {
       zh: /^生成ZIP (\d+)$/,
@@ -572,13 +618,31 @@
     }
   };
 
+  const setTextContent = (node, value) => {
+    if (!node || node.textContent === value) return false;
+    node.textContent = value;
+    return true;
+  };
+
+  const setAttributeIfChanged = (element, name, value) => {
+    if (!element || element.getAttribute?.(name) === value) return false;
+    element.setAttribute?.(name, value);
+    return true;
+  };
+
+  const setDocumentTitle = (documentRef, value) => {
+    if (!documentRef || documentRef.title === value) return false;
+    documentRef.title = value;
+    return true;
+  };
+
   const applyDomTranslations = (language, root = globalThis.document?.body) => {
     const documentRef = globalThis.document;
     if (!documentRef || !root) return;
     const lang = normalizeLanguage(language) || "en";
     documentRef.documentElement.lang = lang === "zh" ? "zh-CN" : "en";
     documentRef.documentElement.dataset.language = lang;
-    documentRef.title = translateText(lang, documentRef.title);
+    setDocumentTitle(documentRef, translateText(lang, documentRef.title));
 
     if (root.nodeType === 1) translateElementAttributes(root, lang);
     if (typeof root.querySelectorAll === "function") {
@@ -611,6 +675,9 @@
     onLanguageChange,
     t,
     translateText,
+    setTextContent,
+    setAttributeIfChanged,
+    setDocumentTitle,
     applyDomTranslations
   };
 })();
