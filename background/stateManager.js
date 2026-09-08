@@ -1,6 +1,7 @@
 import { formatFromUrl } from "../shared/zipCore.js";
 
 const STORAGE_KEY = "pic_collector_tab_states_v2";
+const METADATA_STORAGE_KEY = "pic_collector_tab_metadata_v1";
 const NOISE_QUERY_KEYS = new Set([
   "t",
   "_",
@@ -196,79 +197,9 @@ const pickPreferredSourceUrl = (existingUrl, incomingUrl) => {
 
 const isTelegramBlobUrl = (url) => String(url || "").startsWith("blob:https://web.telegram.org/");
 
-const parseTelegramSourceToken = (sourceUrl) => {
-  if (!sourceUrl) return "";
-  try {
-    const parsed = new URL(sourceUrl);
-    const host = String(parsed.hostname || "").toLowerCase();
-
-    if (/(^|\.)t\.me$/i.test(host)) {
-      const parts = parsed.pathname.split("/").filter(Boolean);
-      if (parts.length >= 3 && parts[0].toLowerCase() === "c" && /^\d+$/.test(parts[1]) && /^\d+$/.test(parts[2])) {
-        return `-100${parts[1]}/${parts[2]}`;
-      }
-      if (parts.length >= 2 && /^[A-Za-z0-9_]{4,}$/i.test(parts[0]) && /^\d+$/.test(parts[1])) {
-        return `@${parts[0]}/${parts[1]}`;
-      }
-      return "";
-    }
-
-    if (/web\.telegram\.org$/i.test(host)) {
-      let hash = String(parsed.hash || "").replace(/^#/, "");
-      if (!hash) {
-        const p = parsed.searchParams.get("p");
-        if (p) {
-          const normalized = normalizeTelegramHash(`#p=${p}`);
-          if (normalized) hash = normalized;
-        }
-      }
-      const matched = hash.match(/^(@[^/]+\/\d+|-?\d{6,}\/\d+)/);
-      return matched?.[1] || "";
-    }
-
-    return "";
-  } catch (_error) {
-    return "";
-  }
-};
-
-const aspectRatio = (image) => {
-  const w = Number(image?.width) || 0;
-  const h = Number(image?.height) || 0;
-  if (!w || !h) return 0;
-  return w / h;
-};
-
-const findTelegramEquivalentId = (state, incomingImage) => {
-  if (!isTelegramBlobUrl(incomingImage?.src)) return null;
-  const incomingToken = parseTelegramSourceToken(incomingImage?.sourceUrl);
-  if (!incomingToken) return null;
-
-  const incomingRatio = aspectRatio(incomingImage);
-  const incomingArea = Number(incomingImage?.area) || 0;
-
-  for (const [id, existing] of state.images.entries()) {
-    if (!isTelegramBlobUrl(existing?.src)) continue;
-    const existingToken = parseTelegramSourceToken(existing?.sourceUrl);
-    if (!existingToken || existingToken !== incomingToken) continue;
-
-    const existingRatio = aspectRatio(existing);
-    if (incomingRatio > 0 && existingRatio > 0 && Math.abs(incomingRatio - existingRatio) > 0.03) {
-      continue;
-    }
-
-    const existingArea = Number(existing?.area) || 0;
-    const areaFactor =
-      incomingArea > 0 && existingArea > 0
-        ? Math.max(incomingArea, existingArea) / Math.max(1, Math.min(incomingArea, existingArea))
-        : 1;
-    if (areaFactor > 4.0) continue;
-
-    return id;
-  }
-
-  return null;
-};
+// An album message and dimensions alone do not identify an individual photo.
+const isStrongTelegramIdentity = (value) =>
+  /^tg:generic\|[^:|]+:(?:\d+:(?:m|i):[^|]+|x:[^|]+)$/.test(String(value || ""));
 
 const getImageFormat = (url) => {
   return formatFromUrl(url);
@@ -303,13 +234,14 @@ const normalizePositiveNumber = (value) => {
 const normalizeMaxDimensions = ({ width = 0, height = 0, area = 0, maxWidth = 0, maxHeight = 0, maxArea = 0 } = {}) => {
   const normalizedWidth = normalizePositiveNumber(width);
   const normalizedHeight = normalizePositiveNumber(height);
-  const normalizedArea = Math.max(normalizePositiveNumber(area), normalizedWidth * normalizedHeight);
+  const normalizedArea = normalizedWidth > 0 && normalizedHeight > 0
+    ? normalizedWidth * normalizedHeight
+    : normalizePositiveNumber(area);
   const candidateMaxWidth = normalizePositiveNumber(maxWidth);
   const candidateMaxHeight = normalizePositiveNumber(maxHeight);
-  const candidateMaxArea = Math.max(
-    normalizePositiveNumber(maxArea),
-    candidateMaxWidth * candidateMaxHeight
-  );
+  const candidateMaxArea = candidateMaxWidth > 0 && candidateMaxHeight > 0
+    ? candidateMaxWidth * candidateMaxHeight
+    : normalizePositiveNumber(maxArea);
 
   if (candidateMaxWidth > 0 && candidateMaxHeight > 0 && candidateMaxArea > normalizedArea) {
     return {
@@ -327,7 +259,7 @@ const normalizeMaxDimensions = ({ width = 0, height = 0, area = 0, maxWidth = 0,
 };
 
 const mergeMaxDimensions = (existing, incoming) => {
-  const existingMax = normalizeMaxDimensions(existing);
+      const existingMax = normalizeMaxDimensions(existing);
   const incomingMax = normalizeMaxDimensions(incoming);
   if (incomingMax.maxArea > existingMax.maxArea) {
     return incomingMax;
@@ -341,6 +273,7 @@ const shouldUpgradeHdSrc = (existing, incoming) => {
   if (incomingHd === incoming?.src && incomingHd === existing?.hdSrc) return false;
 
   const existingHd = String(existing?.hdSrc || "").trim();
+  if (existing?.hdSrcVerified && !incoming?.hdSrcVerified) return false;
   if (!existingHd || existingHd === existing?.src) {
     return incomingHd !== existingHd;
   }
@@ -348,6 +281,21 @@ const shouldUpgradeHdSrc = (existing, incoming) => {
   const existingMaxArea = normalizeMaxDimensions(existing).maxArea;
   const incomingMaxArea = normalizeMaxDimensions(incoming).maxArea;
   return incomingMaxArea > existingMaxArea && incomingHd !== existingHd;
+};
+
+const normalizeCandidateUrls = (values) => {
+  const urls = new Set();
+  for (const value of Array.isArray(values) ? values : []) {
+    if (typeof value !== "string") continue;
+    const raw = value.trim();
+    try {
+      const parsed = new URL(raw);
+      if (/^(https?:|blob:|data:)$/.test(parsed.protocol)) urls.add(raw);
+    } catch (_error) {
+      // Relative and malformed candidates cannot be downloaded independently.
+    }
+  }
+  return [...urls];
 };
 
 const sanitizeImage = (rawImage) => {
@@ -358,12 +306,14 @@ const sanitizeImage = (rawImage) => {
   if (!src) return null;
 
   const incomingNormalized = String(rawImage.normalized || "").trim();
-  const normalized = incomingNormalized || normalizeUrl(originalSrc || src);
+  const normalized = isTelegramBlobUrl(src) && incomingNormalized.startsWith("tg:") && !isStrongTelegramIdentity(incomingNormalized)
+    ? normalizeUrl(src)
+    : incomingNormalized || normalizeUrl(src);
   if (!normalized) return null;
 
   const width = Number(rawImage.width) || 0;
   const height = Number(rawImage.height) || 0;
-  const area = Math.max(Number(rawImage.area) || 0, width * height);
+  const area = width > 0 && height > 0 ? width * height : normalizePositiveNumber(rawImage.area);
   const maxDimensions = normalizeMaxDimensions({
     width,
     height,
@@ -386,11 +336,15 @@ const sanitizeImage = (rawImage) => {
     src,
     originalSrc: originalSrc || src,
     hdSrc,
+    hdSrcVerified: rawImage.hdSrcVerified === true,
+    candidateUrls: normalizeCandidateUrls(rawImage.candidateUrls),
+    aliases: Array.isArray(rawImage.aliases) ? rawImage.aliases.filter((alias) => typeof alias === "string" && alias) : [],
     width,
     height,
     area,
     ...maxDimensions,
     format: resolvedFormat,
+    formatTrusted: rawImage.formatTrusted === true && resolvedFormat !== "unknown",
     source: rawImage.source || "dom",
     sourceUrl,
     timestamp: Number(rawImage.timestamp) || Date.now(),
@@ -402,7 +356,9 @@ const sanitizeImage = (rawImage) => {
 
 const imageLookupKeys = (image) => {
   const keys = new Set();
-  for (const value of [image?.normalized, image?.hdSrc, image?.originalSrc]) {
+  // The loaded originalSrc may be a shared lazy-load placeholder. Keep it as
+  // a download fallback, but only primary/HD sources establish image identity.
+  for (const value of [image?.normalized, image?.hdSrc, image?.src, ...(image?.aliases || [])]) {
     const raw = String(value || "").trim();
     if (!raw) continue;
     keys.add(raw);
@@ -412,8 +368,33 @@ const imageLookupKeys = (image) => {
   return [...keys];
 };
 
+const requestOrigin = (value) => {
+  try { const url = new URL(value); return /^https?:$/.test(url.protocol) ? url.origin : ''; } catch { return ''; }
+};
+// Request aliases may be shared by distinct images; they are not identity keys.
+const indexRequestSources = (state, image, imageId) => {
+  const previous = state.requestKeysByImage.get(imageId);
+  if (previous) for (const url of previous.urls) {
+    const entry = state.requestSourcesByUrl.get(url);
+    const source = entry?.get(previous.origin);
+    if (source && --source.count === 0) entry.delete(previous.origin);
+    if (entry?.size === 0) state.requestSourcesByUrl.delete(url);
+  }
+  const urls = new Set([image.src, image.hdSrc, image.originalSrc, ...(image.candidateUrls || [])].filter(Boolean));
+  const origin = requestOrigin(image.sourceUrl);
+  for (const url of urls) {
+    if (!state.requestSourcesByUrl.has(url)) state.requestSourcesByUrl.set(url, new Map());
+    const entry = state.requestSourcesByUrl.get(url);
+    const source = entry.get(origin);
+    if (source) source.count += 1;
+    else entry.set(origin, { count: 1, sourceUrl: origin ? image.sourceUrl : '' });
+  }
+  state.requestKeysByImage.set(imageId, { urls, origin });
+};
+
 const indexImage = (state, image, imageId) => {
   if (!state || !image || !imageId) return;
+  if (state.images.get(imageId) === image) indexRequestSources(state, image, imageId);
   if (image.normalized) {
     state.imagesByNormalized.set(image.normalized, imageId);
   }
@@ -455,14 +436,22 @@ const addNewImage = (state, image) => {
 
 const findExistingImageId = (state, image) => {
   if (!state || !image) return null;
+  const compatibleId = (id) => {
+    const existing = state.images.get(id);
+    if (isStrongTelegramIdentity(existing?.normalized) && isStrongTelegramIdentity(image.normalized) && existing.normalized !== image.normalized) {
+      return null;
+    }
+    return id || null;
+  };
   if (image.normalized && state.imagesByNormalized.has(image.normalized)) {
-    return state.imagesByNormalized.get(image.normalized);
+    const id = compatibleId(state.imagesByNormalized.get(image.normalized));
+    if (id) return id;
   }
   for (const key of imageLookupKeys(image)) {
     const existingId = state.imagesByHdSrc.get(key) || state.imagesByNormalized.get(key);
-    if (existingId) return existingId;
+    if (compatibleId(existingId)) return existingId;
   }
-  return findTelegramEquivalentId(state, image);
+  return null;
 };
 
 const findImageIdByUrl = (state, url) => {
@@ -522,10 +511,15 @@ const mergeComicPageMetadata = (existing, incoming) => {
   return {};
 };
 
+let collectionSequence = 0;
+const createCollectionId = () => 'collection_' + Date.now().toString(36) + '_' + (++collectionSequence) + '_' + Math.random().toString(36).slice(2);
 const createState = () => {
   const defaults = cloneDefaults();
   return {
+    collectionId: createCollectionId(),
     images: new Map(),
+    requestSourcesByUrl: new Map(),
+    requestKeysByImage: new Map(),
     imagesByNormalized: new Map(),
     imagesByHdSrc: new Map(),
     selectedIds: new Set(),
@@ -538,6 +532,7 @@ const createState = () => {
 };
 
 const serializeState = (state) => ({
+  collectionId: state.collectionId,
   images: Array.from(state.images.values()),
   selectedIds: Array.from(state.selectedIds),
   hiddenIds: Array.from(state.hiddenIds || []),
@@ -578,44 +573,69 @@ export const createTabStateManager = () => {
   const tabStates = new Map();
   let ready = false;
   let readyPromise = null;
-  let persistInFlight = false;
+  let loadError = null;
+  let persistPromise = null;
   let persistQueued = false;
+  let persistenceError = null;
+  let snapshotDirty = false;
+  let persistenceRevision = 0;
 
   const initTabState = (tabId) => {
     if (!tabStates.has(tabId)) {
       tabStates.set(tabId, createState());
+      snapshotDirty = true;
     }
     return tabStates.get(tabId);
   };
 
-  const schedulePersist = () => {
-    if (persistInFlight) {
-      persistQueued = true;
-      return;
-    }
-
-    persistInFlight = true;
-    Promise.resolve()
+  const persist = () => {
+    if (persistPromise) return persistPromise;
+    persistPromise = Promise.resolve()
       .then(async () => {
         do {
           persistQueued = false;
+          const writeSnapshot = snapshotDirty;
+          snapshotDirty = false;
+          const revision = persistenceRevision;
           const payload = {};
           for (const [tabId, state] of tabStates.entries()) {
-            payload[String(tabId)] = serializeState(state);
+            payload[String(tabId)] = writeSnapshot
+              ? { ...serializeState(state), persistenceRevision: revision }
+              : { collectionId: state.collectionId, persistenceRevision: revision,
+                selectedIds: Array.from(state.selectedIds), hiddenIds: Array.from(state.hiddenIds), config: { ...state.config } };
           }
-          await chrome.storage.local.set({ [STORAGE_KEY]: payload });
+          try {
+            await chrome.storage.local.set(writeSnapshot
+              ? { [STORAGE_KEY]: payload, [METADATA_STORAGE_KEY]: {} }
+              : { [METADATA_STORAGE_KEY]: payload });
+          } catch (error) {
+            snapshotDirty = snapshotDirty || writeSnapshot;
+            throw error;
+          }
         } while (persistQueued);
+        persistenceError = null;
       })
       .catch((error) => {
-        console.error("[图片采集查看器] Failed to persist state:", error);
+        persistQueued = true;
+        persistenceError = error?.message || String(error);
+        throw error;
       })
       .finally(() => {
-        persistInFlight = false;
-        if (persistQueued) {
-          persistQueued = false;
-          schedulePersist();
-        }
+        persistPromise = null;
+        if (persistQueued && !persistenceError && !loadError) persist();
       });
+    // Keep fire-and-forget mutations safe while allowing flush callers to see failures.
+    persistPromise.catch((error) => {
+      console.error("[图片采集查看器] Failed to persist state:", error);
+    });
+    return persistPromise;
+  };
+
+  const schedulePersist = (metadataOnly = false) => {
+    persistenceRevision += 1;
+    snapshotDirty = snapshotDirty || !metadataOnly;
+    persistQueued = true;
+    if (!loadError) persist();
   };
 
   const ensureReady = async () => {
@@ -627,46 +647,84 @@ export const createTabStateManager = () => {
 
     readyPromise = (async () => {
       try {
-        const stored = await chrome.storage.local.get(STORAGE_KEY);
+        const stored = await chrome.storage.local.get([STORAGE_KEY, METADATA_STORAGE_KEY]);
         const rawStates = stored?.[STORAGE_KEY] || {};
+        const loadedStates = new Map();
         for (const [tabIdString, rawState] of Object.entries(rawStates)) {
           const tabId = Number(tabIdString);
-          if (!Number.isInteger(tabId)) continue;
+          if (!Number.isInteger(tabId) || !rawState || typeof rawState !== "object") continue;
 
-          const state = initTabState(tabId);
-          state.config = { ...cloneDefaults().config, ...normalizeConfig(rawState.config) };
+          const overlay = stored?.[METADATA_STORAGE_KEY]?.[tabIdString];
+          const baseRevision = Number(rawState.persistenceRevision) || 0;
+          const overlayRevision = Number(overlay?.persistenceRevision) || 0;
+          persistenceRevision = Math.max(persistenceRevision, baseRevision, overlayRevision);
+          const metadata = overlay?.collectionId === rawState.collectionId && overlayRevision > baseRevision
+            ? overlay : rawState;
+
+          const state = createState();
+          if (typeof rawState.collectionId === 'string' && /^collection_[a-z0-9_]+$/i.test(rawState.collectionId) && rawState.collectionId.length < 120) {
+            state.collectionId = rawState.collectionId;
+          } else {
+            // The next write must establish the generated identity before using an overlay.
+            snapshotDirty = true;
+          }
+          state.config = { ...cloneDefaults().config, ...normalizeConfig(metadata.config) };
           state.pageUrl = normalizePageUrl(rawState.pageUrl);
           state.lastScanTime = Number(rawState.lastScanTime) || null;
 
           const images = Array.isArray(rawState.images) ? rawState.images : [];
+          const restoredIds = new Map();
           for (const image of images) {
             const normalizedImage = sanitizeImage(image);
             if (!normalizedImage) continue;
-            addNewImage(state, normalizedImage);
+            // IDs are stable handles for selections even after URL aliases merge.
+            const storedId = typeof image.id === "string" && /^img_[a-z0-9]+(?:_\d+)?$/.test(image.id) ? image.id : normalizedImage.id;
+            const restoredImage = addNewImage(state, { ...normalizedImage, id: storedId });
+            if (restoredImage) restoredIds.set(image.id || normalizedImage.id, restoredImage.id);
           }
 
-          const selectedIds = Array.isArray(rawState.selectedIds) ? rawState.selectedIds : [];
+          const selectedIds = Array.isArray(metadata.selectedIds) ? metadata.selectedIds : [];
           for (const id of selectedIds) {
-            if (state.images.has(id)) {
-              state.selectedIds.add(id);
+            const restoredId = restoredIds.get(id) || id;
+            if (state.images.has(restoredId)) {
+              state.selectedIds.add(restoredId);
             }
           }
 
-          const hiddenIds = Array.isArray(rawState.hiddenIds) ? rawState.hiddenIds : [];
+          const hiddenIds = Array.isArray(metadata.hiddenIds) ? metadata.hiddenIds : [];
           for (const id of hiddenIds) {
-            if (state.images.has(id)) {
-              state.hiddenIds.add(id);
+            const restoredId = restoredIds.get(id) || id;
+            if (state.images.has(restoredId)) {
+              state.hiddenIds.add(restoredId);
             }
           }
+          loadedStates.set(tabId, state);
         }
-      } catch (error) {
-        console.error("[图片采集查看器] Failed to load state:", error);
-      } finally {
+        for (const [tabId, state] of loadedStates) tabStates.set(tabId, state);
+        loadError = null;
         ready = true;
+      } catch (error) {
+        loadError = error;
+        console.error("[图片采集查看器] Failed to load state:", error);
+        throw error;
       }
     })();
 
-    await readyPromise;
+    try {
+      await readyPromise;
+    } finally {
+      readyPromise = null;
+    }
+  };
+
+  const getPersistenceStatus = () => ({
+    pending: persistQueued || Boolean(persistPromise),
+    error: persistenceError || loadError?.message || null
+  });
+
+  const flushPersistence = async () => {
+    if (loadError) await ensureReady();
+    while (persistQueued || persistPromise) await persist();
   };
 
   const mergeImages = (tabId, images = []) => {
@@ -695,6 +753,17 @@ export const createTabStateManager = () => {
       }
 
       indexImage(state, image, existingId);
+      const existingKeys = new Set(imageLookupKeys(existing));
+      const aliases = [...new Set([...existingKeys, ...imageLookupKeys(image)])];
+      const candidateUrls = normalizeCandidateUrls([...image.candidateUrls, ...existing.candidateUrls]);
+      const shouldUpdateAliases = aliases.some((alias) => !existingKeys.has(alias));
+      const shouldUpdateCandidates = candidateUrls.some((url) => !existing.candidateUrls.includes(url));
+      const hdSrc = shouldUpgradeHdSrc(existing, image) ? image.hdSrc : existing.hdSrc;
+      const hdSrcVerified = hdSrc === existing.hdSrc ? existing.hdSrcVerified : image.hdSrcVerified;
+      const format = existing.formatTrusted
+        ? existing.format
+        : image.format !== "unknown" ? image.format : existing.format;
+      const formatTrusted = existing.formatTrusted || image.formatTrusted;
 
       const shouldReplace =
         image.area > existing.area ||
@@ -702,20 +771,19 @@ export const createTabStateManager = () => {
 
       if (shouldReplace) {
         const maxDimensions = mergeMaxDimensions(existing, image);
-        const incomingFormat = String(image.format || "").toLowerCase();
-        const existingFormat = String(existing.format || "").toLowerCase();
         const merged = {
           ...existing,
           ...image,
           id: existingId,
-          format:
-            incomingFormat && incomingFormat !== "unknown"
-              ? image.format
-              : existingFormat && existingFormat !== "unknown"
-                ? existing.format
-                : "unknown",
+          normalized: existing.normalized,
+          aliases,
+          candidateUrls,
+          hdSrc,
+          hdSrcVerified,
+          format,
+          formatTrusted,
           ...maxDimensions,
-          ...preserveHdState(existing, image),
+          ...preserveHdState(existing, { ...image, hdSrc }),
           ...mergeComicPageMetadata(existing, image)
         };
         merged.sourceUrl = pickPreferredSourceUrl(existing.sourceUrl, image.sourceUrl);
@@ -739,15 +807,20 @@ export const createTabStateManager = () => {
         shouldUpgradeFormat ||
         shouldUpdateComicMetadata ||
         shouldUpdateMaxDimensions ||
-        shouldUpdateHdSrc
+        shouldUpdateHdSrc ||
+        shouldUpdateAliases ||
+        shouldUpdateCandidates
       ) {
-        const hdSrc = shouldUpdateHdSrc ? image.hdSrc : existing.hdSrc;
-        const preservedHdState = preserveHdState(existing, { ...image, hdSrc });
+        const preservedHdState = preserveHdState(existing, { ...existing, hdSrc });
         const merged = {
           ...existing,
           sourceUrl: preferredSource || existing.sourceUrl,
           format: shouldUpgradeFormat ? image.format : existing.format,
+          formatTrusted: shouldUpgradeFormat ? image.formatTrusted : existing.formatTrusted,
           hdSrc,
+          hdSrcVerified,
+          aliases,
+          candidateUrls,
           ...maxDimensions,
           ...preservedHdState,
           ...mergeComicPageMetadata(existing, image)
@@ -771,8 +844,27 @@ export const createTabStateManager = () => {
     if (!state) return [];
     return Array.from(state.images.values()).map((image) => ({
       ...image,
+      collectionId: state.collectionId,
       hidden: state.hiddenIds.has(image.id)
     }));
+  };
+
+  const getCollectionId = (tabId) => tabStates.get(tabId)?.collectionId || '';
+  const getImageById = (tabId, imageId) => {
+    const state = tabStates.get(tabId);
+    const image = state?.images.get(imageId);
+    return image ? { ...image, collectionId: state.collectionId } : null;
+  };
+  const getImageRequestSource = (tabId, url) => {
+    const state = tabStates.get(tabId);
+    const sources = state?.requestSourcesByUrl.get(String(url || ''));
+    if (!sources?.size) return { found: false, ambiguous: false, sourceUrl: '' };
+    const known = sources.size - (sources.has('') ? 1 : 0);
+    const pageOrigin = requestOrigin(state.pageUrl);
+    const unknownAddsOrigin = sources.has('') && pageOrigin && !sources.has(pageOrigin);
+    if (known + (unknownAddsOrigin ? 1 : 0) > 1) return { found: true, ambiguous: true, sourceUrl: '' };
+    for (const [origin, source] of sources) if (origin) return { found: true, ambiguous: false, sourceUrl: source.sourceUrl };
+    return { found: true, ambiguous: false, sourceUrl: pageOrigin ? state.pageUrl : '' };
   };
 
   const getPageUrl = (tabId) => {
@@ -801,7 +893,7 @@ export const createTabStateManager = () => {
     } else {
       state.selectedIds.add(imageId);
     }
-    schedulePersist();
+    schedulePersist(true);
     return Array.from(state.selectedIds);
   };
 
@@ -820,7 +912,7 @@ export const createTabStateManager = () => {
         changed = state.selectedIds.delete(imageId) || changed;
       }
     }
-    if (changed) schedulePersist();
+    if (changed) schedulePersist(true);
     return Array.from(state.selectedIds);
   };
 
@@ -830,6 +922,7 @@ export const createTabStateManager = () => {
     const selected = Array.from(state.selectedIds)
       .map((imageId) => state.images.get(imageId))
       .filter(Boolean)
+      .map(image => ({ ...image, collectionId: state.collectionId }))
       .sort((a, b) => b.area - a.area);
     if (!Array.isArray(orderedImageIds) || orderedImageIds.length === 0) {
       return selected;
@@ -867,7 +960,7 @@ export const createTabStateManager = () => {
         changed = state.hiddenIds.delete(imageId) || changed;
       }
     }
-    if (changed) schedulePersist();
+    if (changed) schedulePersist(true);
     return Array.from(state.hiddenIds);
   };
 
@@ -877,7 +970,7 @@ export const createTabStateManager = () => {
     const changed = Object.entries(patch).some(([key, value]) => state.config[key] !== value);
     if (changed) {
       state.config = { ...state.config, ...patch };
-      schedulePersist();
+      schedulePersist(true);
     }
     return { ...state.config };
   };
@@ -943,9 +1036,9 @@ export const createTabStateManager = () => {
     }
   };
 
-  const markHdRejected = (tabId, imageId, rejected = true) => {
+  const markHdRejected = (tabId, imageId, rejected = true, collectionId) => {
     const state = tabStates.get(tabId);
-    if (!state) return;
+    if (!state || !collectionId || collectionId !== state.collectionId) return;
     const image = state.images.get(imageId);
     if (!image) return;
     const nextRejected = Boolean(rejected);
@@ -959,6 +1052,7 @@ export const createTabStateManager = () => {
   const updateImageMetadata = (tabId, metadata = {}) => {
     const state = tabStates.get(tabId);
     if (!state) return { updated: false };
+    if (!metadata.collectionId || metadata.collectionId !== state.collectionId) return { updated: false, stale: true, collectionId: state.collectionId };
 
     const requestedId = String(metadata.imageId || metadata.id || "").trim();
     const loadedUrl = String(metadata.url || metadata.src || metadata.displaySrc || "").trim();
@@ -976,9 +1070,11 @@ export const createTabStateManager = () => {
       area: existing.area,
       maxWidth: metadata.maxWidth ?? metadata.width,
       maxHeight: metadata.maxHeight ?? metadata.height,
-      maxArea: metadata.maxArea ?? metadata.area
-    };
-    const existingMax = normalizeMaxDimensions(existing);
+        maxArea: metadata.maxArea ?? metadata.area
+      };
+      const measuredArea = Math.max(0, Number(incomingDimensions.maxWidth) || 0) *
+        Math.max(0, Number(incomingDimensions.maxHeight) || 0);
+      const existingMax = normalizeMaxDimensions(existing);
     const maxDimensions = mergeMaxDimensions(existing, incomingDimensions);
     const shouldUpdateMaxDimensions = maxDimensions.maxArea > existingMax.maxArea;
 
@@ -992,6 +1088,7 @@ export const createTabStateManager = () => {
         existingFormat === "unknown" ||
         (formatTrusted && incomingFormat !== existingFormat)
       );
+    const shouldTrustFormat = formatTrusted && incomingFormat && incomingFormat !== "unknown" && !existing.formatTrusted;
 
     const isUsableLoadedImageUrl =
       loadedUrl &&
@@ -999,15 +1096,22 @@ export const createTabStateManager = () => {
       !/^blob:/i.test(loadedUrl) &&
       !/^chrome-extension:/i.test(loadedUrl) &&
       loadedUrl !== existing.src;
-    const shouldUpdateHdSrc =
+      // A larger-than-layout thumbnail cannot disprove an HD candidate that has not been measured.
+      const comparedCurrentHd = metadata.comparedHdSrc === existing.hdSrc &&
+        measuredArea >= existingMax.maxArea;
+      const primaryBecameLargest = loadedUrl === existing.src && existing.hdSrc && existing.hdSrc !== existing.src &&
+        ((shouldUpdateMaxDimensions && existing.hdSrcVerified === true) || comparedCurrentHd);
+    const shouldUpdateHdSrc = primaryBecameLargest || (
       isUsableLoadedImageUrl &&
       (
         shouldUpdateMaxDimensions ||
-        !existing.hdSrc ||
-        existing.hdSrc === existing.src
-      );
+          ((!existing.hdSrc || existing.hdSrc === existing.src) &&
+            measuredArea >= existingMax.maxArea)
+      ));
+    const shouldVerifyHdSrc = isUsableLoadedImageUrl &&
+      (shouldUpdateHdSrc || loadedUrl === existing.hdSrc) && !existing.hdSrcVerified;
 
-    if (!shouldUpdateMaxDimensions && !shouldUpgradeFormat && !shouldUpdateHdSrc) {
+    if (!shouldUpdateMaxDimensions && !shouldUpgradeFormat && !shouldUpdateHdSrc && !shouldTrustFormat && !shouldVerifyHdSrc) {
       return { updated: false, image: existing };
     }
 
@@ -1016,7 +1120,9 @@ export const createTabStateManager = () => {
       ...existing,
       ...maxDimensions,
       hdSrc,
+      hdSrcVerified: shouldVerifyHdSrc || existing.hdSrcVerified,
       format: shouldUpgradeFormat ? incomingFormat : existing.format,
+      formatTrusted: shouldTrustFormat || existing.formatTrusted,
       ...preserveHdState(existing, { ...existing, hdSrc })
     };
 
@@ -1030,12 +1136,9 @@ export const createTabStateManager = () => {
   const clearTabImages = (tabId) => {
     const state = tabStates.get(tabId);
     if (!state) return;
-    const changed =
-      state.images.size > 0 ||
-      state.selectedIds.size > 0 ||
-      state.hiddenIds.size > 0 ||
-      state.lastScanTime !== null;
-    if (!changed) return;
+    state.collectionId = createCollectionId();
+    state.requestSourcesByUrl.clear();
+    state.requestKeysByImage.clear();
     state.images.clear();
     state.imagesByNormalized.clear();
     state.imagesByHdSrc.clear();
@@ -1047,9 +1150,14 @@ export const createTabStateManager = () => {
 
   return {
     ensureReady,
+    getPersistenceStatus,
+    flushPersistence,
     initTabState,
     mergeImages,
     getAllImages,
+    getCollectionId,
+    getImageById,
+    getImageRequestSource,
     getPageUrl,
     hasTabState,
     setPageUrl,

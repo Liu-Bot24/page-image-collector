@@ -2,7 +2,6 @@ export const normalizeDnrHostname = (hostname) => {
   const normalized = String(hostname || "").trim().replace(/\.$/, "").toLowerCase();
   if (!normalized) return "";
   if (!/^[a-z0-9.-]+$/i.test(normalized)) return "";
-  if (!normalized.includes(".")) return "";
   return normalized;
 };
 
@@ -95,6 +94,9 @@ export const buildRefererModifyRule = ({
   id,
   hostname,
   refererOrigin,
+  tabIds,
+  initiatorDomains,
+  regexFilter,
   resourceTypes = ["image", "xmlhttprequest", "media", "other"],
   priority = 1
 } = {}) => {
@@ -128,7 +130,10 @@ export const buildRefererModifyRule = ({
     },
     condition: {
       requestDomains: [requestDomain],
-      resourceTypes: [...resourceTypes]
+      resourceTypes: [...resourceTypes],
+      ...(Array.isArray(tabIds) && tabIds.length ? { tabIds: [...new Set(tabIds)] } : {}),
+      ...(Array.isArray(initiatorDomains) && initiatorDomains.length ? { initiatorDomains: [...new Set(initiatorDomains)] } : {}),
+      ...(regexFilter ? { regexFilter, isUrlFilterCaseSensitive: true } : {})
     }
   };
 };
@@ -152,12 +157,16 @@ const isEquivalentRefererRule = (actual, expected) => {
   const actualAction = actual?.action || {};
   const actualCondition = actual?.condition || {};
   const allowedActionKeys = new Set(["type", "requestHeaders"]);
-  const allowedConditionKeys = new Set(["requestDomains", "resourceTypes"]);
+  const allowedConditionKeys = new Set(["requestDomains", "resourceTypes", "tabIds", "initiatorDomains", "regexFilter", "isUrlFilterCaseSensitive"]);
   if (Object.keys(actualAction).some((key) => !allowedActionKeys.has(key))) return false;
   if (Object.keys(actualCondition).some((key) => !allowedConditionKeys.has(key))) return false;
 
   return (
     Number(actual?.id) === Number(expected?.id) &&
+    JSON.stringify(sortedStrings(actualCondition.tabIds, String)) === JSON.stringify(sortedStrings(expected?.condition?.tabIds, String)) &&
+    JSON.stringify(sortedStrings(actualCondition.initiatorDomains)) === JSON.stringify(sortedStrings(expected?.condition?.initiatorDomains)) &&
+    String(actualCondition.regexFilter || "") === String(expected?.condition?.regexFilter || "") &&
+    Boolean(actualCondition.isUrlFilterCaseSensitive) === Boolean(expected?.condition?.isUrlFilterCaseSensitive) &&
     (Number(actual?.priority) || 1) === (Number(expected?.priority) || 1) &&
     String(actualAction.type || "") === String(expected?.action?.type || "") &&
     JSON.stringify(normalizeRequestHeaders(actualAction.requestHeaders)) ===
@@ -199,6 +208,9 @@ export const reconcileRefererRuleSet = ({
         id: ruleId,
         hostname: record.hostname,
         refererOrigin: record.sourceOrigin,
+        tabIds: record.tabIds,
+        initiatorDomains: record.initiatorDomains,
+        regexFilter: record.regexFilter,
         resourceTypes
       }));
     } catch (_error) {

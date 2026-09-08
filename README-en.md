@@ -21,7 +21,7 @@ A Chrome extension for daily browsing scenarios, used to quickly collect web pag
 ### Install from GitHub Releases
 
 1. Go to the project's `Releases` page.
-2. Download the unpacked zip for the corresponding version, e.g., `page-image-collector-1.2.8-unpacked.zip`.
+2. Download the unpacked zip for the corresponding version, e.g., `page-image-collector-1.2.9-unpacked.zip`.
 3. Open `chrome://extensions/`.
 4. Enable "Developer mode".
 5. Unzip the downloaded ZIP file.
@@ -31,6 +31,17 @@ A Chrome extension for daily browsing scenarios, used to quickly collect web pag
 ## Documentation
 
 - Privacy Policy: [PRIVACY.md](./PRIVACY.md)
+
+## What's New in 1.2.9
+
+- Fixed images remaining at thumbnail dimensions and mismatches between dimensions and image URLs, keeping large-image metadata consistent across Popup, Workspace, and previews.
+- Improved original-image fallback and retries so unfinished probes survive fallback selection, fullscreen previews, and gallery refreshes without losing late large-image results.
+- Improved browsing and interaction performance for large collections by reducing selection, visibility, and configuration save overhead, reusing virtual list nodes, and reducing long-page scan stalls.
+- Fixed missed images during drag selection across virtual grid windows, including scrolling while dragging, reverse dragging, and shrinking the selection area.
+- Improved batch download and ZIP reliability with progress based on actual download outcomes, better cancellation, background recovery, and fallback handling, and smaller recovery records for large images.
+- Improved candidate fallback and anti-hotlinking compatibility across cards, lightbox, and fullscreen, reducing interference between workspaces and ending loading clearly when every candidate fails.
+- Improved state isolation across clearing, rescanning, page navigation, and comic chapter changes so stale results cannot overwrite new records and selection, visibility, and pagination remain consistent.
+- Improved dynamic image and background collection by preserving loaded URLs and candidates, accepting dimension and format updates for existing URLs, and reducing incorrect image merges.
 
 ## What's New in 1.2.8
 

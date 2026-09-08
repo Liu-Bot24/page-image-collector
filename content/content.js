@@ -237,9 +237,9 @@ const parseSrcsetLegacyUrl = (srcset) => {
 const parseSrcsetUrls = (srcset) => {
   if (!srcset || typeof srcset !== "string") return [];
   const legacyUrl = parseSrcsetLegacyUrl(srcset);
+  const legacyUrls = splitSrcsetCandidates(srcset).map((item) => item.trim().split(/\s+/, 1)[0]);
   const vendorUrls = globalThis.PageImageCollectorParsers?.parseSrcsetUrls?.(srcset);
-  const vendorBestUrl = Array.isArray(vendorUrls) ? vendorUrls[0] : null;
-  return mergeUrlLists(legacyUrl, vendorBestUrl);
+  return mergeUrlLists(legacyUrl, vendorUrls, legacyUrls);
 };
 
 const getHDUrl = (url) => {
@@ -1363,8 +1363,8 @@ const collectNodeImageCandidates = (node) => {
   return candidates;
 };
 
-const getAnchorImageCandidate = (element) => {
-  if (!element) return null;
+const getAnchorImageCandidates = (element) => {
+  if (!element) return [];
 
   const candidates = [];
   const pushFromNode = (node) => {
@@ -1388,7 +1388,7 @@ const getAnchorImageCandidate = (element) => {
   }
 
   const picked = chooseBestSource(candidates);
-  return picked || null;
+  return mergeUrlLists(picked, candidates);
 };
 
 const measureElement = (element) => {
@@ -1411,6 +1411,7 @@ const measureElement = (element) => {
 
 const collectShadowRoots = (root, out = []) => {
   out.push(root);
+  if (root.shadowRoot) collectShadowRoots(root.shadowRoot, out);
   const elements = root.querySelectorAll?.("*") || [];
   for (const element of elements) {
     if (element.shadowRoot) {
@@ -1421,10 +1422,10 @@ const collectShadowRoots = (root, out = []) => {
 };
 
 const extractFromImg = (element) => {
-  const anchorCandidate = getAnchorImageCandidate(element);
+  const anchorCandidates = getAnchorImageCandidates(element);
   const hintedCandidates = collectNodeImageCandidates(element);
   const srcCandidates = [
-    anchorCandidate,
+    ...anchorCandidates,
     ...hintedCandidates,
     element.getAttribute("data-original"),
     element.getAttribute("data-original-src"),
@@ -1449,6 +1450,8 @@ const extractFromImg = (element) => {
   if (isTelegramNoiseElement(element, src, width, height)) return null;
   return {
     src,
+    originalSrc: getLoadedImageSource(element) || src,
+    candidateUrls: srcCandidates,
     width,
     height,
     source: "img",
@@ -1460,7 +1463,7 @@ const extractFromImg = (element) => {
 const extractFromPicture = (element) => {
   const sourceSets = Array.from(element.querySelectorAll("source"));
   const image = element.querySelector("img");
-  const anchorCandidate = getAnchorImageCandidate(element);
+  const anchorCandidates = getAnchorImageCandidates(element);
   const sourceCandidates = sourceSets.flatMap((source) => [
     ...parseSrcsetUrls(source.getAttribute("srcset") || source.srcset),
     ...parseSrcsetUrls(source.getAttribute("data-srcset")),
@@ -1472,7 +1475,7 @@ const extractFromPicture = (element) => {
   ];
 
   const srcCandidates = [
-    anchorCandidate,
+    ...anchorCandidates,
     ...sourceCandidates,
     ...hintedCandidates,
     image?.getAttribute("data-original"),
@@ -1497,6 +1500,8 @@ const extractFromPicture = (element) => {
   if (isTelegramNoiseElement(image || element, src, width, height)) return null;
   return {
     src,
+    originalSrc: getLoadedImageSource(image) || src,
+    candidateUrls: srcCandidates,
     width,
     height,
     source: "picture",
@@ -1572,6 +1577,7 @@ const extractFromBackground = (element) => {
   if (isTelegramNoiseElement(element, src, width, height)) return null;
   return {
     src,
+    candidateUrls: [...inlineCandidates, ...computedCandidates],
     width,
     height,
     source: "background",
@@ -1626,6 +1632,14 @@ const extractFromXhsScripts = (root) => {
   return imageRecords;
 };
 
+const getLoadedImageSource = (element) => {
+  for (const value of [element?.currentSrc, element?.src, element?.getAttribute?.("src")]) {
+    const url = absoluteUrl(value);
+    if (url && !isInvalidSource(url)) return url;
+  }
+  return null;
+};
+
 const normalizeImageRecord = (record) => {
   if (!record?.src) return null;
   let normalized = normalizeUrl(record.src);
@@ -1635,18 +1649,20 @@ const normalizeImageRecord = (record) => {
   const height = Number(record.height) || 0;
   const area = Math.max(Number(record.area) || 0, width * height);
   const hdSrc = getHDUrl(record.src);
+  const originalSrc = absoluteUrl(record.originalSrc) || record.src;
+  const candidateUrls = mergeUrlLists(hdSrc, record.src, record.candidateUrls, originalSrc)
+    .map(absoluteUrl)
+    .filter((url) => url && !isInvalidSource(url));
   const sourceUrl = normalizeSourceUrl(record.sourceUrl) || getCurrentPageSourceUrl();
   const telegramKey = String(record.telegramKey || "");
 
   if (isTelegramSite() && isTelegramBlobUrl(record.src)) {
-    if (telegramKey) {
+    if (/^[^:|]+:(?:\d+:(?:m|i):[^|]+|x:[^|]+)$/.test(telegramKey)) {
       // Keep telegram dedupe stable across source-url refinements.
       normalized = `tg:generic|${telegramKey}`;
     } else {
-      const shortEdge = Math.min(width || 0, height || 0);
-      const longEdge = Math.max(width || 0, height || 0);
-      const ratioBucket = longEdge > 0 ? Math.round((shortEdge / longEdge) * 100) : 0;
-      normalized = `tg:generic|${ratioBucket}|${Math.round(shortEdge / 20) * 20}x${Math.round(longEdge / 20) * 20}`;
+      // Dimensions and aspect ratios cannot identify distinct message media.
+      normalized = record.src;
     }
   }
 
@@ -1662,7 +1678,8 @@ const normalizeImageRecord = (record) => {
     id: imageIdFromNormalized(normalized),
     normalized,
     src: record.src,
-    originalSrc: record.src,
+    originalSrc,
+    candidateUrls: mergeUrlLists(candidateUrls),
     hdSrc,
     sourceUrl,
     width,
@@ -1860,18 +1877,20 @@ const expandSourceToImages = async (sourceUrl, signal = null) => {
   return buildDeepImageRecords(urls, sourceUrl, "source-deep");
 };
 
+const mergeScannedImage = (existing, incoming) => {
+  if (!existing) return incoming;
+  const preferred = (Number(incoming.area) || 0) > (Number(existing.area) || 0) ? incoming : existing;
+  return {
+    ...preferred,
+    candidateUrls: mergeUrlLists(existing.candidateUrls, incoming.candidateUrls)
+  };
+};
+
 const mergeImageLists = (baseImages = [], extraImages = []) => {
   const map = new Map();
   for (const image of [...baseImages, ...extraImages]) {
     if (!image?.normalized) continue;
-    const existing = map.get(image.normalized);
-    if (!existing) {
-      map.set(image.normalized, image);
-      continue;
-    }
-    if ((Number(image.area) || 0) > (Number(existing.area) || 0)) {
-      map.set(image.normalized, image);
-    }
+    map.set(image.normalized, mergeScannedImage(map.get(image.normalized), image));
   }
   return Array.from(map.values());
 };
@@ -1917,7 +1936,7 @@ const processDeepSourceQueue = () => {
         deepSourceFailureUntil.delete(sourceUrl);
         deepSourceCache.set(sourceUrl, safeImages);
 
-        const freshImages = safeImages.filter((image) => image?.normalized && !knownNormalizedUrls.has(image.normalized));
+        const freshImages = safeImages.filter(hasImageMetadataUpdate);
         if (freshImages.length === 0) return;
 
         const acked = await sendIncrementalToBackground(freshImages, generation);
@@ -1990,7 +2009,22 @@ const scheduleDeepExpansionFromScan = (images = []) => {
   processDeepSourceQueue();
 };
 
-const scanImagesFromRoots = (roots = [], options = {}) => {
+// MessageChannel yields a task without animation-frame or background timer throttling.
+const yieldScanTask = () => new Promise(resolve => {
+  const channel = new MessageChannel();
+  channel.port1.onmessage = () => {
+    channel.port1.close(); channel.port2.close(); resolve();
+  };
+  channel.port2.postMessage(null);
+});
+
+const scanImagesFromRoots = async (roots = [], options = {}) => {
+  const generation = runtimeCacheGeneration;
+  const isCurrent = () => generation === runtimeCacheGeneration && (!options.isCurrent || options.isCurrent());
+  let batchCount = 0;
+  let batchStart = performance.now();
+  const needsYield = () => ++batchCount % 32 === 0 && performance.now() - batchStart >= 8;
+  const pause = async () => { await yieldScanTask(); batchStart = performance.now(); };
   const includeBackground = options.includeBackground !== false;
   const includeScriptExtraction = options.includeScriptExtraction === true;
   const maxBgScanPerScope = Number(options.maxBgScanPerScope) > 0
@@ -2002,6 +2036,7 @@ const scanImagesFromRoots = (roots = [], options = {}) => {
   for (const rootNode of roots) {
     if (!rootNode || typeof rootNode.querySelectorAll !== "function") continue;
     const scopes = collectShadowRoots(rootNode);
+    observeAutoScanShadowRoots(scopes);
 
     for (const scope of scopes) {
       const imageElements = [];
@@ -2011,6 +2046,7 @@ const scanImagesFromRoots = (roots = [], options = {}) => {
       imageElements.push(...scope.querySelectorAll("img, picture"));
 
       for (const element of imageElements) {
+        if (needsYield()) { await pause(); if (!isCurrent()) return []; }
         const extracted =
           element.tagName === "PICTURE"
             ? extractFromPicture(element)
@@ -2019,9 +2055,7 @@ const scanImagesFromRoots = (roots = [], options = {}) => {
         if (!normalizedRecord) continue;
 
         const existing = imageMap.get(normalizedRecord.normalized);
-        if (!existing || normalizedRecord.area > existing.area) {
-          imageMap.set(normalizedRecord.normalized, normalizedRecord);
-        }
+        imageMap.set(normalizedRecord.normalized, mergeScannedImage(existing, normalizedRecord));
       }
 
       if (includeBackground) {
@@ -2032,13 +2066,12 @@ const scanImagesFromRoots = (roots = [], options = {}) => {
         bgElements.push(...scope.querySelectorAll("*"));
         const maxBgScan = Math.min(bgElements.length, maxBgScanPerScope);
         for (let i = 0; i < maxBgScan; i += 1) {
+          if (needsYield()) { await pause(); if (!isCurrent()) return []; }
           const extracted = extractFromBackground(bgElements[i]);
           const normalizedRecord = normalizeImageRecord(extracted);
           if (!normalizedRecord) continue;
           const existing = imageMap.get(normalizedRecord.normalized);
-          if (!existing || normalizedRecord.area > existing.area) {
-            imageMap.set(normalizedRecord.normalized, normalizedRecord);
-          }
+          imageMap.set(normalizedRecord.normalized, mergeScannedImage(existing, normalizedRecord));
         }
       }
 
@@ -2048,9 +2081,7 @@ const scanImagesFromRoots = (roots = [], options = {}) => {
           const normalizedRecord = normalizeImageRecord(extracted);
           if (!normalizedRecord) continue;
           const existing = imageMap.get(normalizedRecord.normalized);
-          if (!existing || normalizedRecord.area > existing.area) {
-            imageMap.set(normalizedRecord.normalized, normalizedRecord);
-          }
+          imageMap.set(normalizedRecord.normalized, mergeScannedImage(existing, normalizedRecord));
         }
       }
     }
@@ -2059,12 +2090,15 @@ const scanImagesFromRoots = (roots = [], options = {}) => {
   return Array.from(imageMap.values());
 };
 
-const scanImages = () => {
-  const scanned = scanImagesFromRoots([document], {
+const scanImages = async (options = {}) => {
+  const generation = runtimeCacheGeneration;
+  const scanned = await scanImagesFromRoots([document], {
+    ...options,
     includeBackground: true,
     includeScriptExtraction: true,
     maxBgScanPerScope: 6000
   });
+  if (generation !== runtimeCacheGeneration || (options.isCurrent && !options.isCurrent())) return [];
   // Telegram blob URLs are volatile; forced HD pairing can produce wrong mappings.
   // Keep scan result conservative and avoid cross-item HD reassignment.
   scheduleDeepExpansionFromScan(scanned);
@@ -2515,9 +2549,18 @@ let autoScanTimer = null;
 const autoScanRetryTimers = new Set();
 let autoScanDirty = false;
 const knownNormalizedUrls = new Set();
+const knownImageMetadata = new Map();
 const autoScanMutationRoots = new Set();
+let autoScanSession = 0;
+let autoScanInFlight = null;
+let autoScanBaselinePending = false;
+const autoScanObservedRoots = new Set();
 let autoScrollEnabled = false;
 let autoScrollTimer = null;
+let autoScrollObservationTimer = null;
+let autoScrollAnimationFrame = null;
+let autoScrollDeadlineTimer = null;
+let autoScrollRunId = 0;
 let autoScrollStallCount = 0;
 let autoScrollIdleCount = 0;
 let autoScrollLastHeight = 0;
@@ -2544,6 +2587,8 @@ let autoScrollProgrammaticUntil = 0;
 let autoScrollUserIntentUntil = 0;
 let autoScrollIgnoreUserInterrupt = false;
 const AUTO_SCROLL_INTERVAL_MS = 680;
+const AUTO_SCROLL_OBSERVATION_FALLBACK_MS = 150;
+const AUTO_SCROLL_MAX_DURATION_MS = 5 * 60 * 1000;
 const AUTO_SCROLL_SETTLE_INTERVAL_MS = 980;
 const AUTO_SCROLL_STEP_MIN = 280;
 const AUTO_SCROLL_STEP_MAX = 620;
@@ -2566,10 +2611,20 @@ const AUTO_SCROLL_ROOT_MUTATION_RESCAN_MS = 1200;
 const COMIC_SEQUENCE_COUNT_CACHE_MS = 2500;
 const COMIC_SEQUENCE_COUNT_MUTATION_CACHE_MS = 800;
 
+const imageMetadataSignature = (image) => JSON.stringify([
+  image.src, image.originalSrc, image.hdSrc, image.sourceUrl,
+  Number(image.width) || 0, Number(image.height) || 0, Number(image.area) || 0,
+  image.format, [...new Set(image.candidateUrls || [])].sort()
+]);
+
+const hasImageMetadataUpdate = (image) => image?.normalized &&
+  knownImageMetadata.get(image.normalized) !== imageMetadataSignature(image);
+
 const recordKnownImages = (images) => {
   for (const image of images) {
     if (image.normalized) {
       knownNormalizedUrls.add(image.normalized);
+      knownImageMetadata.set(image.normalized, imageMetadataSignature(image));
     }
   }
 };
@@ -2579,6 +2634,9 @@ const resetRuntimeCaches = () => {
   sourceContainerCache = new WeakMap();
   sourceElementCache = new WeakMap();
   knownNormalizedUrls.clear();
+  knownImageMetadata.clear();
+  autoScanInFlight = null;
+  autoScanBaselinePending = autoScanEnabled;
   autoScanMutationRoots.clear();
   deepSourceCache.clear();
   deepSourceQueue.length = 0;
@@ -2600,6 +2658,13 @@ const resetRuntimeCaches = () => {
   return runtimeCacheGeneration;
 };
 
+const scanRootContains = (ancestor, node) => {
+  for (let current = node; current; current = current.getRootNode?.()?.host) {
+    if (ancestor === current || ancestor.contains?.(current)) return true;
+  }
+  return false;
+};
+
 const addAutoScanMutationRoot = (node) => {
   if (!node) return;
   if (
@@ -2609,7 +2674,11 @@ const addAutoScanMutationRoot = (node) => {
   ) {
     return;
   }
-  if (autoScanMutationRoots.size > 48) {
+  for (const existing of autoScanMutationRoots) {
+    if (scanRootContains(existing, node)) return;
+    if (scanRootContains(node, existing)) autoScanMutationRoots.delete(existing);
+  }
+  if (autoScanMutationRoots.size >= 48) {
     autoScanMutationRoots.clear();
     autoScanMutationRoots.add(document);
     return;
@@ -2633,7 +2702,7 @@ const sendIncrementalToBackground = async (images, generation = runtimeCacheGene
       type: MSG.INCREMENTAL_SCAN,
       payload: { images, runtimeGeneration: generation }
     });
-    return response?.success !== false;
+    return response?.success === true;
   } catch {
     return false;
   }
@@ -2641,40 +2710,61 @@ const sendIncrementalToBackground = async (images, generation = runtimeCacheGene
 
 const pushIncrementalImages = async () => {
   const generation = runtimeCacheGeneration;
-  const changedRoots = consumeAutoScanMutationRoots();
-  const scanned = scanImagesFromRoots(changedRoots, {
-    includeBackground: true,
-    includeScriptExtraction: false,
-    maxBgScanPerScope: 1200
-  });
-  if (scanned.length === 0) return;
-
-  scheduleDeepExpansionFromScan(scanned);
-  const merged = mergeImageLists(scanned, getCachedDeepImagesForScan(scanned));
-  const newImages = merged.filter((image) => image?.normalized && !knownNormalizedUrls.has(image.normalized));
-  if (newImages.length === 0) return;
-
-  const acked = await sendIncrementalToBackground(newImages, generation);
-  if (generation !== runtimeCacheGeneration) return;
-  if (acked) {
-    recordKnownImages(newImages);
+  const session = autoScanSession;
+  if (autoScanInFlight) {
+    autoScanDirty = true;
     return;
   }
+  const token = { generation, session };
+  autoScanInFlight = token;
+  try {
+    const changedRoots = consumeAutoScanMutationRoots();
+    const isCurrent = () => generation === runtimeCacheGeneration && session === autoScanSession;
+    const scanned = await (autoScanBaselinePending ? scanImages({ isCurrent }) : scanImagesFromRoots(changedRoots, {
+      isCurrent,
+      includeBackground: true,
+      includeScriptExtraction: false,
+      maxBgScanPerScope: 1200
+    }));
+    if (!isCurrent()) return;
+    scheduleDeepExpansionFromScan(scanned);
+    const merged = mergeImageLists(scanned, getCachedDeepImagesForScan(scanned));
+    const newImages = merged.filter(hasImageMetadataUpdate);
+    if (newImages.length === 0) {
+      autoScanBaselinePending = false;
+      return;
+    }
 
-  addAutoScanMutationRoot(document);
-  const retryTimer = setTimeout(() => {
-    autoScanRetryTimers.delete(retryTimer);
-    if (generation !== runtimeCacheGeneration) return;
-    if (!autoScanEnabled) return;
-    scheduleIncrementalScan();
-  }, 1200);
-  autoScanRetryTimers.add(retryTimer);
+    const acked = await sendIncrementalToBackground(newImages, generation);
+    if (generation !== runtimeCacheGeneration || session !== autoScanSession) return;
+    if (acked) {
+      recordKnownImages(newImages);
+      autoScanBaselinePending = false;
+      return;
+    }
+
+    addAutoScanMutationRoot(document);
+    if (autoScanRetryTimers.size === 0) {
+      const retryTimer = setTimeout(() => {
+        autoScanRetryTimers.delete(retryTimer);
+        if (generation !== runtimeCacheGeneration || session !== autoScanSession) return;
+        if (!autoScanEnabled) return;
+        scheduleIncrementalScan();
+      }, 1200);
+      autoScanRetryTimers.add(retryTimer);
+    }
+  } finally {
+    if (autoScanInFlight === token) {
+      autoScanInFlight = null;
+      if (autoScanDirty) scheduleIncrementalScan();
+    }
+  }
 };
 
 const scheduleIncrementalScan = () => {
   if (!autoScanEnabled) return;
   autoScanDirty = true;
-  if (autoScanTimer) return;
+  if (autoScanTimer || autoScanInFlight) return;
   autoScanTimer = setTimeout(() => {
     autoScanTimer = null;
     if (!autoScanEnabled) return;
@@ -2697,6 +2787,7 @@ const AUTO_SCAN_ATTRIBUTE_FILTER = [
   "src",
   "srcset",
   "style",
+  "class",
   "data-src",
   "data-srcset",
   "data-original",
@@ -2715,13 +2806,32 @@ const AUTO_SCAN_ATTRIBUTE_FILTER = [
   "data-highres"
 ];
 
+const observeAutoScanShadowRoots = (roots) => {
+  if (!autoScanObserver) return;
+  for (const root of roots) {
+    if (!(root instanceof ShadowRoot) || autoScanObservedRoots.has(root)) continue;
+    autoScanObserver.observe(root, {
+      childList: true, subtree: true, attributes: true,
+      attributeFilter: AUTO_SCAN_ATTRIBUTE_FILTER
+    });
+    root.addEventListener("load", handleAutoScanImageLoad, true);
+    autoScanObservedRoots.add(root);
+  }
+};
+
+const handleAutoScanImageLoad = (event) => {
+  if (!autoScanEnabled || event.target?.tagName !== "IMG") return;
+  addAutoScanMutationRoot(event.target);
+  scheduleIncrementalScan();
+};
+
 const startAutoScan = () => {
   if (autoScanEnabled) return;
   autoScanEnabled = true;
+  autoScanSession += 1;
+  autoScanBaselinePending = true;
   autoScanMutationRoots.clear();
-
-  const baseline = scanImages();
-  recordKnownImages(baseline);
+  document.addEventListener("load", handleAutoScanImageLoad, true);
 
   autoScanObserver = new MutationObserver((mutations) => {
     let hasRelevantMutation = false;
@@ -2752,10 +2862,17 @@ const startAutoScan = () => {
     attributes: true,
     attributeFilter: AUTO_SCAN_ATTRIBUTE_FILTER
   });
+  void pushIncrementalImages();
 };
 
 const stopAutoScan = () => {
   autoScanEnabled = false;
+  autoScanSession += 1;
+  autoScanInFlight = null;
+  autoScanBaselinePending = false;
+  document.removeEventListener("load", handleAutoScanImageLoad, true);
+  for (const root of autoScanObservedRoots) root.removeEventListener("load", handleAutoScanImageLoad, true);
+  autoScanObservedRoots.clear();
   if (autoScanObserver) {
     autoScanObserver.disconnect();
     autoScanObserver = null;
@@ -2764,6 +2881,8 @@ const stopAutoScan = () => {
     clearTimeout(autoScanTimer);
     autoScanTimer = null;
   }
+  for (const retryTimer of autoScanRetryTimers) clearTimeout(retryTimer);
+  autoScanRetryTimers.clear();
   autoScanDirty = false;
   autoScanMutationRoots.clear();
 };
@@ -3056,11 +3175,33 @@ const updateAutoScrollIdleState = (metrics, options = {}) => {
   return false;
 };
 
+const cancelAutoScrollObservation = () => {
+  if (autoScrollObservationTimer !== null) clearTimeout(autoScrollObservationTimer);
+  if (autoScrollAnimationFrame !== null) cancelAnimationFrame(autoScrollAnimationFrame);
+  autoScrollObservationTimer = null;
+  autoScrollAnimationFrame = null;
+};
+
+const observeAfterAutoScroll = (callback, runId) => {
+  let observed = false;
+  const observe = () => {
+    if (observed || runId !== autoScrollRunId) return;
+    observed = true;
+    cancelAutoScrollObservation();
+    if (autoScrollEnabled) callback();
+  };
+  // Animation frames can pause entirely in inactive tabs. Either callback may
+  // win, but only one observation is allowed to schedule the following step.
+  autoScrollObservationTimer = setTimeout(observe, AUTO_SCROLL_OBSERVATION_FALLBACK_MS);
+  autoScrollAnimationFrame = requestAnimationFrame(observe);
+};
+
 const scheduleAutoScrollTick = (delayMs = getAutoScrollProfileConfig().intervalMs) => {
   if (!autoScrollEnabled || autoScrollTimer) return;
+  const runId = autoScrollRunId;
   autoScrollTimer = setTimeout(() => {
     autoScrollTimer = null;
-    if (!autoScrollEnabled) return;
+    if (!autoScrollEnabled || runId !== autoScrollRunId) return;
 
     const profile = getAutoScrollProfileConfig();
     const metrics = getScrollMetrics();
@@ -3106,7 +3247,7 @@ const scheduleAutoScrollTick = (delayMs = getAutoScrollProfileConfig().intervalM
       });
     }
 
-    requestAnimationFrame(() => {
+    observeAfterAutoScroll(() => {
       if (!autoScrollEnabled) return;
       const nextMetrics = getScrollMetrics();
       const observedCount = getAutoScrollObservedCount();
@@ -3137,7 +3278,7 @@ const scheduleAutoScrollTick = (delayMs = getAutoScrollProfileConfig().intervalM
           ? profile.settleIntervalMs
           : profile.intervalMs;
       scheduleAutoScrollTick(nextDelay);
-    });
+    }, runId);
   }, Math.max(80, Number(delayMs) || getAutoScrollProfileConfig().intervalMs));
 };
 
@@ -3147,6 +3288,15 @@ const startAutoScroll = (profile = "normal", options = {}) => {
   autoScrollIgnoreUserInterrupt = options?.ignoreUserInterrupt === true;
   if (autoScrollEnabled) return;
   autoScrollEnabled = true;
+  autoScrollRunId += 1;
+  const runId = autoScrollRunId;
+  const requestedDuration = Number(options?.maxDurationMs);
+  const maxDurationMs = Number.isFinite(requestedDuration) && requestedDuration > 0
+    ? Math.max(1000, requestedDuration)
+    : AUTO_SCROLL_MAX_DURATION_MS;
+  autoScrollDeadlineTimer = setTimeout(() => {
+    if (autoScrollEnabled && runId === autoScrollRunId) completeAutoScroll("timeout");
+  }, maxDurationMs);
   autoScrollElementRoot = null;
   autoScrollRootSearchVersion = -1;
   autoScrollRootSearchAt = 0;
@@ -3170,6 +3320,10 @@ const startAutoScroll = (profile = "normal", options = {}) => {
 
 const stopAutoScroll = () => {
   autoScrollEnabled = false;
+  autoScrollRunId += 1;
+  cancelAutoScrollObservation();
+  if (autoScrollDeadlineTimer !== null) clearTimeout(autoScrollDeadlineTimer);
+  autoScrollDeadlineTimer = null;
   stopAutoScrollMutationTracking();
   autoScrollStallCount = 0;
   autoScrollIdleCount = 0;
@@ -3234,10 +3388,12 @@ window.addEventListener("scroll", () => {
 chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
   switch (message?.type) {
     case MSG.SCAN_IMAGES: {
-      const images = scanImages();
-      recordKnownImages(images);
-      sendResponse({ success: true, images, count: images.length });
-      break;
+      const generation = runtimeCacheGeneration;
+      scanImages().then(images => {
+        if (generation !== runtimeCacheGeneration) return sendResponse({ success: false, stale: true });
+        sendResponse({ success: true, images, count: images.length });
+      }).catch(error => sendResponse({ success: false, error: error?.message || String(error) }));
+      return true;
     }
 
     case MSG.GET_COMIC_SEQUENCE: {

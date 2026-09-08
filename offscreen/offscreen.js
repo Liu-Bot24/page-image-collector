@@ -67,7 +67,7 @@ const ensureUniqueArchiveFilename = (filename, usedNames) => {
 const getDownloadCandidates = (image, preferHD = true) => {
   const first = preferHD ? image?.hdSrc || image?.src : image?.src || image?.hdSrc;
   const second = preferHD ? image?.src : image?.hdSrc;
-  const base = [first, second, image?.originalSrc].filter(Boolean);
+  const base = [first, second, ...(image?.candidateUrls || []), image?.originalSrc].filter(Boolean);
   const expanded = [];
   for (const url of base) {
     expanded.push(url);
@@ -79,7 +79,16 @@ const getDownloadCandidates = (image, preferHD = true) => {
   return [...new Set(expanded)];
 };
 
-const fetchBlob = async (url, timeoutMs = 8000) => {
+const fetchBlob = async (url, timeoutMs = 8000, sourceUrl = '') => {
+  const lease = await chrome.runtime.sendMessage({ type: 'ACQUIRE_IMAGE_REFERER', payload: { url, sourceUrl } });
+  if (lease?.success !== true) throw new Error(lease?.error || 'Image Referer acquisition failed');
+  try { return await fetchBlobUnscoped(url, timeoutMs); } finally {
+    const released = await chrome.runtime.sendMessage({ type: 'RELEASE_IMAGE_REFERER', payload: { token: lease.token } });
+    if (released?.success !== true) throw new Error(released?.error || 'Image Referer release failed');
+  }
+};
+
+const fetchBlobUnscoped = async (url, timeoutMs = 8000) => {
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), timeoutMs);
   try {
@@ -179,7 +188,7 @@ const buildZipEntryFromImage = async (image, options = {}) => {
   for (let i = 0; i < candidates.length; i += 1) {
     const url = candidates[i];
     try {
-      let blob = await fetchBlob(url);
+      let blob = await fetchBlob(url, 8000, image.sourceUrl);
       let filename = "";
       let converted = false;
 
@@ -260,6 +269,8 @@ const requestPartDownload = async (task, entries, expectMoreParts = false) => {
   if (!zipBlob || Number(zipBlob.size) <= 0) {
     return { success: false, error: `ZIP第 ${partIndex + 1} 卷构建失败: Empty zip blob` };
   }
+  // Blob owns a copy; the caller has transferred this part and never retries its entries.
+  entries.length = 0;
 
   const objectUrl = URL.createObjectURL(zipBlob);
   try {
@@ -378,6 +389,7 @@ const runZipTask = async (payload = {}) => {
         task.packedCount += 1;
         results.push({
           imageId: image.id,
+          collectionId: image.collectionId,
           success: true,
           converted: entryResult.converted,
           fallbackUsed: entryResult.fallbackUsed
@@ -385,6 +397,7 @@ const runZipTask = async (payload = {}) => {
       } else {
         results.push({
           imageId: image.id,
+          collectionId: image.collectionId,
           success: false,
           error: entryResult.error || "Download failed",
           fallbackUsed: entryResult.fallbackUsed === true

@@ -25,6 +25,7 @@ const MSG = {
   IMAGES_UPDATED: "IMAGES_UPDATED",
   DOWNLOAD_PROGRESS: "DOWNLOAD_PROGRESS",
   PROBE_IMAGE_DIMENSIONS: "PROBE_IMAGE_DIMENSIONS",
+  GET_IMAGE_PREVIEW: "GET_IMAGE_PREVIEW",
   UPDATE_IMAGE_METADATA: "UPDATE_IMAGE_METADATA",
   OPEN_DOWNLOAD_DIRECTORY: "OPEN_DOWNLOAD_DIRECTORY",
   OPEN_SOURCE_URL: "OPEN_SOURCE_URL",
@@ -141,6 +142,7 @@ let hasScannedOnce = false;
 let comicModeEnabled = false;
 let comicSequenceCache = null;
 let comicSequenceTask = null;
+let comicSequenceGeneration = 0;
 let comicAssistState = {
   ownedAutoScan: false
 };
@@ -156,12 +158,15 @@ const COMIC_PAGINATION_LIMIT_STORAGE_KEY = "comic_pagination_limit";
 const COMIC_PAGINATION_WAIT_STORAGE_KEY = "comic_pagination_wait_seconds";
 const clipboardPayloadCache = new Map();
 const CLIPBOARD_CACHE_TTL = 5 * 60 * 1000;
+const CLIPBOARD_CACHE_MAX_BYTES = 16 * 1024 * 1024;
 const resolvedHdUrlMap = new Map();
-const imageDimensionCache = new Map();
+let dimensionProbeQueue = null;
 const cardDimensionCache = new Map();
 const cardDimensionPending = new Set();
 const cardDimensionTasks = new Map();
 let imageMetadataGeneration = 0;
+let activeCollectionId = '';
+
 const fullscreenCache = new Map();
 const fullscreenPendingTasks = new Map();
 let fullscreenCacheGeneration = 0;
@@ -186,17 +191,22 @@ let virtualGridState = {
   metrics: null,
   spacer: null,
   renderedKey: "",
+  rowNodes: new Map(),
   rowRenderFrame: 0,
   renderToken: 0
 };
-let virtualGridHydrationToken = 0;
 let virtualGridRefreshFrame = 0;
 let transientActionStatus = "";
 let transientActionStatusTitle = "";
 let pinnedActionStatus = "";
 let pinnedActionStatusTitle = "";
+let persistenceError = "";
+let refererWarning = '';
+let previewCompatibility = false;
+let previewLoader = null;
 const FULLSCREEN_PRELOAD_RADIUS = 4;
-const FULLSCREEN_FETCH_TIMEOUT_MS = 15 * 1000;
+const FULLSCREEN_PRELOAD_TIMEOUT_MS = 15 * 1000;
+const FULLSCREEN_CACHE_MAX_BYTES = 64 * 1024 * 1024;
 const DIMENSION_PROBE_CONCURRENCY = 8;
 const DRAG_SELECT_MOVE_THRESHOLD = 6;
 const DRAG_CLICK_SUPPRESS_MS = 260;
@@ -274,6 +284,37 @@ const getSourceTabId = async () => {
   return sourceTabIdFromQuery;
 };
 
+const acceptCollectionId = (collectionId, invalidateRender = false) => {
+  if (!collectionId || collectionId === activeCollectionId) return false;
+  const hadCollection = Boolean(activeCollectionId);
+  activeCollectionId = collectionId;
+  imageMetadataGeneration += 1;
+  previewLoader?.clear();
+  dimensionProbeQueue?.clear();
+  cardDimensionCache.clear();
+  cardDimensionTasks.clear();
+  clipboardPayloadCache.clear();
+  invalidateComicSequenceCache();
+  resetComicPaginationState();
+  if (typeof cardDimensionPending !== 'undefined') cardDimensionPending.clear();
+  if (typeof resolvedHdUrlMap !== 'undefined') resolvedHdUrlMap.clear();
+  if (metadataRefreshTimer) clearTimeout(metadataRefreshTimer);
+  metadataRefreshTimer = null;
+  metadataRefreshRequested = false;
+  if (hadCollection) {
+    closeLightbox();
+    if (typeof fullscreenActive !== 'undefined' && fullscreenActive) closeFullscreenViewer();
+    if (typeof clearFullscreenCache === 'function') clearFullscreenCache();
+  }
+  if (invalidateRender) {
+    galleryRenderToken += 1;
+    currentImages = [];
+    selectedIds.clear();
+    elements.gallery.replaceChildren?.();
+  }
+  return true;
+};
+
 const sendMessage = async (type, payload = {}) => {
   if (!Number.isInteger(sourceTabId)) {
     sourceTabId = await getSourceTabId();
@@ -281,6 +322,7 @@ const sendMessage = async (type, payload = {}) => {
   if (!Number.isInteger(sourceTabId)) {
     return { success: false, error: "未绑定原网页标签页，请从原网页重新打开 Workspace" };
   }
+  const responseGeneration = imageMetadataGeneration;
   return new Promise((resolve) => {
     chrome.runtime.sendMessage(
       { type, payload, tabId: sourceTabId },
@@ -288,6 +330,23 @@ const sendMessage = async (type, payload = {}) => {
         if (chrome.runtime.lastError) {
           resolve({ success: false, error: chrome.runtime.lastError.message });
           return;
+        }
+        if (type === MSG.GET_IMAGES && responseGeneration !== imageMetadataGeneration) {
+          resolve({ success: false, stale: true });
+          return;
+        }
+        if (type === MSG.GET_IMAGES && response?.success) acceptCollectionId(response.collectionId);
+        if (type === MSG.GET_IMAGES && response?.referer) {
+          previewCompatibility = response.referer.degraded === true;
+          refererWarning = previewCompatibility ? response.referer.message || '部分图片正在使用兼容加载方式' : '';
+          renderActionStatus();
+        }
+        if (response?.persistence) {
+          const nextError = String(response.persistence.error || "");
+          if (nextError !== persistenceError) {
+            persistenceError = nextError;
+            renderActionStatus();
+          }
         }
         resolve(response || { success: false, error: "No response" });
       }
@@ -377,16 +436,24 @@ const focusSourceTabAndStartAutoScroll = async () => {
 
 const cleanupClipboardCache = () => {
   const now = Date.now();
-  for (const [key, entry] of clipboardPayloadCache.entries()) {
-    if (!entry || now - entry.time > CLIPBOARD_CACHE_TTL) {
-      clipboardPayloadCache.delete(key);
-    }
+  let bytes = 0;
+  for (const [key, entry] of clipboardPayloadCache) {
+    if (!entry || now - entry.time > CLIPBOARD_CACHE_TTL) clipboardPayloadCache.delete(key);
+    else bytes += entry.bytes;
+  }
+  for (const [key, entry] of clipboardPayloadCache) {
+    if (bytes <= CLIPBOARD_CACHE_MAX_BYTES) break;
+    bytes -= entry.bytes;
+    clipboardPayloadCache.delete(key);
   }
 };
 
 const setClipboardCache = (key, payload) => {
   if (!key || !payload?.success || !payload?.dataUrl) return;
-  clipboardPayloadCache.set(key, { ...payload, time: Date.now() });
+  const bytes = payload.dataUrl.length * 2;
+  if (bytes > CLIPBOARD_CACHE_MAX_BYTES) return;
+  clipboardPayloadCache.delete(key);
+  clipboardPayloadCache.set(key, { ...payload, time: Date.now(), bytes });
   cleanupClipboardCache();
 };
 
@@ -414,9 +481,20 @@ const canWriteClipboardImage = () =>
   navigator.clipboard &&
   typeof navigator.clipboard.write === "function";
 
+const rememberResolvedHdSrc = (image, url) => {
+  if (!image?.id || !url) return;
+  resolvedHdUrlMap.set(image.id, { url, src: image.src, hdSrc: image.hdSrc });
+};
+
+const getResolvedHdSrc = (image) => {
+  const entry = image?.id ? resolvedHdUrlMap.get(image.id) : null;
+  if (!entry || entry.src !== image.src) return "";
+  return entry.hdSrc === image.hdSrc || entry.url === image.hdSrc ? entry.url : "";
+};
+
 const getEffectiveHdSrc = (image) => {
   if (!image) return "";
-  const resolved = image.id ? String(resolvedHdUrlMap.get(image.id) || "").trim() : "";
+  const resolved = getResolvedHdSrc(image);
   if (resolved) return resolved;
   const hdSrc = String(image.hdSrc || "").trim();
   if (hdSrc) return hdSrc;
@@ -425,66 +503,30 @@ const getEffectiveHdSrc = (image) => {
   return "";
 };
 
-const getImageDimensions = async (url) => {
-  const normalizedUrl = String(url || "").trim();
-  if (!normalizedUrl) return { width: 0, height: 0 };
-
-  const cached = imageDimensionCache.get(normalizedUrl);
-  if (cached) {
-    return await cached;
-  }
-
-  const domProbe = () =>
-    new Promise((resolve) => {
-      const probe = new Image();
-      let settled = false;
-      const finish = (dimensions) => {
-        if (settled) return;
-        settled = true;
-        clearTimeout(timer);
-        probe.onload = null;
-        probe.onerror = null;
-        resolve(dimensions);
-      };
-      const timer = setTimeout(() => finish({ width: 0, height: 0 }), 10000);
-      probe.onload = () => {
-        finish({
-          width: probe.naturalWidth || 0,
-          height: probe.naturalHeight || 0
-        });
-      };
-      probe.onerror = () => finish({ width: 0, height: 0 });
-      probe.src = normalizedUrl;
-    });
-
-  let promise;
-  promise = (async () => {
-    if (/^https?:/i.test(normalizedUrl)) {
-      const response = await sendMessage(MSG.PROBE_IMAGE_DIMENSIONS, { url: normalizedUrl });
-      if (response?.success) {
-        const probed = {
-          width: Number(response.width) || 0,
-          height: Number(response.height) || 0,
-          format: String(response.format || "").toLowerCase(),
-          formatTrusted: response.formatTrusted === true
-        };
-        if (probed.width > 0 && probed.height > 0) return probed;
-      }
-      const fallback = await domProbe();
-      if (fallback.width <= 0 || fallback.height <= 0) {
-        setTimeout(() => {
-          if (imageDimensionCache.get(normalizedUrl) === promise) {
-            imageDimensionCache.delete(normalizedUrl);
+const getImageDimensions = (url, collectionId = activeCollectionId) => {
+  if (!dimensionProbeQueue) {
+    dimensionProbeQueue = PageImageCollectorMetadata.createDimensionProbeQueue({
+      concurrency: DIMENSION_PROBE_CONCURRENCY,
+      probe: async (normalizedUrl, signal, context) => {
+        if (signal.aborted) return { width: 0, height: 0 };
+        if (/^https?:/i.test(normalizedUrl)) {
+          const scope = JSON.parse(context);
+          const response = await sendMessage(MSG.PROBE_IMAGE_DIMENSIONS, { url: normalizedUrl, collectionId: scope.collectionId });
+          if (signal.aborted) return { width: 0, height: 0 };
+          if (response?.success && Number(response.width) > 0 && Number(response.height) > 0) {
+            return {
+              width: Number(response.width), height: Number(response.height),
+              format: String(response.format || "").toLowerCase(),
+              formatTrusted: response.formatTrusted === true
+            };
           }
-        }, 30000);
+          return await PageImageCollectorMetadata.probeDomDimensions(normalizedUrl, signal);
+        }
+        return await PageImageCollectorMetadata.probeDomDimensions(normalizedUrl, signal);
       }
-      return fallback;
-    }
-    return await domProbe();
-  })();
-
-  imageDimensionCache.set(normalizedUrl, promise);
-  return await promise;
+    });
+  }
+  return dimensionProbeQueue.get(url, JSON.stringify({ tabId: sourceTabId, collectionId }));
 };
 
 const computeArea = (width, height) => Math.max(0, (Number(width) || 0) * (Number(height) || 0));
@@ -493,7 +535,7 @@ const formatAreaMp = (area) => `${(Math.max(0, Number(area) || 0) / 1000000).toF
 const normalizeDimensionMeta = (meta = {}) => {
   const width = Math.max(0, Number(meta.width) || Number(meta.maxWidth) || 0);
   const height = Math.max(0, Number(meta.height) || Number(meta.maxHeight) || 0);
-  const area = Math.max(0, Number(meta.area) || Number(meta.maxArea) || computeArea(width, height));
+  const area = computeArea(width, height);
   return { width, height, area };
 };
 
@@ -503,7 +545,7 @@ const getBaseDimensionMeta = (image) => {
   return {
     width,
     height,
-    area: Math.max(Number(image?.area) || 0, computeArea(width, height))
+    area: computeArea(width, height)
   };
 };
 
@@ -511,7 +553,7 @@ const getStoredMaxDimensionMeta = (image) => {
   const base = getBaseDimensionMeta(image);
   const maxWidth = Number(image?.maxWidth) || 0;
   const maxHeight = Number(image?.maxHeight) || 0;
-  const maxArea = Math.max(Number(image?.maxArea) || 0, computeArea(maxWidth, maxHeight));
+  const maxArea = computeArea(maxWidth, maxHeight);
   if (maxWidth > 0 && maxHeight > 0 && maxArea > base.area) {
     return { width: maxWidth, height: maxHeight, area: maxArea };
   }
@@ -566,7 +608,9 @@ const sendImageMetadataUpdate = (image, meta, options = {}) => {
   if (normalized.width <= 0 || normalized.height <= 0) return;
   sendMessage(MSG.UPDATE_IMAGE_METADATA, {
     imageId: image.id,
+    collectionId: image.collectionId,
     url: options.url || "",
+    comparedHdSrc: options.comparedHdSrc || "",
     maxWidth: normalized.width,
     maxHeight: normalized.height,
     maxArea: normalized.area,
@@ -596,8 +640,9 @@ const rememberImageDimensions = (image, meta, options = {}) => {
     detectedFormat !== "unknown" &&
     (
       String(image.format || "").toLowerCase() === "unknown" ||
-      (formatTrusted && detectedFormat !== String(image.format || "").toLowerCase())
+      (formatTrusted && (detectedFormat !== String(image.format || "").toLowerCase() || image.formatTrusted !== true))
     );
+  const formatChanged = shouldUpdateFormat && detectedFormat !== String(image.format || "").toLowerCase();
   const loadedUrl = String(options.url || "").trim();
   const isPersistentLoadedUrl =
     loadedUrl &&
@@ -613,6 +658,7 @@ const rememberImageDimensions = (image, meta, options = {}) => {
     loadedUrl !== cached?.url;
   if (!cached || normalized.area > (Number(cached.area) || 0) || shouldPreferLoadedSource) {
     cardDimensionCache.set(image.id, {
+      ...cached,
       ...normalized,
       url: loadedUrl || cached?.url || "",
       format: shouldUpdateFormat ? detectedFormat : cached?.format || ""
@@ -622,14 +668,16 @@ const rememberImageDimensions = (image, meta, options = {}) => {
 
   if (shouldUpdateFormat) {
     image.format = detectedFormat;
+    if (formatTrusted) image.formatTrusted = true;
     updateCardMetaInDom(image.id, { ...normalized, format: detectedFormat });
   }
 
   const baseMeta = getBaseDimensionMeta(image);
   const storedMax = getStoredMaxDimensionMeta(image);
-  const loadedIsLargerThanBase = isPersistentLoadedUrl && normalized.area > baseMeta.area;
+  const loadedIsLargerThanBase = isPersistentLoadedUrl && normalized.area > baseMeta.area &&
+    normalized.area >= storedMax.area;
   if (loadedIsLargerThanBase) {
-    resolvedHdUrlMap.set(image.id, loadedUrl);
+    rememberResolvedHdSrc(image, loadedUrl);
     if (!image.hdSrc || image.hdSrc === image.src) {
       image.hdSrc = loadedUrl;
     }
@@ -644,17 +692,17 @@ const rememberImageDimensions = (image, meta, options = {}) => {
     image.maxArea = normalized.area;
     sendImageMetadataUpdate(image, normalized, {
       ...options,
-      refreshFormatFacets: shouldUpdateFormat
+      refreshFormatFacets: formatChanged
     });
   } else if (loadedIsLargerThanBase) {
-    sendImageMetadataUpdate(image, storedMax, {
+    sendImageMetadataUpdate(image, normalized, {
       ...options,
-      refreshFormatFacets: shouldUpdateFormat
+      refreshFormatFacets: formatChanged
     });
-  } else if (shouldUpdateFormat) {
-    sendImageMetadataUpdate(image, storedMax, {
+  } else if (shouldUpdateFormat || options.comparedHdSrc) {
+    sendImageMetadataUpdate(image, normalized, {
       ...options,
-      refreshFormatFacets: true
+      refreshFormatFacets: formatChanged
     });
   }
 
@@ -675,106 +723,64 @@ const runWithConcurrency = async (tasks, concurrency) => {
 };
 
 const resolveCardMaxDimensions = async (image, options = {}) => {
-  if (!image?.id) return getCardMeta(image);
-  const metadataGeneration = Number.isInteger(options.metadataGeneration)
-    ? options.metadataGeneration
-    : imageMetadataGeneration;
-
+  if (!image?.id) return { width: 0, height: 0, area: 0 };
+  if (image.collectionId && activeCollectionId && image.collectionId !== activeCollectionId) return getCardMeta(image);
+  const metadataGeneration = options.metadataGeneration ?? imageMetadataGeneration;
+  if (metadataGeneration !== imageMetadataGeneration) return getCardMeta(image);
   const effectiveHd = getEffectiveHdSrc(image);
-  const hasHdCandidate = Boolean(effectiveHd && effectiveHd !== image.src);
   const cached = cardDimensionCache.get(image.id);
-  if (cached) {
-    const cachedArea = Number(cached.area) || computeArea(cached.width, cached.height);
-    const cachedUrl = String(cached.url || "").trim();
-    const storedMax = getStoredMaxDimensionMeta(image);
-    const baseMeta = getBaseDimensionMeta(image);
-    const cachedCoversKnownMax = cachedArea >= storedMax.area;
-    const cachedCoversHdCandidate =
-      !hasHdCandidate ||
-      (cachedUrl && cachedUrl !== image.src) ||
-      cachedArea > baseMeta.area;
-    if (cachedCoversKnownMax && cachedCoversHdCandidate) return cached;
-  }
-
+  const collectionId = image.collectionId || activeCollectionId;
+  const retrySources = cached && cached.sourceSrc === image.src && cached.collectionId === collectionId
+    ? cached.retrySources || [] : [];
   const pendingTask = cardDimensionTasks.get(image.id);
-  if (pendingTask) return await pendingTask;
+  const samePendingContext = pendingTask && pendingTask.sourceSrc === image.src && pendingTask.collectionId === collectionId &&
+    pendingTask.metadataGeneration === metadataGeneration;
+  const inFlightSources = samePendingContext ? pendingTask.probeUrls || [] : [];
+  const probeUrls = [...new Set([image.src, effectiveHd, ...retrySources, ...inFlightSources].filter(Boolean))];
+  const sourcesKey = JSON.stringify(probeUrls);
+  const hasHdCandidate = Boolean(effectiveHd && effectiveHd !== image.src);
+  if (cached?.sourcesKey === sourcesKey && Date.now() < cached.retryAt &&
+      cached.area >= getStoredMaxDimensionMeta(image).area) return cached;
+  if (samePendingContext && pendingTask.sourcesKey === sourcesKey) return await pendingTask;
 
   let task;
   task = (async () => {
     cardDimensionPending.add(image.id);
     try {
-      const probes = [getImageDimensions(image.src)];
-      if (hasHdCandidate) {
-        probes.push(getImageDimensions(effectiveHd));
+      const candidates = await Promise.all(probeUrls.map(async url => ({
+        ...await getImageDimensions(url, collectionId), url
+      })));
+      const failedSources = candidates.filter(candidate => !computeArea(candidate.width, candidate.height)).map(candidate => candidate.url);
+      const hdDim = candidates.find(candidate => candidate.url === effectiveHd) || {};
+      for (const url of failedSources) {
+        if (url === image.src || !/\.webp(?:\?|$)/i.test(url)) continue;
+        const jpgAlt = url.replace(/\.webp(?=\?|$)/i, ".jpg");
+        if (probeUrls.includes(jpgAlt)) continue;
+        const jpgDim = await getImageDimensions(jpgAlt, collectionId);
+        if (computeArea(jpgDim.width, jpgDim.height) > 0) candidates.push({ ...jpgDim, url: jpgAlt });
       }
-      const [srcDim, hdDim = { width: 0, height: 0 }] = await Promise.all(probes);
-
-      const srcArea = computeArea(srcDim.width, srcDim.height);
-      let hdArea = computeArea(hdDim.width, hdDim.height);
-      let bestHdDim = hdDim;
-      let bestFormatDim = srcDim.format ? srcDim : hdDim;
-
-      if (hasHdCandidate && hdArea === 0 && /\.webp(?:\?|$)/i.test(effectiveHd)) {
-        const jpgAlt = effectiveHd.replace(/\.webp(?=\?|$)/i, ".jpg");
-        if (jpgAlt !== effectiveHd) {
-          const jpgDim = await getImageDimensions(jpgAlt);
-          const jpgArea = computeArea(jpgDim.width, jpgDim.height);
-          if (jpgArea > 0) {
-            bestHdDim = jpgDim;
-            if (jpgDim.format) bestFormatDim = jpgDim;
-            hdArea = jpgArea;
-            if (metadataGeneration === imageMetadataGeneration) {
-              resolvedHdUrlMap.set(image.id, jpgAlt);
-            }
-          }
-        }
-      }
-
-      if (metadataGeneration !== imageMetadataGeneration) return getCardMeta(image);
-
-      const baseMeta = getStoredMaxDimensionMeta(image);
-
-      let width = baseMeta.width;
-      let height = baseMeta.height;
-      let area = baseMeta.area;
-      let bestUrl = "";
-
-      if (srcArea >= area) {
-        width = srcDim.width;
-        height = srcDim.height;
-        area = srcArea;
-        bestUrl = image.src;
-        bestHdDim = srcDim;
-        if (srcDim.format) bestFormatDim = srcDim;
-      }
-      if (hdArea >= area) {
-        width = bestHdDim.width;
-        height = bestHdDim.height;
-        area = hdArea;
-        bestUrl = resolvedHdUrlMap.get(image.id) || effectiveHd;
-        if (bestHdDim.format) bestFormatDim = bestHdDim;
-      }
-
-      const resolved = { width, height, area };
-      const hdResolved = hasHdCandidate && hdArea > 0;
+      if (metadataGeneration !== imageMetadataGeneration || cardDimensionTasks.get(image.id) !== task) return getCardMeta(image);
+      const before = getCardMeta(image);
+      const beforeFormat = String(image.format || "").toLowerCase();
+      const resolved = PageImageCollectorMetadata.selectLargestDimensions(getStoredMaxDimensionMeta(image), candidates);
       rememberImageDimensions(image, resolved, {
-        url: bestUrl,
-        format: bestFormatDim.format || "",
-        formatTrusted: bestFormatDim.formatTrusted === true,
-        metadataGeneration
+        url: resolved.url || "", format: resolved.format || "",
+        comparedHdSrc: hasHdCandidate && resolved.url === image.src &&
+          computeArea(hdDim.width, hdDim.height) > 0 ? effectiveHd : "",
+        formatTrusted: resolved.formatTrusted === true, metadataGeneration
       });
-      if (hasHdCandidate && !hdResolved) {
-        const failedProbeCacheEntry = cardDimensionCache.get(image.id);
-        setTimeout(() => {
-          if (
-            metadataGeneration === imageMetadataGeneration &&
-            cardDimensionCache.get(image.id) === failedProbeCacheEntry
-          ) {
-            cardDimensionCache.delete(image.id);
-          }
-        }, 30000);
+      // The displayed winner may change while a different candidate still needs a retry.
+      const nextRetrySources = failedSources.filter(url => url !== image.src);
+      const entry = {
+        ...resolved, sourceSrc: image.src, collectionId, retrySources: nextRetrySources,
+        sourcesKey: JSON.stringify([...new Set([image.src, getEffectiveHdSrc(image), ...nextRetrySources].filter(Boolean))]),
+        retryAt: failedSources.length ? Date.now() + 30000 : Infinity
+      };
+      cardDimensionCache.set(image.id, entry);
+      if (before.width !== entry.width || before.height !== entry.height || beforeFormat !== String(image.format || "").toLowerCase()) {
+        scheduleMetadataRenderRefresh();
       }
-      return resolved;
+      return entry;
     } finally {
       if (cardDimensionTasks.get(image.id) === task) {
         cardDimensionPending.delete(image.id);
@@ -782,7 +788,11 @@ const resolveCardMaxDimensions = async (image, options = {}) => {
       }
     }
   })();
-
+  task.sourcesKey = sourcesKey;
+  task.sourceSrc = image.src;
+  task.collectionId = collectionId;
+  task.metadataGeneration = metadataGeneration;
+  task.probeUrls = probeUrls;
   cardDimensionTasks.set(image.id, task);
   return await task;
 };
@@ -794,16 +804,7 @@ const writeClipboardImage = async (payload) => {
   return true;
 };
 
-const preloadClipboardPayload = async (image, preferredUrl, preferHD = false) => {
-  if (!image || !preferredUrl) return;
-  if (getClipboardCache(preferredUrl)) return;
-  const response = await sendMessage(MSG.COPY_TO_CLIPBOARD, {
-    image,
-    preferredUrl,
-    preferHD
-  });
-  setClipboardCache(preferredUrl, response);
-};
+
 
 const setActivePreset = (preset) => {
   activePreset = preset;
@@ -965,6 +966,7 @@ const buildFormatOptions = (stats = {}) => {
 // Later images are appended after the baseline instead of reordering the whole
 // gallery again on every incremental update.
 const invalidateComicSequenceCache = () => {
+  comicSequenceGeneration += 1;
   comicSequenceCache = null;
   comicSequenceTask = null;
 };
@@ -1005,14 +1007,19 @@ const getPaginationComicOrder = (image) => {
 };
 
 const fetchComicSequence = async () => {
+  if (!activeCollectionId) return [];
   if (comicSequenceCache) return comicSequenceCache;
   if (comicSequenceTask) return await comicSequenceTask;
+  const collectionId = activeCollectionId;
+  const generation = comicSequenceGeneration;
 
   const task = (async () => {
-    const response = await sendMessage(MSG.GET_COMIC_SEQUENCE);
+    const response = await sendMessage(MSG.GET_COMIC_SEQUENCE, { collectionId });
+    if (generation !== comicSequenceGeneration || collectionId !== activeCollectionId || response?.stale) return [];
     if (!response?.success) {
       throw new Error(response?.error || "获取漫画顺序失败");
     }
+    if (response.collectionId !== collectionId) return [];
     const sequence = Array.isArray(response.sequence) ? response.sequence : [];
     comicSequenceCache = sequence;
     return sequence;
@@ -1202,35 +1209,40 @@ const updateComicPaginationUi = () => {
 };
 
 const refreshComicPaginationInfo = async () => {
-  if (!comicModeEnabled || !Number.isInteger(sourceTabId)) {
+  if (!comicModeEnabled || !Number.isInteger(sourceTabId) || !activeCollectionId) {
     comicPaginationInfo = null;
     updateComicPaginationUi();
     return;
   }
 
   const refreshId = ++comicPaginationRefreshId;
+  const collectionId = activeCollectionId;
+  comicPaginationInfo = { supported: false, pending: true, collectionId };
+  updateComicPaginationUi();
   let nextPaginationInfo = null;
   try {
     const response = await withPromiseTimeout(
-      sendMessage(MSG.GET_COMIC_PAGINATION),
+      sendMessage(MSG.GET_COMIC_PAGINATION, { collectionId }),
       COMIC_PAGINATION_DETECT_TIMEOUT_MS,
       "分页检测超时"
     );
-    if (response?.success && response.pagination?.supported) {
-      nextPaginationInfo = response.pagination;
+    if (response?.success && response.collectionId === collectionId) {
+      nextPaginationInfo = { ...(response.pagination || { supported: false }), collectionId };
     }
   } catch { /* ignore */ }
 
-  if (refreshId !== comicPaginationRefreshId || !comicModeEnabled) return;
+  if (refreshId !== comicPaginationRefreshId || !comicModeEnabled || collectionId !== activeCollectionId) return;
   comicPaginationInfo = nextPaginationInfo;
   updateComicPaginationUi();
 };
 
 const resetComicPaginationState = () => {
+  const wasLoading = comicPaginationLoading;
   comicPaginationRefreshId += 1;
   comicPaginationLoadId += 1;
   comicPaginationInfo = null;
   comicPaginationLoading = false;
+  if (wasLoading) setActionStatus('', 0);
   updateComicPaginationUi();
 };
 
@@ -1243,12 +1255,14 @@ const cancelComicPaginationLoad = async () => {
 };
 
 const loadComicPaginationPages = async () => {
+  if (!comicModeEnabled || !activeCollectionId || comicPaginationInfo?.collectionId !== activeCollectionId) return;
   if (!comicPaginationInfo?.supported || comicPaginationLoading) return;
   if (!comicPaginationInfo.nextUrl) return;
 
   const limit = getComicPaginationLimit();
   const waitSeconds = getComicPaginationWaitSeconds();
   const loadId = ++comicPaginationLoadId;
+  const collectionId = activeCollectionId;
 
   comicPaginationLoading = true;
   updateComicPaginationUi();
@@ -1260,10 +1274,17 @@ const loadComicPaginationPages = async () => {
       nextUrl: comicPaginationInfo.nextUrl,
       limit,
       waitSeconds,
+      collectionId,
       clientId: COMIC_PAGINATION_CLIENT_ID
     });
 
-    if (loadId !== comicPaginationLoadId || !comicModeEnabled) return;
+    if (loadId !== comicPaginationLoadId || !comicModeEnabled || collectionId !== activeCollectionId) return;
+    if (response?.stale) {
+      resetComicPaginationState();
+      await renderGallery();
+      return;
+    }
+    if (response?.success && response.collectionId !== collectionId) return;
     if (response?.success) {
       const results = Array.isArray(response.results) ? response.results : [];
       const loaded = results.filter((item) => item?.success).length;
@@ -1289,10 +1310,10 @@ const loadComicPaginationPages = async () => {
       setActionStatus(`分页加载失败: ${response?.error || "未知错误"}`, 8000);
     }
   } catch (error) {
-    if (loadId !== comicPaginationLoadId || !comicModeEnabled) return;
+    if (loadId !== comicPaginationLoadId || !comicModeEnabled || collectionId !== activeCollectionId) return;
     setActionStatus(`分页加载出错: ${error?.message || "未知错误"}`, 8000);
   } finally {
-    if (loadId === comicPaginationLoadId) {
+    if (loadId === comicPaginationLoadId && collectionId === activeCollectionId) {
       comicPaginationLoading = false;
       updateComicPaginationUi();
     }
@@ -1412,8 +1433,8 @@ const renderFormatFilters = (stats = {}) => {
 const ACTION_STATUS_MAX_LENGTH = 72;
 
 const renderActionStatus = () => {
-  const rawText = pinnedActionStatus || transientActionStatus;
-  const title = pinnedActionStatus ? pinnedActionStatusTitle : transientActionStatusTitle;
+  const rawText = persistenceError ? "保存失败，当前更改尚未保存" : refererWarning || pinnedActionStatus || transientActionStatus;
+  const title = persistenceError || (pinnedActionStatus ? pinnedActionStatusTitle : transientActionStatusTitle);
   const displayText =
     rawText.length > ACTION_STATUS_MAX_LENGTH
       ? `${rawText.slice(0, ACTION_STATUS_MAX_LENGTH)}…`
@@ -1686,49 +1707,39 @@ const syncHiddenImageIdsFromImages = (images = []) => {
   }
 };
 
-const fallbackImageError = (imgElement, fallbackUrl, image = null) => {
-  if (!fallbackUrl) return;
-  const stage = imgElement.dataset.fallbackApplied || "0";
-
-  if (stage === "0") {
-    const currentSrc = imgElement.src || "";
-    if (currentSrc !== fallbackUrl) {
-      const jpgAlt = currentSrc.replace(/\.webp(?=\?|$)/i, ".jpg");
-      if (jpgAlt !== currentSrc) {
-        imgElement.dataset.fallbackApplied = "1";
-        const prevOnload = imgElement.onload;
-        imgElement.onload = () => {
-          if (image?.id) {
-            resolvedHdUrlMap.set(image.id, jpgAlt);
-            const nw = imgElement.naturalWidth || 0;
-            const nh = imgElement.naturalHeight || 0;
-            if (nw > 0 && nh > 0) {
-              rememberImageDimensions(image, { width: nw, height: nh, area: nw * nh }, { url: jpgAlt });
-            }
-          }
-          if (typeof prevOnload === "function") prevOnload();
-        };
-        imgElement.src = jpgAlt;
-        return;
+const getPreviewLoader = () => {
+  if (!previewLoader) previewLoader = PageImageCollectorPreview.createLoader({
+    normalize: normalizePreviewImageUrl,
+    isCurrent: image => !image?.collectionId || !activeCollectionId || image.collectionId === activeCollectionId,
+    onExhausted: element => {
+      element.alt = '图片加载失败';
+      if (element === elements.fullscreenImage) {
+        setFullscreenLoading(false);
+        requestAnimationFrame(updateFullscreenZoomCapability);
       }
+    },
+    fetchPreview: async (url, image) => {
+      if (!image?.id || !image.collectionId) return null;
+      const response = await sendMessage(MSG.GET_IMAGE_PREVIEW, { url, imageId: image.id, collectionId: image.collectionId });
+      if (!response?.success || response.collectionId !== image.collectionId || !String(response.dataUrl || '').startsWith('data:image/')) return null;
+      const blob = await (await fetch(response.dataUrl)).blob();
+      const objectUrl = URL.createObjectURL(blob);
+      return { url: objectUrl, release: () => URL.revokeObjectURL(objectUrl) };
     }
-  }
-
-  if (stage !== "0" && stage !== "1") return;
-  imgElement.dataset.fallbackApplied = "2";
-  imgElement.src = fallbackUrl;
-  if (!image) return;
-  const candidate = String(fallbackUrl || "");
-  if (!/sinaimg\.cn/i.test(candidate)) return;
-  sendMessage(MSG.COPY_TO_CLIPBOARD, {
-    image,
-    preferredUrl: candidate,
-    preferHD: currentConfig.enableHD
-  }).then((response) => {
-    if (!response?.success || !response.dataUrl) return;
-    imgElement.dataset.fallbackApplied = "3";
-    imgElement.src = response.dataUrl;
-  }).catch(() => {});
+  });
+  return previewLoader;
+};
+const startImagePreview = (element, image, preferred) => {
+  element.alt = '图片预览';
+  getPreviewLoader().start(element, image, preferred, previewCompatibility);
+};
+const getLoadedPreviewUrl = element => previewLoader?.loadedUrl(element) || element.currentSrc || element.src || '';
+const fallbackImageError = (element, fallbackUrl, image = null) => {
+  if (element.isConnected === false) return Promise.resolve(false);
+  const record = image || { src: fallbackUrl };
+  const loader = getPreviewLoader();
+  if (!loader.has(element, record)) loader.start(element, record, element.currentSrc || element.src || fallbackUrl);
+  return loader.error(element);
 };
 
 const formatFromUrl = (url) => {
@@ -1832,79 +1843,71 @@ const setFullscreenLoading = (loading, text = "加载中...") => {
 const releaseFullscreenCacheEntry = (url) => {
   const entry = fullscreenCache.get(url);
   if (!entry) return;
-  if (entry.objectUrl) {
-    URL.revokeObjectURL(entry.objectUrl);
-  }
+  entry.image?.removeAttribute("src");
   fullscreenCache.delete(url);
 };
 
 const clearFullscreenCache = () => {
   fullscreenCacheGeneration += 1;
-  for (const pending of fullscreenPendingTasks.values()) {
-    pending?.controller?.abort();
-  }
+  for (const pending of fullscreenPendingTasks.values()) pending.controller.abort();
   fullscreenPendingTasks.clear();
-  for (const url of fullscreenCache.keys()) {
+  for (const url of fullscreenCache.keys()) releaseFullscreenCacheEntry(url);
+};
+
+const trimFullscreenCache = () => {
+  let bytes = [...fullscreenCache.values()].reduce((total, entry) => total + entry.size, 0);
+  for (const [url, entry] of [...fullscreenCache.entries()].sort((a, b) => a[1].lastUsed - b[1].lastUsed)) {
+    if (bytes <= FULLSCREEN_CACHE_MAX_BYTES) break;
+    bytes -= entry.size;
     releaseFullscreenCacheEntry(url);
   }
 };
 
 const ensureFullscreenCache = async (url) => {
   if (!url) return { displayUrl: "", cached: false };
-
   const cached = fullscreenCache.get(url);
-  if (cached) {
+  if (cached && (!cached.failed || Date.now() < cached.retryAt)) {
     cached.lastUsed = Date.now();
-    return { displayUrl: cached.objectUrl || url, cached: Boolean(cached.objectUrl) };
+    return { displayUrl: url, cached: !cached.failed };
   }
-
   const pending = fullscreenPendingTasks.get(url);
-  if (pending?.task) {
-    return await pending.task;
-  }
+  if (pending && !pending.controller.signal.aborted) return await pending.task;
 
   const generation = fullscreenCacheGeneration;
   const controller = new AbortController();
-  const timeoutId = setTimeout(() => controller.abort(), FULLSCREEN_FETCH_TIMEOUT_MS);
-  let task;
-  task = (async () => {
-    try {
-      const response = await fetch(url, {
-        cache: "no-store",
-        signal: controller.signal
-      });
-      if (!response.ok) throw new Error(`HTTP ${response.status}`);
-      const blob = await response.blob();
-      if (generation !== fullscreenCacheGeneration || controller.signal.aborted) {
-        return { displayUrl: url, cached: false };
-      }
-      const objectUrl = URL.createObjectURL(blob);
-      fullscreenCache.set(url, {
-        objectUrl,
-        size: blob.size || 0,
-        lastUsed: Date.now()
-      });
-      return { displayUrl: objectUrl, cached: true };
-    } catch {
-      if (generation === fullscreenCacheGeneration) {
-        fullscreenCache.set(url, {
-          objectUrl: "",
-          size: 0,
-          lastUsed: Date.now(),
-          failed: true
-        });
-      }
-      return { displayUrl: url, cached: false };
-    } finally {
+  const preload = new Image();
+  let timeoutId;
+  const task = new Promise((resolve) => {
+    let settled = false;
+    const finish = (loaded) => {
+      if (settled) return;
+      settled = true;
       clearTimeout(timeoutId);
-      if (fullscreenPendingTasks.get(url)?.task === task) {
-        fullscreenPendingTasks.delete(url);
-      }
-    }
-  })();
-
+      preload.onload = null;
+      preload.onerror = null;
+      if (generation === fullscreenCacheGeneration && !controller.signal.aborted) {
+        // Estimate the retained decoded pixels; encoded network caching belongs to the browser.
+        const size = loaded ? (preload.naturalWidth || 0) * (preload.naturalHeight || 0) * 4 : 0;
+        if (size <= FULLSCREEN_CACHE_MAX_BYTES) {
+          fullscreenCache.set(url, { image: loaded ? preload : null, size, lastUsed: Date.now(), retryAt: Date.now() + 30000, failed: !loaded });
+          trimFullscreenCache();
+        } else preload.removeAttribute("src");
+      } else preload.removeAttribute("src");
+      resolve({ displayUrl: url, cached: loaded && !controller.signal.aborted });
+    };
+    controller.signal.addEventListener("abort", () => finish(false), { once: true });
+    timeoutId = setTimeout(() => controller.abort(), FULLSCREEN_PRELOAD_TIMEOUT_MS);
+    preload.onload = () => finish(true);
+    preload.onerror = () => finish(false);
+  });
   fullscreenPendingTasks.set(url, { task, controller, generation });
-  return await task;
+  // Use an image request so per-tab Referer rules also cover fullscreen preloads.
+  preload.src = url;
+  try {
+    return await task;
+  } finally {
+    if (fullscreenPendingTasks.get(url)?.task === task) fullscreenPendingTasks.delete(url);
+  }
 };
 
 const getFullscreenWindowIndexes = (centerIndex) => {
@@ -1924,6 +1927,9 @@ const pruneFullscreenCache = (centerIndex) => {
       .map((index) => getFullscreenSourceForImage(currentImages[index]))
       .filter(Boolean)
   );
+  for (const [url, pending] of fullscreenPendingTasks) {
+    if (!keepUrls.has(url)) pending.controller.abort();
+  }
   for (const url of fullscreenCache.keys()) {
     if (!keepUrls.has(url)) {
       releaseFullscreenCacheEntry(url);
@@ -1932,7 +1938,9 @@ const pruneFullscreenCache = (centerIndex) => {
 };
 
 const preloadFullscreenAround = (centerIndex) => {
+  if (previewCompatibility) return;
   if (!fullscreenActive) return;
+  pruneFullscreenCache(centerIndex);
   const indexes = getFullscreenWindowIndexes(centerIndex);
   for (const index of indexes) {
     if (index === centerIndex) continue;
@@ -2059,6 +2067,7 @@ const renderFullscreenImage = async () => {
   const image = currentImages[fullscreenIndex];
   if (!image) return;
   fullscreenImageId = image.id;
+  pruneFullscreenCache(fullscreenIndex);
   const source = getFullscreenSourceForImage(image);
   if (!source) return;
   elements.fullscreenImage.dataset.source = source;
@@ -2066,58 +2075,39 @@ const renderFullscreenImage = async () => {
   setFullscreenLoading(true, "加载原图...");
 
   let loadUrl = source;
-  const { displayUrl, cached } = await ensureFullscreenCache(source);
+  const { displayUrl, cached } = previewCompatibility ? { displayUrl: source, cached: false } : await ensureFullscreenCache(source);
   if (!fullscreenActive) return;
   if (elements.fullscreenImage.dataset.source !== source) return;
 
-  if (!cached && /\.webp(?:\?|$)/i.test(source)) {
+  if (!previewCompatibility && !cached && /\.webp(?:\?|$)/i.test(source)) {
     const jpgAlt = source.replace(/\.webp(?=\?|$)/i, ".jpg");
     if (jpgAlt !== source) {
-      const { displayUrl: jpgDisplay, cached: jpgCached } = await ensureFullscreenCache(jpgAlt);
+      const { cached: jpgCached } = await ensureFullscreenCache(jpgAlt);
       if (jpgCached) {
         loadUrl = jpgAlt;
-        if (image?.id) resolvedHdUrlMap.set(image.id, jpgAlt);
+        if (image?.id) rememberResolvedHdSrc(image, jpgAlt);
       }
     }
   }
   if (!fullscreenActive) return;
   if (elements.fullscreenImage.dataset.source !== source) return;
 
-  const finalDisplay = loadUrl === source ? (displayUrl || source) : (fullscreenCache.get(loadUrl)?.objectUrl || loadUrl);
-  elements.fullscreenImage.src = finalDisplay;
+  const finalDisplay = loadUrl === source ? (displayUrl || source) : loadUrl;
+  startImagePreview(elements.fullscreenImage, image, finalDisplay);
 
-  const thumbFallback = image?.src || image?.originalSrc || "";
   elements.fullscreenImage.onerror = () => {
-    const stage = elements.fullscreenImage.dataset.fsFallbackStage || "0";
-    if (stage === "0") {
-      const curSrc = elements.fullscreenImage.src || "";
-      const jpgAlt = curSrc.replace(/\.webp(?=\?|$)/i, ".jpg");
-      if (jpgAlt !== curSrc) {
-        elements.fullscreenImage.dataset.fsFallbackStage = "0.5";
-        elements.fullscreenImage.src = jpgAlt;
-        return;
-      }
-    }
-    if (stage === "0" || stage === "0.5") {
-      if (thumbFallback && thumbFallback !== elements.fullscreenImage.src) {
-        elements.fullscreenImage.dataset.fsFallbackStage = "1";
-        elements.fullscreenImage.src = thumbFallback;
-        return;
-      }
-    }
-    setFullscreenLoading(false);
-    requestAnimationFrame(updateFullscreenZoomCapability);
+    fallbackImageError(elements.fullscreenImage, image.originalSrc || image.src, image).then(advanced => {
+      if (!advanced) { setFullscreenLoading(false); requestAnimationFrame(updateFullscreenZoomCapability); }
+    });
   };
   elements.fullscreenImage.onload = () => {
     if (image?.id) {
-      const loadedSrc = elements.fullscreenImage.src || "";
+      const loadedSrc = getLoadedPreviewUrl(elements.fullscreenImage);
       const nw = elements.fullscreenImage.naturalWidth || 0;
       const nh = elements.fullscreenImage.naturalHeight || 0;
       if (nw > 0 && nh > 0) {
         const loadedArea = nw * nh;
-        if (loadedSrc && loadedSrc !== thumbFallback && !loadedSrc.startsWith("blob:")) {
-          resolvedHdUrlMap.set(image.id, loadedSrc);
-        }
+
         rememberImageDimensions(image, { width: nw, height: nh, area: loadedArea }, { url: loadedSrc });
       }
     }
@@ -2142,6 +2132,9 @@ const openFullscreenViewer = (startIndex = 0) => {
 };
 
 const closeFullscreenViewer = () => {
+  previewLoader?.cancel(elements.fullscreenImage);
+  elements.fullscreenImage.onload = null;
+  elements.fullscreenImage.onerror = null;
   fullscreenActive = false;
   fullscreenIndex = -1;
   fullscreenImageId = "";
@@ -2277,21 +2270,19 @@ const setLightboxSource = (src, mode) => {
   lightboxCurrentSrc = src;
   elements.lightboxContent.classList.toggle("is-original", mode === "original");
   elements.lightboxImage.dataset.fallbackApplied = "0";
-  elements.lightboxImage.src = src;
+  startImagePreview(elements.lightboxImage, lightboxImage, src);
   elements.lightboxImage.onload = () => {
     if (lightboxImage?.id) {
       const nw = elements.lightboxImage.naturalWidth || 0;
       const nh = elements.lightboxImage.naturalHeight || 0;
       if (nw > 0 && nh > 0) {
         const loadedArea = nw * nh;
-        const loadedSrc = elements.lightboxImage.src || src;
-        if (loadedSrc && !loadedSrc.startsWith("blob:")) {
-          resolvedHdUrlMap.set(lightboxImage.id, loadedSrc);
-        }
+        const loadedSrc = getLoadedPreviewUrl(elements.lightboxImage) || src;
         rememberImageDimensions(lightboxImage, { width: nw, height: nh, area: loadedArea }, { url: loadedSrc });
       }
     }
-    syncLightboxMeta(src);
+    lightboxCurrentSrc = getLoadedPreviewUrl(elements.lightboxImage);
+    syncLightboxMeta(lightboxCurrentSrc);
     updateOneToOneCapabilityFromCurrentDisplay();
     updateOriginalButton();
     syncLightboxOriginalScrollLayout();
@@ -2300,7 +2291,6 @@ const setLightboxSource = (src, mode) => {
   syncLightboxMeta(src);
   syncLightboxOriginalScrollLayout();
   updateOriginalButton();
-  preloadClipboardPayload(lightboxImage, src, false).catch(() => {});
 };
 
 const evaluateMeaningfulOriginal = async (sessionId) => {
@@ -2436,6 +2426,7 @@ const resetVirtualGridState = (renderToken = virtualGridState.renderToken + 1) =
     metrics: null,
     spacer: null,
     renderedKey: "",
+    rowNodes: new Map(),
     rowRenderFrame: 0,
     renderToken
   };
@@ -2460,7 +2451,6 @@ const teardownVirtualGrid = () => {
   if (virtualGridState.adapter?.destroy) {
     virtualGridState.adapter.destroy();
   }
-  virtualGridHydrationToken += 1;
   resetVirtualGridState();
   clearVirtualGridStyles();
 };
@@ -2531,19 +2521,6 @@ const getVirtualGridAnchorOffset = (rows, metrics, anchor, fallbackOffset = 0) =
   if (rowIndex < 0) return Math.max(0, fallbackOffset || 0);
   const rowHeight = Math.max(1, Number(metrics?.rowHeight) || 1);
   return Math.max(0, (rowIndex * rowHeight) + (Number(anchor.offsetWithinRow) || 0));
-};
-
-const hydrateVirtualGridImages = (images, renderToken) => {
-  const hydrationToken = virtualGridHydrationToken + 1;
-  virtualGridHydrationToken = hydrationToken;
-  const tasks = images
-    .filter((image) => image?.id)
-    .map((image) => async () => {
-      if (hydrationToken !== virtualGridHydrationToken || renderToken !== galleryRenderToken) return null;
-      return await resolveCardMaxDimensions(image);
-    });
-  if (tasks.length === 0) return;
-  runWithConcurrency(tasks, DIMENSION_PROBE_CONCURRENCY).catch(() => {});
 };
 
 const getImageAspectRatio = (image) => {
@@ -2623,7 +2600,7 @@ const applyGalleryLayout = () => {
 
 const createCard = (image, index) => {
   const cardMetadataGeneration = imageMetadataGeneration;
-  const resolved = resolvedHdUrlMap.get(image.id);
+  const resolved = currentConfig.enableHD ? getResolvedHdSrc(image) : "";
   const displaySrc = resolved || image.displaySrc || image.src;
   const ext = String(resolveImageFormat(image) || formatFromUrl(displaySrc) || "unknown").toUpperCase();
   const isSelected = selectedIds.has(image.id);
@@ -2631,6 +2608,7 @@ const createCard = (image, index) => {
 
   const card = document.createElement("div");
   card.className = `gallery-card${isSelected ? " selected" : ""}`;
+  card.classList.toggle("drag-preview", dragPreviewIds.has(image.id));
   card.dataset.id = image.id;
 
   const imageWrap = document.createElement("div");
@@ -2638,7 +2616,7 @@ const createCard = (image, index) => {
   const imageNode = document.createElement("img");
   imageNode.alt = "Image preview";
   imageNode.loading = "lazy";
-  setImagePreviewSrc(imageNode, displaySrc, image.src);
+  startImagePreview(imageNode, image, displaySrc);
   imageWrap.appendChild(imageNode);
 
   if (isHdBadge(image)) {
@@ -2679,7 +2657,7 @@ const createCard = (image, index) => {
     const height = imageNode.naturalHeight || 0;
     if (width > 0 && height > 0) {
       rememberImageDimensions(image, { width, height, area: width * height }, {
-        url: imageNode.currentSrc || imageNode.src,
+        url: getLoadedPreviewUrl(imageNode),
         metadataGeneration: cardMetadataGeneration
       });
     }
@@ -2729,9 +2707,9 @@ const appendGalleryCardsBatched = async (images, renderToken) => {
 };
 
 const renderVirtualGridRows = (renderToken = virtualGridState.renderToken) => {
-  const { enabled, instance, rows, metrics, spacer } = virtualGridState;
+  const { enabled, instance, rows, metrics, spacer, rowNodes } = virtualGridState;
   virtualGridState.rowRenderFrame = 0;
-  if (!enabled || !instance || !metrics || !spacer) return;
+  if (!enabled || !instance || !metrics || !spacer || spacer.isConnected === false) return;
   if (renderToken !== virtualGridState.renderToken) return;
 
   const virtualRows = instance.getVirtualItems();
@@ -2740,25 +2718,33 @@ const renderVirtualGridRows = (renderToken = virtualGridState.renderToken) => {
   if (renderedKey === virtualGridState.renderedKey && spacer.childElementCount > 0) return;
   virtualGridState.renderedKey = renderedKey;
 
-  const fragment = document.createDocumentFragment();
+  const visibleIndices = new Set(virtualRows.map(row => row.index));
+  for (const [index, node] of rowNodes) {
+    if (!visibleIndices.has(index)) { node.remove(); rowNodes.delete(index); }
+  }
+  let position = 0;
   for (const virtualRow of virtualRows) {
     const row = rows[virtualRow.index];
     if (!row) continue;
 
-    const rowNode = document.createElement("div");
-    rowNode.className = "virtual-gallery-row";
+    let rowNode = rowNodes.get(virtualRow.index);
+    if (!rowNode) {
+      rowNode = document.createElement("div");
+      rowNode.className = "virtual-gallery-row";
+      row.items.forEach((image, offset) => {
+        rowNode.appendChild(createCard(image, row.startIndex + offset));
+      });
+      rowNodes.set(virtualRow.index, rowNode);
+    }
     rowNode.style.height = `${metrics.cardHeight}px`;
     rowNode.style.transform = `translateY(${virtualRow.start}px)`;
     rowNode.style.gridTemplateColumns = `repeat(${row.items.length}, ${metrics.cardWidth}px)`;
     rowNode.style.gap = `${metrics.gap}px`;
 
-    row.items.forEach((image, offset) => {
-      rowNode.appendChild(createCard(image, row.startIndex + offset));
-    });
-    fragment.appendChild(rowNode);
+    const existing = spacer.children[position] || null;
+    if (existing !== rowNode) spacer.insertBefore(rowNode, existing);
+    position += 1;
   }
-
-  spacer.replaceChildren(fragment);
 };
 
 const scheduleVirtualGridRowsRender = (renderToken = virtualGridState.renderToken) => {
@@ -2825,7 +2811,6 @@ const mountVirtualGrid = (images, renderToken, options = {}) => {
 
   elements.gallery.scrollTop = initialOffset;
   renderVirtualGridRows(nextVirtualToken);
-  hydrateVirtualGridImages(images, renderToken);
   return renderToken === galleryRenderToken;
 };
 
@@ -2867,6 +2852,9 @@ const renderGallery = async () => {
   if (!allResponse.success) return;
   if (renderToken !== galleryRenderToken) return;
   const allImages = allResponse.images || [];
+  if (comicModeEnabled && !comicPaginationInfo && !comicPaginationLoading) {
+    refreshComicPaginationInfo().catch(() => {});
+  }
   syncHiddenImageIdsFromImages(allImages);
 
   const needsDimensionHydration =
@@ -2882,16 +2870,14 @@ const renderGallery = async () => {
     );
 
   if (needsDimensionHydration) {
-    const uncached = allImages.filter((img) => !cardDimensionCache.has(img.id));
-    const cached = allImages.filter((img) => cardDimensionCache.has(img.id));
-    cached.forEach((img) => resolveCardMaxDimensions(img));
-    if (uncached.length > 0) {
-      await runWithConcurrency(
-        uncached.map((img) => () => resolveCardMaxDimensions(img)),
-        DIMENSION_PROBE_CONCURRENCY
-      );
-      if (renderToken !== galleryRenderToken) return;
-    }
+    const metadataGeneration = imageMetadataGeneration;
+    runWithConcurrency(
+      allImages.map((image) => async () => {
+        if (renderToken !== galleryRenderToken || metadataGeneration !== imageMetadataGeneration) return;
+        await resolveCardMaxDimensions(image, { metadataGeneration });
+      }),
+      DIMENSION_PROBE_CONCURRENCY
+    ).catch(() => {});
   }
 
   const metricAndOrientationFiltered = allImages
@@ -3000,7 +2986,19 @@ const toggleSelect = async (imageId) => {
   const response = await sendMessage(MSG.TOGGLE_SELECT, { imageId });
   if (!response.success) return;
   selectedIds = new Set(response.selectedIds || []);
-  await renderGallery();
+  const card = document.querySelector(`.gallery-card[data-id="${imageId}"]`);
+  const selected = selectedIds.has(imageId);
+  card?.classList.toggle("selected", selected);
+  const checkbox = card?.querySelector(".checkbox");
+  if (checkbox) {
+    checkbox.classList.toggle("checked", selected);
+    checkbox.textContent = selected ? "✓" : "";
+  }
+  elements.statSelected.textContent = String(selectedIds.size);
+  syncBatchDownloadUiState();
+  elements.btnCopyBatch.disabled = selectedIds.size === 0;
+  syncSelectAllButtonLabel();
+  syncHideToggleButton();
 };
 
 const isSelectableCardTarget = (target) => {
@@ -3058,30 +3056,38 @@ const hideDragSelectionBox = () => {
 };
 
 const clearDragPreview = () => {
-  for (const id of dragPreviewIds) {
-    const node = elements.gallery.querySelector(`.gallery-card[data-id="${id}"]`);
-    node?.classList.remove("drag-preview");
+  for (const node of elements.gallery.querySelectorAll(".gallery-card[data-id]")) {
+    node.classList.remove("drag-preview");
   }
   dragPreviewIds = new Set();
 };
 
 const updateDragPreview = (ids) => {
   const next = new Set(ids);
-  for (const id of dragPreviewIds) {
-    if (next.has(id)) continue;
-    const node = elements.gallery.querySelector(`.gallery-card[data-id="${id}"]`);
-    node?.classList.remove("drag-preview");
-  }
-  for (const id of next) {
-    if (dragPreviewIds.has(id)) continue;
-    const node = elements.gallery.querySelector(`.gallery-card[data-id="${id}"]`);
-    node?.classList.add("drag-preview");
+  for (const node of elements.gallery.querySelectorAll(".gallery-card[data-id]")) {
+    node.classList.toggle("drag-preview", next.has(node.dataset.id));
   }
   dragPreviewIds = next;
 };
 
 const hitTestSelectionCards = (rect) => {
   const hitIds = new Set();
+  if (virtualGridState.enabled && virtualGridState.metrics && virtualGridState.spacer) {
+    const { rows, metrics, spacer } = virtualGridState;
+    const galleryRect = elements.gallery.getBoundingClientRect();
+    const spacerRect = spacer.getBoundingClientRect();
+    const left = spacerRect.left - galleryRect.left + elements.gallery.scrollLeft;
+    const top = spacerRect.top - galleryRect.top + elements.gallery.scrollTop;
+    const firstRow = Math.max(0, Math.ceil((rect.top - top - metrics.cardHeight) / metrics.rowHeight));
+    const lastRow = Math.min(rows.length - 1, Math.floor((rect.bottom - top) / metrics.rowHeight));
+    for (let rowIndex = firstRow; rowIndex <= lastRow; rowIndex += 1) {
+      rows[rowIndex].items.forEach((image, column) => {
+        const cardLeft = left + column * (metrics.cardWidth + metrics.gap);
+        if (rect.left <= cardLeft + metrics.cardWidth && rect.right >= cardLeft) hitIds.add(image.id);
+      });
+    }
+    return hitIds;
+  }
   const cards = elements.gallery.querySelectorAll(".gallery-card[data-id]");
   const galleryRect = virtualGridState.enabled ? elements.gallery.getBoundingClientRect() : null;
   for (const card of cards) {
@@ -3179,10 +3185,12 @@ const teardownDragSelect = () => {
   window.removeEventListener("pointermove", onGalleryPointerMove, true);
   window.removeEventListener("pointerup", onGalleryPointerUp, true);
   window.removeEventListener("pointercancel", onGalleryPointerCancel, true);
+  elements.gallery.removeEventListener("scroll", onGalleryDragScroll);
 };
 
 const onGalleryPointerMove = (event) => {
   if (!dragSelectState) return;
+  dragSelectState.client = { x: event.clientX, y: event.clientY };
   const point = getGalleryPoint(event.clientX, event.clientY);
   dragSelectState.current = point;
   const dx = point.x - dragSelectState.start.x;
@@ -3199,6 +3207,11 @@ const onGalleryPointerMove = (event) => {
   updateDragPreview(hitTestSelectionCards(rect));
 };
 
+const onGalleryDragScroll = () => {
+  if (!dragSelectState?.client) return;
+  onGalleryPointerMove({ clientX: dragSelectState.client.x, clientY: dragSelectState.client.y, preventDefault() {} });
+};
+
 const onGalleryPointerCancel = () => {
   teardownDragSelect();
 };
@@ -3207,7 +3220,9 @@ const onGalleryPointerUp = async (event) => {
   if (!dragSelectState) return;
   const replaceMode = dragSelectState.replaceMode || event.ctrlKey || event.metaKey;
   const moved = dragSelectState.moved;
-  const hitIds = new Set(dragPreviewIds);
+  const hitIds = moved ? hitTestSelectionCards(normalizeSelectionRect(
+    dragSelectState.start, getGalleryPoint(event.clientX, event.clientY)
+  )) : new Set();
   teardownDragSelect();
   if (!moved) return;
 
@@ -3224,6 +3239,7 @@ const onGalleryPointerDown = (event) => {
   elements.gallery.classList.add("drag-select-active");
   dragSelectState = {
     start: getGalleryPoint(event.clientX, event.clientY),
+    client: { x: event.clientX, y: event.clientY },
     current: null,
     moved: false,
     replaceMode: event.ctrlKey || event.metaKey
@@ -3231,6 +3247,7 @@ const onGalleryPointerDown = (event) => {
   window.addEventListener("pointermove", onGalleryPointerMove, true);
   window.addEventListener("pointerup", onGalleryPointerUp, true);
   window.addEventListener("pointercancel", onGalleryPointerCancel, true);
+  elements.gallery.addEventListener("scroll", onGalleryDragScroll, { passive: true });
 };
 
 const openLightbox = (image, index = -1) => {
@@ -3256,9 +3273,6 @@ const openLightbox = (image, index = -1) => {
   lightboxCanOneToOne = false;
   lightboxOriginalEvalPending = Boolean(lightboxOriginalSrc && lightboxOriginalSrc !== lightboxPreviewSrc);
   setLightboxSource(lightboxPreviewSrc, "preview");
-  if (lightboxOriginalSrc) {
-    preloadClipboardPayload(lightboxImage, lightboxOriginalSrc, false).catch(() => {});
-  }
   evaluateMeaningfulOriginal(lightboxSessionId).catch(() => {});
   updateLightboxNavigation();
   elements.lightbox.classList.add("active");
@@ -3276,6 +3290,10 @@ const navigateLightbox = (step) => {
 };
 
 const closeLightbox = () => {
+  previewLoader?.cancel(elements.lightboxImage);
+  elements.lightboxImage.onload = null;
+  elements.lightboxImage.onerror = null;
+  elements.lightboxImage.removeAttribute('src');
   lightboxSessionId += 1;
   elements.lightbox.classList.remove("active");
   elements.lightboxContent.classList.remove("is-original");
@@ -3296,6 +3314,7 @@ const closeLightbox = () => {
 };
 
 const copyImageOrUrl = async (image, options = {}) => {
+  const metadataGeneration = imageMetadataGeneration;
   const canWriteImage = canWriteClipboardImage();
   const preferredUrl = options.preferredUrl || "";
 
@@ -3316,7 +3335,7 @@ const copyImageOrUrl = async (image, options = {}) => {
     preferredUrl,
     preferHD: options.preferHD === true
   });
-  if (preferredUrl) {
+  if (preferredUrl && metadataGeneration === imageMetadataGeneration) {
     setClipboardCache(preferredUrl, backgroundResponse);
   }
   if (canWriteImage && backgroundResponse?.success && backgroundResponse.dataUrl) {
@@ -3405,7 +3424,7 @@ const clearImages = async () => {
   selectedIds = new Set();
   hiddenImageIds.clear();
   resolvedHdUrlMap.clear();
-  imageDimensionCache.clear();
+  dimensionProbeQueue?.clear();
   cardDimensionCache.clear();
   cardDimensionTasks.clear();
   cardDimensionPending.clear();
@@ -3983,6 +4002,7 @@ chrome.runtime.onMessage.addListener((message) => {
   if (message?.type === MSG.IMAGES_UPDATED) {
     const updatedTabId = Number(message?.payload?.tabId);
     if (!Number.isInteger(updatedTabId) || updatedTabId !== sourceTabId) return;
+    acceptCollectionId(message?.payload?.collectionId, true);
     if (manualScanInProgress) return;
     scheduleRenderRefresh();
   }

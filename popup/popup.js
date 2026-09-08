@@ -17,6 +17,7 @@ const MSG = {
   AUTO_SCROLL_STATE_CHANGED: "AUTO_SCROLL_STATE_CHANGED",
   DOWNLOAD_PROGRESS: "DOWNLOAD_PROGRESS",
   PROBE_IMAGE_DIMENSIONS: "PROBE_IMAGE_DIMENSIONS",
+  GET_IMAGE_PREVIEW: "GET_IMAGE_PREVIEW",
   UPDATE_IMAGE_METADATA: "UPDATE_IMAGE_METADATA",
   OPEN_DOWNLOAD_DIRECTORY: "OPEN_DOWNLOAD_DIRECTORY",
   OPEN_SOURCE_URL: "OPEN_SOURCE_URL",
@@ -87,11 +88,19 @@ let transientActionStatus = "";
 let transientActionStatusTitle = "";
 let pinnedActionStatus = "";
 let pinnedActionStatusTitle = "";
+let persistenceError = "";
+let refererWarning = '';
+let previewCompatibility = false;
+let previewLoader = null;
 const clipboardPayloadCache = new Map();
 const CLIPBOARD_CACHE_TTL = 5 * 60 * 1000;
-const imageDimensionCache = new Map();
+const CLIPBOARD_CACHE_MAX_BYTES = 16 * 1024 * 1024;
+let dimensionProbeQueue = null;
 const cardDimensionCache = new Map();
 const cardDimensionTasks = new Map();
+let imageMetadataGeneration = 0;
+let activeCollectionId = '';
+
 
 let currentConfig = {
   enableHD: true,
@@ -138,8 +147,38 @@ const getCurrentTabId = async () => {
   return tabs[0]?.id ?? null;
 };
 
+const acceptCollectionId = (collectionId, invalidateRender = false) => {
+  if (!collectionId || collectionId === activeCollectionId) return false;
+  const hadCollection = Boolean(activeCollectionId);
+  activeCollectionId = collectionId;
+  imageMetadataGeneration += 1;
+  previewLoader?.clear();
+  dimensionProbeQueue?.clear();
+  cardDimensionCache.clear();
+  cardDimensionTasks.clear();
+  clipboardPayloadCache.clear();
+  if (typeof cardDimensionPending !== 'undefined') cardDimensionPending.clear();
+  if (typeof resolvedHdUrlMap !== 'undefined') resolvedHdUrlMap.clear();
+  if (metadataRefreshTimer) clearTimeout(metadataRefreshTimer);
+  metadataRefreshTimer = null;
+  metadataRefreshRequested = false;
+  if (hadCollection) {
+    closeLightbox();
+    if (typeof fullscreenActive !== 'undefined' && fullscreenActive) closeFullscreenViewer();
+    if (typeof clearFullscreenCache === 'function') clearFullscreenCache();
+  }
+  if (invalidateRender) {
+    imageRenderToken += 1;
+    currentImages = [];
+    selectedIds.clear();
+    elements.imageGrid.replaceChildren?.();
+  }
+  return true;
+};
+
 const sendMessage = async (type, payload = {}) => {
   if (!sourceTabId) sourceTabId = await getCurrentTabId();
+  const responseGeneration = imageMetadataGeneration;
   return new Promise((resolve) => {
     chrome.runtime.sendMessage(
       { type, payload, tabId: sourceTabId },
@@ -147,6 +186,23 @@ const sendMessage = async (type, payload = {}) => {
         if (chrome.runtime.lastError) {
           resolve({ success: false, error: chrome.runtime.lastError.message });
           return;
+        }
+        if (type === MSG.GET_IMAGES && responseGeneration !== imageMetadataGeneration) {
+          resolve({ success: false, stale: true });
+          return;
+        }
+        if (type === MSG.GET_IMAGES && response?.success) acceptCollectionId(response.collectionId);
+        if (type === MSG.GET_IMAGES && response?.referer) {
+          previewCompatibility = response.referer.degraded === true;
+          refererWarning = previewCompatibility ? response.referer.message || '部分图片正在使用兼容加载方式' : '';
+          renderActionStatus();
+        }
+        if (response?.persistence) {
+          const nextError = String(response.persistence.error || "");
+          if (nextError !== persistenceError) {
+            persistenceError = nextError;
+            renderActionStatus();
+          }
         }
         resolve(response || { success: false, error: "No response" });
       }
@@ -219,8 +275,8 @@ const setAutoScrollButtonState = (enabled) => {
 const ACTION_STATUS_MAX_LENGTH = 58;
 
 const renderActionStatus = () => {
-  const rawText = pinnedActionStatus || transientActionStatus;
-  const title = pinnedActionStatus ? pinnedActionStatusTitle : transientActionStatusTitle;
+  const rawText = persistenceError ? "保存失败，当前更改尚未保存" : refererWarning || pinnedActionStatus || transientActionStatus;
+  const title = persistenceError || (pinnedActionStatus ? pinnedActionStatusTitle : transientActionStatusTitle);
   const displayText =
     rawText.length > ACTION_STATUS_MAX_LENGTH
       ? `${rawText.slice(0, ACTION_STATUS_MAX_LENGTH)}…`
@@ -396,16 +452,24 @@ const scheduleMetadataRenderRefresh = () => {
 
 const cleanupClipboardCache = () => {
   const now = Date.now();
-  for (const [key, entry] of clipboardPayloadCache.entries()) {
-    if (!entry || now - entry.time > CLIPBOARD_CACHE_TTL) {
-      clipboardPayloadCache.delete(key);
-    }
+  let bytes = 0;
+  for (const [key, entry] of clipboardPayloadCache) {
+    if (!entry || now - entry.time > CLIPBOARD_CACHE_TTL) clipboardPayloadCache.delete(key);
+    else bytes += entry.bytes;
+  }
+  for (const [key, entry] of clipboardPayloadCache) {
+    if (bytes <= CLIPBOARD_CACHE_MAX_BYTES) break;
+    bytes -= entry.bytes;
+    clipboardPayloadCache.delete(key);
   }
 };
 
 const setClipboardCache = (key, payload) => {
   if (!key || !payload?.success || !payload?.dataUrl) return;
-  clipboardPayloadCache.set(key, { ...payload, time: Date.now() });
+  const bytes = payload.dataUrl.length * 2;
+  if (bytes > CLIPBOARD_CACHE_MAX_BYTES) return;
+  clipboardPayloadCache.delete(key);
+  clipboardPayloadCache.set(key, { ...payload, time: Date.now(), bytes });
   cleanupClipboardCache();
 };
 
@@ -440,64 +504,32 @@ const writeClipboardImage = async (payload) => {
   return true;
 };
 
-const preloadClipboardPayload = async (image, preferredUrl, preferHD = false) => {
-  if (!image || !preferredUrl) return;
-  if (getClipboardCache(preferredUrl)) return;
-  const response = await sendMessage(MSG.COPY_TO_CLIPBOARD, {
-    image,
-    preferredUrl,
-    preferHD
-  });
-  setClipboardCache(preferredUrl, response);
-};
 
-const getImageDimensions = async (url) => {
-  const normalizedUrl = String(url || "").trim();
-  if (!normalizedUrl) return { width: 0, height: 0 };
 
-  const cached = imageDimensionCache.get(normalizedUrl);
-  if (cached) return await cached;
-
-  const domProbe = () =>
-    new Promise((resolve) => {
-      const probe = new Image();
-      let settled = false;
-      const finish = (result) => {
-        if (settled) return;
-        settled = true;
-        clearTimeout(timer);
-        probe.onload = null;
-        probe.onerror = null;
-        resolve(result);
-      };
-      const timer = setTimeout(() => finish({ width: 0, height: 0 }), 8000);
-      probe.onload = () => finish({ width: probe.naturalWidth || 0, height: probe.naturalHeight || 0 });
-      probe.onerror = () => finish({ width: 0, height: 0 });
-      probe.src = normalizedUrl;
-    });
-
-  const promise = (async () => {
-    if (/^https?:/i.test(normalizedUrl)) {
-      const response = await sendMessage(MSG.PROBE_IMAGE_DIMENSIONS, { url: normalizedUrl });
-      if (response?.success) {
-        return {
-          width: Number(response.width) || 0,
-          height: Number(response.height) || 0,
-          format: String(response.format || "").toLowerCase(),
-          formatTrusted: response.formatTrusted === true
-        };
+const getImageDimensions = (url, collectionId = activeCollectionId) => {
+  if (!dimensionProbeQueue) {
+    dimensionProbeQueue = PageImageCollectorMetadata.createDimensionProbeQueue({
+      concurrency: DIMENSION_PROBE_CONCURRENCY,
+      probe: async (normalizedUrl, signal, context) => {
+        if (signal.aborted) return { width: 0, height: 0 };
+        if (/^https?:/i.test(normalizedUrl)) {
+          const scope = JSON.parse(context);
+          const response = await sendMessage(MSG.PROBE_IMAGE_DIMENSIONS, { url: normalizedUrl, collectionId: scope.collectionId });
+          if (signal.aborted) return { width: 0, height: 0 };
+          if (response?.success && Number(response.width) > 0 && Number(response.height) > 0) {
+            return {
+              width: Number(response.width), height: Number(response.height),
+              format: String(response.format || "").toLowerCase(),
+              formatTrusted: response.formatTrusted === true
+            };
+          }
+          return { width: 0, height: 0 };
+        }
+        return await PageImageCollectorMetadata.probeDomDimensions(normalizedUrl, signal);
       }
-      return { width: 0, height: 0 };
-    }
-    return await domProbe();
-  })();
-
-  imageDimensionCache.set(normalizedUrl, promise);
-  const result = await promise;
-  if ((Number(result?.width) || 0) <= 0 || (Number(result?.height) || 0) <= 0) {
-    imageDimensionCache.delete(normalizedUrl);
+    });
   }
-  return result;
+  return dimensionProbeQueue.get(url, JSON.stringify({ tabId: sourceTabId, collectionId }));
 };
 
 const computeArea = (width, height) => Math.max(0, (Number(width) || 0) * (Number(height) || 0));
@@ -507,29 +539,43 @@ const shouldApplyDetectedFormat = (image, meta = {}) => {
   const format = String(meta.format || "").trim().toLowerCase();
   if (!image?.id || !format || format === "unknown") return false;
   const currentFormat = String(image.format || "").toLowerCase();
-  return currentFormat === "unknown" || (meta.formatTrusted === true && format !== currentFormat);
+  return currentFormat === "unknown" ||
+    (meta.formatTrusted === true && (format !== currentFormat || image.formatTrusted !== true));
 };
 
-const sendImageFormatUpdate = (image, meta = {}) => {
+const sendImageMetadataUpdate = (image, meta = {}) => {
+  if (!image?.id) return;
   const format = String(meta.format || "").trim().toLowerCase();
-  if (!shouldApplyDetectedFormat(image, meta)) return;
+  const measured = PageImageCollectorMetadata.dimensions(meta);
+  const stored = getStoredDimensionMeta(image);
+  const loadedUrl = String(meta.url || '');
+  const persistentCandidate = loadedUrl && loadedUrl !== image.src &&
+    !/^(?:blob|data|chrome-extension):/i.test(loadedUrl);
+  const shouldSaveDimensions = measured.area > stored.area;
+  const shouldSaveCandidate = persistentCandidate && measured.area >= stored.area &&
+    (loadedUrl !== image.hdSrc || image.hdSrcVerified !== true);
+  const shouldSaveFormat = shouldApplyDetectedFormat(image, meta);
+  if (!shouldSaveDimensions && !shouldSaveCandidate && !shouldSaveFormat && !meta.comparedHdSrc) return;
+  const formatChanged = shouldSaveFormat && format !== String(image.format || "").toLowerCase();
   sendMessage(MSG.UPDATE_IMAGE_METADATA, {
     imageId: image.id,
-    url: image.hdSrc || image.src || image.originalSrc || "",
-    maxWidth: Number(meta.width) || Number(image.maxWidth) || Number(image.width) || 0,
-    maxHeight: Number(meta.height) || Number(image.maxHeight) || Number(image.height) || 0,
-    maxArea: Number(meta.area) || Number(image.maxArea) || Number(image.area) || 0,
+    collectionId: image.collectionId,
+    url: meta.url || "",
+    comparedHdSrc: meta.comparedHdSrc || "",
+    maxWidth: measured.width,
+    maxHeight: measured.height,
+    maxArea: measured.area,
     format,
     formatTrusted: meta.formatTrusted === true
   }).then((response) => {
-    if (response?.updated) scheduleMetadataRenderRefresh();
+    if (response?.updated && formatChanged) scheduleMetadataRenderRefresh();
   }).catch(() => {});
 };
 
 const applyDetectedFormat = (image, meta = {}) => {
   if (!shouldApplyDetectedFormat(image, meta)) return false;
-  sendImageFormatUpdate(image, meta);
   image.format = String(meta.format || "").trim().toLowerCase();
+  if (meta.formatTrusted === true) image.formatTrusted = true;
   return true;
 };
 
@@ -547,73 +593,60 @@ const runWithConcurrency = async (tasks, concurrency) => {
   return results;
 };
 
+const getStoredDimensionMeta = (image) => PageImageCollectorMetadata.selectLargestDimensions(
+  { width: image?.width, height: image?.height },
+  [{ width: image?.maxWidth, height: image?.maxHeight }]
+);
+
 const getCardMeta = (image) => {
   const cached = cardDimensionCache.get(image.id);
   if (cached && currentConfig.enableHD) return cached;
-  const width = Number(image.width) || 0;
-  const height = Number(image.height) || 0;
-  return {
-    width,
-    height,
-    area: Math.max(Number(image.area) || 0, computeArea(width, height))
-  };
+  return currentConfig.enableHD ? getStoredDimensionMeta(image)
+    : PageImageCollectorMetadata.dimensions({ width: image.width, height: image.height });
 };
 
-const resolveCardMaxDimensions = async (image) => {
-  if (!image?.id) return getCardMeta(image);
+const resolveCardMaxDimensions = async (image, options = {}) => {
+  if (!image?.id) return { width: 0, height: 0, area: 0 };
+  if (image.collectionId && activeCollectionId && image.collectionId !== activeCollectionId) return getCardMeta(image);
+  const metadataGeneration = options.metadataGeneration ?? imageMetadataGeneration;
+  if (metadataGeneration !== imageMetadataGeneration) return getCardMeta(image);
+  const sourcesKey = JSON.stringify([image.src, image.hdSrc]);
   const cached = cardDimensionCache.get(image.id);
-  if (cached) return cached;
-
+  if (cached?.sourcesKey === sourcesKey && Date.now() < cached.retryAt &&
+      cached.area >= getStoredDimensionMeta(image).area) return cached;
   const pendingTask = cardDimensionTasks.get(image.id);
-  if (pendingTask) return await pendingTask;
-
+  if (pendingTask?.sourcesKey === sourcesKey) return await pendingTask;
   const hasHdCandidate = Boolean(image.hdSrc && image.hdSrc !== image.src);
 
-  const task = (async () => {
+  let task;
+  task = (async () => {
     try {
-      const probes = [getImageDimensions(image.src)];
-      if (hasHdCandidate) {
-        probes.push(getImageDimensions(image.hdSrc));
+      const [srcDim, hdDim = { width: 0, height: 0 }] = await Promise.all([
+        getImageDimensions(image.src, image.collectionId || activeCollectionId), ...(hasHdCandidate ? [getImageDimensions(image.hdSrc)] : [])
+      ]);
+      if (metadataGeneration !== imageMetadataGeneration || cardDimensionTasks.get(image.id) !== task) return getCardMeta(image);
+      const before = getCardMeta(image);
+      const beforeFormat = String(image.format || "").toLowerCase();
+      const resolved = PageImageCollectorMetadata.selectLargestDimensions(getStoredDimensionMeta(image), [
+        { ...srcDim, url: image.src }, { ...hdDim, url: image.hdSrc }
+      ]);
+      const failed = !computeArea(srcDim.width, srcDim.height) ||
+        (hasHdCandidate && !computeArea(hdDim.width, hdDim.height));
+      const entry = { ...resolved, sourcesKey, retryAt: failed ? Date.now() + 30000 : Infinity,
+        comparedHdSrc: hasHdCandidate && resolved.url === image.src &&
+          computeArea(hdDim.width, hdDim.height) > 0 ? image.hdSrc : "" };
+      cardDimensionCache.set(image.id, entry);
+      sendImageMetadataUpdate(image, entry);
+      applyDetectedFormat(image, entry);
+      if (before.width !== entry.width || before.height !== entry.height || beforeFormat !== String(image.format || "").toLowerCase()) {
+        scheduleMetadataRenderRefresh();
       }
-      const [srcDim, hdDim = { width: 0, height: 0 }] = await Promise.all(probes);
-      const srcArea = computeArea(srcDim.width, srcDim.height);
-      const hdArea = computeArea(hdDim.width, hdDim.height);
-      const base = getCardMeta(image);
-      let width = base.width;
-      let height = base.height;
-      let area = base.area;
-      let bestDim = base;
-      let bestFormatDim = srcDim.format ? srcDim : hdDim;
-
-      if (srcArea >= area) {
-        width = srcDim.width;
-        height = srcDim.height;
-        area = srcArea;
-        bestDim = srcDim;
-        if (srcDim.format) bestFormatDim = srcDim;
-      }
-      if (hdArea >= area) {
-        width = hdDim.width;
-        height = hdDim.height;
-        area = hdArea;
-        bestDim = hdDim;
-        if (hdDim.format) bestFormatDim = hdDim;
-      }
-
-      const resolved = {
-        width,
-        height,
-        area,
-        format: bestDim.format || bestFormatDim.format || "",
-        formatTrusted: bestDim.formatTrusted === true || bestFormatDim.formatTrusted === true
-      };
-      cardDimensionCache.set(image.id, resolved);
-      return resolved;
+      return entry;
     } finally {
-      cardDimensionTasks.delete(image.id);
+      if (cardDimensionTasks.get(image.id) === task) cardDimensionTasks.delete(image.id);
     }
   })();
-
+  task.sourcesKey = sourcesKey;
   cardDimensionTasks.set(image.id, task);
   return await task;
 };
@@ -666,23 +699,33 @@ const resolveImageFormat = (image) => {
   return formatFromUrl(image?.displaySrc || image?.hdSrc || image?.src || image?.originalSrc || "");
 };
 
-const fallbackImageError = (imgElement, fallbackUrl, image = null) => {
-  if (!fallbackUrl) return;
-  if (imgElement.dataset.fallbackApplied && imgElement.dataset.fallbackApplied !== "0") return;
-  imgElement.dataset.fallbackApplied = "1";
-  imgElement.src = fallbackUrl;
-  if (!image) return;
-  const candidate = String(fallbackUrl || "");
-  if (!/sinaimg\.cn/i.test(candidate)) return;
-  sendMessage(MSG.COPY_TO_CLIPBOARD, {
-    image,
-    preferredUrl: candidate,
-    preferHD: currentConfig.enableHD
-  }).then((response) => {
-    if (!response?.success || !response.dataUrl) return;
-    imgElement.dataset.fallbackApplied = "2";
-    imgElement.src = response.dataUrl;
-  }).catch(() => {});
+const getPreviewLoader = () => {
+  if (!previewLoader) previewLoader = PageImageCollectorPreview.createLoader({
+    normalize: normalizePreviewImageUrl,
+    isCurrent: image => !image?.collectionId || !activeCollectionId || image.collectionId === activeCollectionId,
+    onExhausted: element => { element.alt = '图片加载失败'; },
+    fetchPreview: async (url, image) => {
+      if (!image?.id || !image.collectionId) return null;
+      const response = await sendMessage(MSG.GET_IMAGE_PREVIEW, { url, imageId: image.id, collectionId: image.collectionId });
+      if (!response?.success || response.collectionId !== image.collectionId || !String(response.dataUrl || '').startsWith('data:image/')) return null;
+      const blob = await (await fetch(response.dataUrl)).blob();
+      const objectUrl = URL.createObjectURL(blob);
+      return { url: objectUrl, release: () => URL.revokeObjectURL(objectUrl) };
+    }
+  });
+  return previewLoader;
+};
+const startImagePreview = (element, image, preferred) => {
+  element.alt = '图片预览';
+  getPreviewLoader().start(element, image, preferred, previewCompatibility);
+};
+const getLoadedPreviewUrl = element => previewLoader?.loadedUrl(element) || element.currentSrc || element.src || '';
+const fallbackImageError = (element, fallbackUrl, image = null) => {
+  if (element.isConnected === false) return Promise.resolve(false);
+  const record = image || { src: fallbackUrl };
+  const loader = getPreviewLoader();
+  if (!loader.has(element, record)) loader.start(element, record, element.currentSrc || element.src || fallbackUrl);
+  return loader.error(element);
 };
 
 const getViewSources = (image) => {
@@ -884,19 +927,7 @@ const renderFormatFilters = (stats = {}) => {
   elements.formatFilters.appendChild(fragment);
 };
 
-const getImageMetaForFilters = (image) => {
-  if (currentConfig.enableHD) {
-    const cached = cardDimensionCache.get(image.id);
-    if (cached) return cached;
-  }
-  const width = Number(image.width) || 0;
-  const height = Number(image.height) || 0;
-  return {
-    width,
-    height,
-    area: Math.max(Number(image.area) || 0, computeArea(width, height))
-  };
-};
+const getImageMetaForFilters = (image) => getCardMeta(image);
 
 const passesMetricFilters = (image, filters) => {
   const meta = getImageMetaForFilters(image);
@@ -982,6 +1013,7 @@ const syncScanButtonLabel = () => {
 };
 
 const createCard = (image, index) => {
+  const metadataGeneration = imageMetadataGeneration;
   const displaySrc = image.displaySrc || image.src;
   const format = String(resolveImageFormat(image) || formatFromUrl(displaySrc) || "unknown").toUpperCase();
   const isSelected = selectedIds.has(image.id);
@@ -995,7 +1027,7 @@ const createCard = (image, index) => {
   const imageNode = document.createElement("img");
   imageNode.alt = "Image preview";
   imageNode.loading = "lazy";
-  setImagePreviewSrc(imageNode, displaySrc, image.src);
+  startImagePreview(imageNode, image, displaySrc);
   wrapper.appendChild(imageNode);
 
   if (isHdBadge(image)) {
@@ -1033,9 +1065,11 @@ const createCard = (image, index) => {
     await toggleSelect(image.id);
   });
 
-  resolveCardMaxDimensions(image).then((resolved) => {
-    dimensions.textContent = `${resolved.width} × ${resolved.height}`;
-    area.textContent = formatAreaMp(resolved.area);
+  resolveCardMaxDimensions(image, { metadataGeneration }).then((resolved) => {
+    if (metadataGeneration !== imageMetadataGeneration) return;
+    const displayMeta = currentConfig.enableHD ? resolved : getCardMeta(image);
+    dimensions.textContent = `${displayMeta.width} × ${displayMeta.height}`;
+    area.textContent = formatAreaMp(displayMeta.area);
     if (applyDetectedFormat(image, resolved)) {
       formatBadge.textContent = String(image.format || "unknown").toUpperCase();
     }
@@ -1068,15 +1102,14 @@ const renderImages = async () => {
       filters.minArea > 0
   );
   if (needsDimensionHydration) {
-    await runWithConcurrency(
+    const metadataGeneration = imageMetadataGeneration;
+    runWithConcurrency(
       visibleAllImages.map((image) => async () => {
-        const resolved = await resolveCardMaxDimensions(image);
-        applyDetectedFormat(image, resolved);
-        return resolved;
+        if (renderToken !== imageRenderToken || metadataGeneration !== imageMetadataGeneration) return;
+        await resolveCardMaxDimensions(image, { metadataGeneration });
       }),
       DIMENSION_PROBE_CONCURRENCY
-    );
-    if (renderToken !== imageRenderToken) return;
+    ).catch(() => {});
   }
 
   const metricAndOrientationFiltered = visibleAllImages
@@ -1150,7 +1183,18 @@ const toggleSelect = async (imageId) => {
   const response = await sendMessage(MSG.TOGGLE_SELECT, { imageId });
   if (!response.success) return;
   selectedIds = new Set(response.selectedIds || []);
-  await renderImages();
+  const card = document.querySelector(`.image-card[data-id="${imageId}"]`);
+  const selected = selectedIds.has(imageId);
+  card?.classList.toggle("selected", selected);
+  const checkbox = card?.querySelector(".checkbox");
+  if (checkbox) {
+    checkbox.classList.toggle("checked", selected);
+    checkbox.textContent = selected ? "✓" : "";
+  }
+  elements.statSelected.textContent = String(selectedIds.size);
+  syncBatchDownloadButtonState();
+  elements.btnCopySelected.disabled = selectedIds.size === 0;
+  syncSelectAllButtonLabel();
 };
 
 const toggleSelectAll = async () => {
@@ -1187,11 +1231,13 @@ const openLightbox = (image, index = -1) => {
   lightboxCurrentSrc = displaySrc;
   lightboxSourceUrl = getImageSourceUrl(image);
   elements.lightboxImage.dataset.fallbackApplied = "0";
-  elements.lightboxImage.src = displaySrc;
+  startImagePreview(elements.lightboxImage, image, displaySrc);
   elements.lightboxImage.onerror = () => fallbackImageError(elements.lightboxImage, image.src, image);
-  elements.lightboxImage.onload = () => syncLightboxMeta(displaySrc);
+  elements.lightboxImage.onload = () => {
+    lightboxCurrentSrc = getLoadedPreviewUrl(elements.lightboxImage);
+    syncLightboxMeta(lightboxCurrentSrc);
+  };
   syncLightboxMeta(displaySrc);
-  preloadClipboardPayload(image, displaySrc, false).catch(() => {});
   updateLightboxNavigation();
   elements.lightbox.classList.add("active");
 };
@@ -1209,6 +1255,10 @@ const navigateLightbox = (step) => {
 };
 
 const closeLightbox = () => {
+  previewLoader?.cancel(elements.lightboxImage);
+  elements.lightboxImage.onload = null;
+  elements.lightboxImage.onerror = null;
+  elements.lightboxImage.removeAttribute('src');
   elements.lightbox.classList.remove("active");
   lightboxImage = null;
   lightboxCurrentSrc = "";
@@ -1217,6 +1267,7 @@ const closeLightbox = () => {
 };
 
 const copyImageOrUrl = async (image, options = {}) => {
+  const metadataGeneration = imageMetadataGeneration;
   const canWriteImage = canWriteClipboardImage();
   const preferredUrl = options.preferredUrl || "";
 
@@ -1237,7 +1288,7 @@ const copyImageOrUrl = async (image, options = {}) => {
     preferredUrl,
     preferHD: options.preferHD === true
   });
-  if (preferredUrl) setClipboardCache(preferredUrl, backgroundResponse);
+  if (preferredUrl && metadataGeneration === imageMetadataGeneration) setClipboardCache(preferredUrl, backgroundResponse);
 
   if (canWriteImage && backgroundResponse?.success && backgroundResponse.dataUrl) {
     try {
@@ -1311,6 +1362,12 @@ const clearImages = async () => {
     return;
   }
 
+  imageMetadataGeneration += 1;
+  imageRenderToken += 1;
+  dimensionProbeQueue?.clear();
+  cardDimensionCache.clear();
+  cardDimensionTasks.clear();
+  clipboardPayloadCache.clear();
   closeLightbox();
   if (metadataRefreshTimer) {
     clearTimeout(metadataRefreshTimer);
@@ -1705,6 +1762,7 @@ chrome.runtime.onMessage.addListener((message) => {
   if (message?.type === MSG.IMAGES_UPDATED) {
     const updatedTabId = Number(message?.payload?.tabId);
     if (!Number.isInteger(updatedTabId) || updatedTabId !== sourceTabId) return;
+    acceptCollectionId(message?.payload?.collectionId, true);
     if (manualScanInProgress) return;
     scheduleRenderRefresh();
     return;

@@ -35,7 +35,13 @@ body {
 .workspace {
   display: flex;
   flex-direction: column;
+  height: 100vh;
   min-height: 100vh;
+}
+
+.workspace > .console,
+.workspace > .comic-banner {
+  flex-shrink: 0;
 }
 
 /* 控制台 */
@@ -407,7 +413,7 @@ html[lang="en"] .logo-text {
   display: flex;
   gap: 8px;
   align-items: center;
-  flex-wrap: nowrap;
+  flex-wrap: wrap;
   min-width: 0;
 }
 
@@ -415,11 +421,13 @@ html[lang="en"] .logo-text {
   display: flex;
   align-items: center;
   gap: 8px;
-  flex-wrap: nowrap;
+  flex-wrap: wrap;
   min-width: 0;
 }
 
 .preset-chip {
+  flex-shrink: 0;
+  white-space: nowrap;
   border: 1px solid var(--border-color);
   background: rgba(255, 255, 255, 0.04);
   color: var(--text-secondary);
@@ -442,6 +450,8 @@ html[lang="en"] .logo-text {
 }
 
 .metric-filter {
+  flex-shrink: 0;
+  white-space: nowrap;
   display: flex;
   align-items: center;
   gap: 8px;
@@ -735,10 +745,12 @@ input[type="number"]::-webkit-inner-spin-button {
 
 /* 画廊 */
 .gallery {
+  min-height: 160px;
   flex: 1;
   padding: 24px;
   display: grid;
   grid-template-columns: repeat(auto-fill, minmax(220px, 1fr));
+  grid-auto-rows: max-content;
   gap: 20px;
   align-content: start;
   position: relative;
