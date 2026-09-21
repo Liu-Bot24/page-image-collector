@@ -123,6 +123,7 @@ let fullscreenZoomed = false;
 let fullscreenCanZoom = false;
 let fullscreenIndex = -1;
 let fullscreenImageId = "";
+let fullscreenRenderToken = 0;
 let fullscreenScrollLock = {
   htmlOverflow: "",
   bodyOverflow: ""
@@ -1830,9 +1831,24 @@ const applyLightboxNavBucket = (width, height) => {
   elements.lightboxContent.classList.add(bucketClass);
 };
 
-const getFullscreenSourceForImage = (image) => {
+const getFullscreenSourceCandidates = (image) => {
   const { previewSrc, originalSrc } = getViewSources(image);
-  return originalSrc || previewSrc || image?.hdSrc || image?.src || image?.originalSrc || "";
+  const source = originalSrc || previewSrc || image?.hdSrc || image?.src || image?.originalSrc || "";
+  // Lightbox alternatives deliberately exclude the preview URL. That exclusion
+  // does not imply the alternative is larger when src already equals the HD URL.
+  return originalSrc && previewSrc && getEffectiveHdSrc(image) === previewSrc
+    ? [source, previewSrc]
+    : [source].filter(Boolean);
+};
+
+const getFullscreenSourceForImage = async (image) => {
+  const sources = getFullscreenSourceCandidates(image);
+  if (sources.length < 2) return sources[0] || "";
+  const dimensions = await Promise.all(sources.map(url => getImageDimensions(url, image.collectionId || activeCollectionId)));
+  // Preserve the existing order on equal sizes or if both probes fail. The
+  // preview loader still handles network/decoding failures of the chosen URL.
+  return computeArea(dimensions[1].width, dimensions[1].height) > computeArea(dimensions[0].width, dimensions[0].height)
+    ? sources[1] : sources[0];
 };
 
 const setFullscreenLoading = (loading, text = "加载中...") => {
@@ -1924,7 +1940,7 @@ const getFullscreenWindowIndexes = (centerIndex) => {
 const pruneFullscreenCache = (centerIndex) => {
   const keepUrls = new Set(
     getFullscreenWindowIndexes(centerIndex)
-      .map((index) => getFullscreenSourceForImage(currentImages[index]))
+      .flatMap((index) => getFullscreenSourceCandidates(currentImages[index]))
       .filter(Boolean)
   );
   for (const [url, pending] of fullscreenPendingTasks) {
@@ -1945,9 +1961,9 @@ const preloadFullscreenAround = (centerIndex) => {
   for (const index of indexes) {
     if (index === centerIndex) continue;
     const image = currentImages[index];
-    const source = getFullscreenSourceForImage(image);
-    if (!source) continue;
-    ensureFullscreenCache(source).catch(() => {});
+    for (const source of getFullscreenSourceCandidates(image)) {
+      ensureFullscreenCache(source).catch(() => {});
+    }
   }
   pruneFullscreenCache(centerIndex);
 };
@@ -2066,9 +2082,12 @@ const renderFullscreenImage = async () => {
   if (!fullscreenActive) return;
   const image = currentImages[fullscreenIndex];
   if (!image) return;
+  const renderToken = ++fullscreenRenderToken;
   fullscreenImageId = image.id;
   pruneFullscreenCache(fullscreenIndex);
-  const source = getFullscreenSourceForImage(image);
+  setFullscreenLoading(true, "加载原图...");
+  const source = await getFullscreenSourceForImage(image);
+  if (!fullscreenActive || renderToken !== fullscreenRenderToken) return;
   if (!source) return;
   elements.fullscreenImage.dataset.source = source;
   elements.fullscreenImage.dataset.fsFallbackStage = "0";
@@ -2076,7 +2095,7 @@ const renderFullscreenImage = async () => {
 
   let loadUrl = source;
   const { displayUrl, cached } = previewCompatibility ? { displayUrl: source, cached: false } : await ensureFullscreenCache(source);
-  if (!fullscreenActive) return;
+  if (!fullscreenActive || renderToken !== fullscreenRenderToken) return;
   if (elements.fullscreenImage.dataset.source !== source) return;
 
   if (!previewCompatibility && !cached && /\.webp(?:\?|$)/i.test(source)) {
@@ -2089,7 +2108,7 @@ const renderFullscreenImage = async () => {
       }
     }
   }
-  if (!fullscreenActive) return;
+  if (!fullscreenActive || renderToken !== fullscreenRenderToken) return;
   if (elements.fullscreenImage.dataset.source !== source) return;
 
   const finalDisplay = loadUrl === source ? (displayUrl || source) : loadUrl;
@@ -2132,6 +2151,7 @@ const openFullscreenViewer = (startIndex = 0) => {
 };
 
 const closeFullscreenViewer = () => {
+  fullscreenRenderToken += 1;
   previewLoader?.cancel(elements.fullscreenImage);
   elements.fullscreenImage.onload = null;
   elements.fullscreenImage.onerror = null;

@@ -395,6 +395,69 @@ test("Fullscreen uses cancellable image preloads and bounds retained decoded pix
   assert.equal(ui.run("fullscreenCache.size"), 1);
 });
 
+for (const primaryIsLarger of [true, false]) {
+  test(`fullscreen compares equal src/HD against the alternative on a cold entry (${primaryIsLarger ? 'primary' : 'alternative'} is larger)`, async () => {
+    const primary = 'https://cdn.example/primary.jpg';
+    const alternative = 'https://cdn.example/alternative.jpg';
+    const ui = await loadUi('workspace', ({ type, payload }) => type === 'PROBE_IMAGE_DIMENSIONS'
+      ? { success: true, width: (payload.url === primary) === primaryIsLarger ? 1600 : 450, height: (payload.url === primary) === primaryIsLarger ? 2399 : 675 }
+      : { success: true });
+    ui.put('fixture', record({ src: primary, hdSrc: primary, originalSrc: alternative }));
+    ui.run('currentImages = [fixture]; fullscreenActive = true; fullscreenIndex = 0');
+    const rendering = ui.run('renderFullscreenImage()');
+    await flush();
+    for (const image of ui.images) { image.naturalWidth = 1600; image.naturalHeight = 2399; image.onload?.(); }
+    await rendering;
+    const expected = primaryIsLarger ? primary : alternative;
+    assert.equal(ui.nodes.get('fullscreen-image').src, expected);
+    assert.equal(ui.run('fullscreenCache.has(elements.fullscreenImage.src)'), true, 'pruning must retain the selected full-size image');
+    await ui.run('fallbackImageError(elements.fullscreenImage, fixture.src, fixture)');
+    assert.equal(ui.nodes.get('fullscreen-image').src, primaryIsLarger ? alternative : primary, 'failed originals still fall back');
+  });
+}
+
+test('fullscreen ignores a late source comparison after switching images or closing', async () => {
+  for (const close of [false, true]) {
+    const probes = [];
+    const ui = await loadUi('workspace', ({ type }) => type === 'PROBE_IMAGE_DIMENSIONS'
+      ? new Promise(resolve => probes.push(resolve)) : { success: true });
+    ui.put('fixtures', [record({ src: 'https://cdn.example/a.jpg', hdSrc: 'https://cdn.example/a.jpg', originalSrc: 'https://cdn.example/alt.jpg' }),
+      record({ id: 'next', src: 'https://cdn.example/next.jpg', hdSrc: 'https://cdn.example/next.jpg' })]);
+    ui.run('currentImages = fixtures; fullscreenActive = true; fullscreenIndex = 0');
+    const first = ui.run('renderFullscreenImage()'); await flush();
+    assert.equal(probes.length, 2);
+    if (close) ui.run('closeFullscreenViewer()');
+    else {
+      ui.run('fullscreenIndex = 1');
+      const next = ui.run('renderFullscreenImage()'); await flush();
+      for (const image of ui.images) { image.naturalWidth = 900; image.naturalHeight = 1200; image.onload?.(); }
+      await next;
+    }
+    for (const resolve of probes) resolve({ success: true, width: 1600, height: 2399 });
+    await first; await flush();
+    assert.equal(ui.nodes.get('fullscreen-image').src || '', close ? '' : 'https://cdn.example/next.jpg');
+  }
+});
+
+test('fullscreen keeps source ordering on ties and failed probes without probing unambiguous images', async () => {
+  for (const [primaryWidth, alternativeWidth, expected] of [[800, 800, 'alternative'], [800, 0, 'primary'], [0, 800, 'alternative'], [0, 0, 'alternative']]) {
+    let probes = 0;
+    const ui = await loadUi('workspace', ({ type, payload }) => {
+      if (type !== 'PROBE_IMAGE_DIMENSIONS') return { success: true };
+      probes += 1;
+      return { success: true, width: payload.url.includes('/primary') ? primaryWidth : alternativeWidth, height: 1200 };
+    });
+    ui.put('fixture', record({ src: 'https://cdn.example/primary.jpg', hdSrc: 'https://cdn.example/primary.jpg', originalSrc: 'https://cdn.example/alternative.jpg' }));
+    const selection = ui.run('getFullscreenSourceForImage(fixture)'); await flush();
+    for (const image of ui.images) image.onerror?.();
+    assert.equal(await selection, `https://cdn.example/${expected}.jpg`);
+    assert.equal(probes, 2);
+    ui.run('fixture.hdSrc = "https://cdn.example/distinct-hd.jpg"');
+    assert.equal(await ui.run('getFullscreenSourceForImage(fixture)'), 'https://cdn.example/distinct-hd.jpg');
+    assert.equal(probes, 2, 'distinct HD selection must not add dimension requests');
+  }
+});
+
 test('fullscreen compatibility exhaustion ends loading and shows a failure state', async () => {
   const ui = await loadUi('workspace', () => ({ success: false, error: 'unavailable' }));
   let loading = false;
