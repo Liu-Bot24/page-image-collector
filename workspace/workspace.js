@@ -489,8 +489,15 @@ const rememberResolvedHdSrc = (image, url) => {
 
 const getResolvedHdSrc = (image) => {
   const entry = image?.id ? resolvedHdUrlMap.get(image.id) : null;
-  if (!entry || entry.src !== image.src) return "";
-  return entry.hdSrc === image.hdSrc || entry.url === image.hdSrc ? entry.url : "";
+  if (!entry) return "";
+  if (entry.src !== image.src || (entry.hdSrc !== image.hdSrc && entry.url !== image.hdSrc)) {
+    resolvedHdUrlMap.delete(image.id);
+    return "";
+  }
+  // Once persistence acknowledges the override, retire its earlier HD identity.
+  // Returning to that earlier address must not resurrect an obsolete override.
+  entry.hdSrc = image.hdSrc;
+  return entry.url;
 };
 
 const getEffectiveHdSrc = (image) => {
@@ -675,6 +682,12 @@ const rememberImageDimensions = (image, meta, options = {}) => {
 
   const baseMeta = getBaseDimensionMeta(image);
   const storedMax = getStoredMaxDimensionMeta(image);
+  if (loadedUrl === image.src && getResolvedHdSrc(image) &&
+      normalized.area >= storedMax.area && normalized.area >= (Number(cached?.area) || 0)) {
+    // A measured primary can supersede a temporary alternative just as an HD
+    // candidate can. Keep the local override consistent with the persisted winner.
+    rememberResolvedHdSrc(image, loadedUrl);
+  }
   const loadedIsLargerThanBase = isPersistentLoadedUrl && normalized.area > baseMeta.area &&
     normalized.area >= storedMax.area;
   if (loadedIsLargerThanBase) {
@@ -1902,7 +1915,8 @@ const ensureFullscreenCache = async (url) => {
   const cached = fullscreenCache.get(url);
   if (cached && (!cached.failed || Date.now() < cached.retryAt)) {
     cached.lastUsed = Date.now();
-    return { displayUrl: url, cached: !cached.failed };
+    return { displayUrl: url, cached: !cached.failed,
+      width: cached.image?.naturalWidth || 0, height: cached.image?.naturalHeight || 0 };
   }
   const pending = fullscreenPendingTasks.get(url);
   if (pending && !pending.controller.signal.aborted) return await pending.task;
@@ -1919,15 +1933,18 @@ const ensureFullscreenCache = async (url) => {
       clearTimeout(timeoutId);
       preload.onload = null;
       preload.onerror = null;
+      const width = loaded ? preload.naturalWidth || 0 : 0;
+      const height = loaded ? preload.naturalHeight || 0 : 0;
       if (generation === fullscreenCacheGeneration && !controller.signal.aborted) {
         // Estimate the retained decoded pixels; encoded network caching belongs to the browser.
-        const size = loaded ? (preload.naturalWidth || 0) * (preload.naturalHeight || 0) * 4 : 0;
+        const size = width * height * 4;
         if (size <= FULLSCREEN_CACHE_MAX_BYTES) {
           fullscreenCache.set(url, { image: loaded ? preload : null, size, lastUsed: Date.now(), retryAt: Date.now() + 30000, failed: !loaded });
           trimFullscreenCache();
         } else preload.removeAttribute("src");
       } else preload.removeAttribute("src");
-      resolve({ displayUrl: url, cached: loaded && !controller.signal.aborted });
+      resolve({ displayUrl: url, cached: loaded && !controller.signal.aborted,
+        width, height });
     };
     controller.signal.addEventListener("abort", () => finish(false), { once: true });
     timeoutId = setTimeout(() => controller.abort(), FULLSCREEN_PRELOAD_TIMEOUT_MS);
@@ -2160,21 +2177,29 @@ const renderFullscreenImage = async () => {
   }
 
   let loadUrl = source;
-  const { displayUrl, cached } = previewCompatibility ? { displayUrl: source, cached: false } : await ensureFullscreenCache(source);
+  let loaded = previewCompatibility ? { displayUrl: source, cached: false } : await ensureFullscreenCache(source);
   if (!isCurrent()) return;
-  if (!previewCompatibility && !cached && /\.webp(?:\?|$)/i.test(source)) {
+  if (!previewCompatibility && !loaded.cached && /\.webp(?:\?|$)/i.test(source)) {
     const jpgAlt = source.replace(/\.webp(?=\?|$)/i, ".jpg");
     if (jpgAlt !== source) {
-      const { cached: jpgCached } = await ensureFullscreenCache(jpgAlt);
+      const jpg = await ensureFullscreenCache(jpgAlt);
       if (!isCurrent()) return;
-      if (jpgCached) {
+      if (jpg.cached) {
         loadUrl = jpgAlt;
-        if (image.id) rememberResolvedHdSrc(image, jpgAlt);
+        loaded = jpg;
       }
     }
   }
   if (!isCurrent()) return;
-  showSource(loadUrl === source ? (displayUrl || source) : loadUrl);
+  // Validate the final decoded fallback, not just the originally selected URL.
+  // A failed upgrade must not discard a working, larger image.
+  if (!previewCompatibility && displayedSource && elements.fullscreenImage.complete && elements.fullscreenImage.naturalWidth > 0 &&
+      (!loaded.cached || computeArea(loaded.width, loaded.height) <= computeArea(elements.fullscreenImage.naturalWidth, elements.fullscreenImage.naturalHeight))) {
+    preloadFullscreenAround(fullscreenIndex);
+    return;
+  }
+  if (loadUrl !== source) rememberResolvedHdSrc(image, loadUrl);
+  showSource(loaded.displayUrl || loadUrl);
   preloadFullscreenAround(fullscreenIndex);
 };
 

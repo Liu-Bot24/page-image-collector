@@ -12,9 +12,11 @@ const { chromium } = await import(process.env.PIC_PLAYWRIGHT_MODULE
   ? pathToFileURL(resolve(process.env.PIC_PLAYWRIGHT_MODULE)).href : 'playwright');
 await mkdir(output, { recursive: true });
 const bitmaps = new Map();
+let failUpgrade = false;
 const server = createServer((req, res) => {
   const path = new URL(req.url, 'http://localhost').pathname;
   res.setHeader('Cache-Control', 'no-store');
+  if (failUpgrade && path === '/upgrade.webp') { res.writeHead(503); res.end(); return; }
   if (bitmaps.has(path)) {
     res.writeHead(200, { 'Content-Type': 'image/png' });
     res.end(bitmaps.get(path));
@@ -37,8 +39,8 @@ try {
   const worker = context.serviceWorkers()[0] || await context.waitForEvent('serviceworker');
   const generator = await context.newPage();
   await generator.goto(origin);
-  const pngs = await generator.evaluate(() => [450, 1600].map(width => {
-    const canvas = document.createElement('canvas'); canvas.width = width; canvas.height = width === 450 ? 675 : 2399;
+  const pngs = await generator.evaluate(() => [450, 1600, 2400].map(width => {
+    const canvas = document.createElement('canvas'); canvas.width = width; canvas.height = width === 450 ? 675 : width === 1600 ? 2399 : 3200;
     const ctx = canvas.getContext('2d'); ctx.fillStyle = '#357c94'; ctx.fillRect(0, 0, canvas.width, canvas.height);
     ctx.fillStyle = 'white'; ctx.font = '40px sans-serif'; ctx.fillText(`${canvas.width} x ${canvas.height}`, 20, 80);
     return canvas.toDataURL('image/png').split(',')[1];
@@ -47,6 +49,8 @@ try {
     bitmaps.set(`/small${suffix}.png`, Buffer.from(pngs[0], 'base64'));
     bitmaps.set(`/large${suffix}.png`, Buffer.from(pngs[1], 'base64'));
   }
+  bitmaps.set('/upgrade.webp', Buffer.from(pngs[2], 'base64'));
+  bitmaps.set('/upgrade.jpg', Buffer.from(pngs[0], 'base64'));
   const source = await context.newPage(); await source.goto(`${origin}/fixture`);
   const tabId = await worker.evaluate(async url => (await chrome.tabs.query({})).find(tab => tab.url === url).id, source.url());
   await worker.evaluate(id => chrome.tabs.sendMessage(id, { type: 'START_AUTO_SCAN' }), tabId);
@@ -103,7 +107,9 @@ try {
       if (message.type === 'PROBE_IMAGE_DIMENSIONS') gate.started.push(url);
       const kind = gate.mode === 'race' && message.type === 'GET_IMAGE_PREVIEW' && url.endsWith('/large-other.png') ? 'old'
         : gate.mode === 'race' && message.type === 'PROBE_IMAGE_DIMENSIONS' ? 'comparison'
-        : gate.mode === 'queue' && message.type === 'PROBE_IMAGE_DIMENSIONS' && url.includes('?card=') ? 'card' : '';
+        : gate.mode === 'queue' && message.type === 'PROBE_IMAGE_DIMENSIONS' && url.includes('?card=') ? 'card'
+        : gate.mode === 'mapping' && message.type === 'PROBE_IMAGE_DIMENSIONS' && url.endsWith('/large.png') ? 'primary'
+        : gate.mode === 'upgrade' && message.type === 'PROBE_IMAGE_DIMENSIONS' && url.endsWith('/upgrade.webp') ? 'upgrade' : '';
       if (!kind) return send(message, callback);
       return send(message, response => gate.held.push({ kind, release: () => callback(response) }));
     };
@@ -156,6 +162,52 @@ try {
   });
   assert.equal((await inspectFullscreen()).width, 1600);
   passed('decoded 1600px image displays while 24 card probes wait; comparison gets a free slot without waiting for them all');
+
+  if (process.env.PIC_FULLSCREEN_REGRESSION !== 'fallback') {
+    await ui.evaluate(async index => {
+      closeFullscreenViewer(); closeLightbox(); dimensionProbeQueue?.clear(); cardDimensionCache.clear(); resolvedHdUrlMap.clear();
+      replyGate.mode = 'mapping';
+      const image = { ...currentImages[index], width: 298, height: 398, area: 298 * 398, maxWidth: 0, maxHeight: 0, maxArea: 0 };
+      image.hdSrc = image.src; image.displaySrc = image.src;
+      globalThis.mappingImageId = image.id;
+      await getImageDimensions(image.originalSrc, image.collectionId);
+      currentImages = [image]; fullscreenActive = true; fullscreenIndex = 0;
+      globalThis.renderDone = renderFullscreenImage();
+    }, primaryIndex);
+    await ui.waitForFunction(() => replyGate.held.some(reply => reply.kind === 'primary') && elements.fullscreenImage.naturalWidth === 450 && !elements.fullscreenLoading.classList.contains('active'));
+    await ui.evaluate(async () => { replyGate.mode = ''; for (const reply of replyGate.held.splice(0)) reply.release(); await renderDone; });
+    await ui.waitForFunction(() => elements.fullscreenImage.naturalWidth === 1600 && !elements.fullscreenLoading.classList.contains('active'));
+    await ui.evaluate(async () => {
+      const response = await sendMessage(MSG.GET_IMAGES);
+      const fresh = response.images.find(image => image.id === mappingImageId);
+      if (fresh.hdSrc !== fresh.src || fresh.maxWidth !== 1600) throw new Error('background must retain measured primary');
+      if (getEffectiveHdSrc(fresh) !== fresh.src) throw new Error('stale local small override survived the primary upgrade');
+      currentImages = [fresh]; await renderFullscreenImage();
+      await resolveCardMaxDimensions(fresh);
+      const next = await sendMessage(MSG.GET_IMAGES);
+      currentImages = next.images.filter(image => image.id === mappingImageId);
+      closeFullscreenViewer(); openFullscreenViewer(0);
+    });
+    await ui.waitForFunction(() => elements.fullscreenImage.naturalWidth === 1600 && !elements.fullscreenLoading.classList.contains('active'));
+    passed('temporary small display upgrades to primary and remains large after background refresh, card completion and reopen');
+  }
+
+  await ui.evaluate(async origin => {
+    closeFullscreenViewer(); closeLightbox(); dimensionProbeQueue?.clear(); cardDimensionCache.clear(); resolvedHdUrlMap.clear();
+    replyGate.mode = 'upgrade';
+    const stored = (await sendMessage(MSG.GET_IMAGES)).images.find(image => image.src.endsWith('/large.png'));
+    const image = { ...stored, originalSrc: `${origin}/upgrade.webp`, hdSrc: stored.src, displaySrc: stored.src };
+    await getImageDimensions(image.src, image.collectionId);
+    currentImages = [image]; fullscreenActive = true; fullscreenIndex = 0;
+    globalThis.renderDone = renderFullscreenImage();
+  }, origin);
+  await ui.waitForFunction(() => replyGate.held.some(reply => reply.kind === 'upgrade') && elements.fullscreenImage.naturalWidth === 1600 && !elements.fullscreenLoading.classList.contains('active'));
+  failUpgrade = true;
+  await ui.evaluate(async () => { replyGate.mode = ''; for (const reply of replyGate.held.splice(0)) reply.release(); await renderDone; });
+  assert.equal(await ui.evaluate(() => getLoadedPreviewUrl(elements.fullscreenImage).endsWith('/large.png')), true);
+  assert.equal((await inspectFullscreen()).width, 1600);
+  assert.equal(await ui.evaluate(() => getEffectiveHdSrc(currentImages[0]).endsWith('/upgrade.jpg')), false);
+  passed('failed 2400px upgrade with a decoded 450px JPG fallback preserves the working 1600px image and source mapping');
 } finally {
   await context?.close();
   await new Promise(resolve => server.close(resolve));

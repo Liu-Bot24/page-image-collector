@@ -472,6 +472,110 @@ test('fullscreen upgrades a displayed measured source only after a larger candid
   assert.equal(element.src, 'https://cdn.example/alternative.jpg');
 });
 
+test('fullscreen keeps the upgraded primary after reloading the background record', async () => {
+  const originalChrome = globalThis.chrome;
+  globalThis.chrome = { storage: { local: { get: async () => ({}), set: async () => {} } } };
+  const manager = createTabStateManager();
+  try {
+    await manager.ensureReady();
+    const primary = 'https://cdn.example/primary.jpg';
+    const small = 'https://cdn.example/small.jpg';
+    manager.mergeImages(7, [record({ src: primary, hdSrc: primary, originalSrc: small, width: 298, height: 398 })]);
+    const [fixture] = manager.getAllImages(7);
+    let finishPrimary;
+    const ui = await loadUi('workspace', ({ type, payload }) => {
+      if (type === 'UPDATE_IMAGE_METADATA') return dispatchMetadata(manager, payload);
+      if (type === 'PROBE_IMAGE_DIMENSIONS') return payload.url === small
+        ? { success: true, width: 450, height: 675 }
+        : new Promise(resolve => { finishPrimary = resolve; });
+      return { success: true };
+    });
+    ui.put('fixture', fixture);
+    await ui.run('getImageDimensions(fixture.originalSrc, fixture.collectionId)');
+    ui.run('currentImages = [fixture]; fullscreenActive = true; fullscreenIndex = 0');
+    const rendering = ui.run('renderFullscreenImage()'); await flush();
+    const element = ui.nodes.get('fullscreen-image');
+    assert.equal(element.src, small);
+    element.naturalWidth = 450; element.naturalHeight = 675; element.complete = true; element.onload(); await flush();
+    finishPrimary({ success: true, width: 1600, height: 2399 }); await flush();
+    for (const image of ui.images) { image.naturalWidth = 1600; image.naturalHeight = 2399; image.complete = true; image.onload?.(); }
+    await rendering;
+    assert.equal(element.src, primary);
+    element.naturalWidth = 1600; element.naturalHeight = 2399; element.onload(); await flush();
+    const [fresh] = manager.getAllImages(7);
+    assert.equal(fresh.hdSrc, primary);
+    assert.equal(fresh.maxWidth, 1600);
+    ui.put('fresh', fresh);
+    assert.equal(ui.run('getEffectiveHdSrc(fresh)'), primary, 'local override must agree with the measured winner after refresh');
+    ui.run('currentImages = [fresh]');
+    await ui.run('renderFullscreenImage()');
+    assert.equal(element.src, primary);
+    await ui.run('resolveCardMaxDimensions(fresh)'); await flush();
+    ui.put('fresh', manager.getAllImages(7)[0]);
+    assert.equal(ui.run('getEffectiveHdSrc(fresh)'), primary);
+  } finally {
+    await manager.flushPersistence(); globalThis.chrome = originalChrome;
+  }
+});
+
+for (const fallbackWidth of [450, 2000]) {
+  test(`fullscreen evaluates the decoded JPG fallback before replacing a working primary (${fallbackWidth}px)`, async () => {
+    const primary = 'https://cdn.example/primary.jpg';
+    const alternative = 'https://cdn.example/alternative.webp';
+    let finishAlternative;
+    const ui = await loadUi('workspace', ({ type, payload }) => type !== 'PROBE_IMAGE_DIMENSIONS' ? { success: true }
+      : payload.url === primary ? { success: true, width: 1600, height: 2399 }
+        : new Promise(resolve => { finishAlternative = resolve; }));
+    ui.put('fixture', record({ src: primary, hdSrc: primary, originalSrc: alternative }));
+    await ui.run('getImageDimensions(fixture.src)');
+    ui.run('currentImages = [fixture]; fullscreenActive = true; fullscreenIndex = 0');
+    const rendering = ui.run('renderFullscreenImage()'); await flush();
+    const element = ui.nodes.get('fullscreen-image');
+    element.naturalWidth = 1600; element.naturalHeight = 2399; element.complete = true; element.onload();
+    finishAlternative({ success: true, width: 2400, height: 3200 }); await flush();
+    ui.images.find(image => image.src === alternative).onerror(); await flush();
+    const jpg = ui.images.find(image => image.src === alternative.replace('.webp', '.jpg'));
+    jpg.naturalWidth = fallbackWidth; jpg.naturalHeight = fallbackWidth === 450 ? 675 : 3000; jpg.complete = true; jpg.onload();
+    await rendering;
+    const expected = fallbackWidth === 450 ? primary : jpg.src;
+    assert.equal(element.src, expected, 'only a genuinely larger decoded fallback should replace the working image');
+    assert.notEqual(ui.run('getEffectiveHdSrc(fixture)'), fallbackWidth === 450 ? jpg.src : '');
+  });
+}
+
+test('fullscreen still uses a small decoded JPG when no working image is displayed', async () => {
+  const ui = await loadUi('workspace', () => ({ success: true }));
+  ui.put('fixture', record({ hdSrc: 'https://cdn.example/full.webp' }));
+  ui.run('currentImages = [fixture]; fullscreenActive = true; fullscreenIndex = 0');
+  const rendering = ui.run('renderFullscreenImage()'); await flush();
+  ui.images.find(image => image.src.endsWith('/full.webp')).onerror(); await flush();
+  const jpg = ui.images.find(image => image.src.endsWith('/full.jpg'));
+  jpg.naturalWidth = 100; jpg.naturalHeight = 150; jpg.complete = true; jpg.onload();
+  await rendering;
+  assert.equal(ui.nodes.get('fullscreen-image').src, jpg.src);
+  assert.equal(ui.run('getEffectiveHdSrc(fixture)'), jpg.src);
+});
+
+test('workspace retires acknowledged or invalidated source overrides without reviving old HD identities', async () => {
+  for (const acknowledge of [false, true]) {
+    const ui = await loadUi('workspace', () => ({ success: true }));
+    ui.put('fixture', record());
+    ui.run("rememberResolvedHdSrc(fixture, 'https://cdn.example/fallback.jpg')");
+    ui.run(acknowledge ? "fixture.hdSrc = 'https://cdn.example/fallback.jpg'" : "fixture.hdSrc = 'https://cdn.example/new.jpg'");
+    assert.equal(ui.run('getEffectiveHdSrc(fixture)'), acknowledge ? 'https://cdn.example/fallback.jpg' : 'https://cdn.example/new.jpg');
+    ui.run("fixture.hdSrc = 'https://cdn.example/full.jpg'");
+    assert.equal(ui.run('getEffectiveHdSrc(fixture)'), 'https://cdn.example/full.jpg');
+  }
+});
+
+test('a smaller measured primary does not displace a larger resolved alternative', async () => {
+  const ui = await loadUi('workspace', () => ({ success: true }));
+  ui.put('fixture', record());
+  ui.run("rememberImageDimensions(fixture, { width: 1800, height: 2400 }, { url: 'https://cdn.example/fallback.jpg' })");
+  ui.run('rememberImageDimensions(fixture, { width: 450, height: 675 }, { url: fixture.src })');
+  assert.equal(ui.run('getEffectiveHdSrc(fixture)'), 'https://cdn.example/fallback.jpg');
+});
+
 test('priority probes reuse queued work and peek respects expiry and context', async () => {
   const pending = [];
   const ui = await loadUi('workspace', () => ({ success: true }));
