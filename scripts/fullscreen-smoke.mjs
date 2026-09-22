@@ -90,6 +90,72 @@ try {
   await ui.locator('#fullscreen-close').click();
   assert.equal(await ui.evaluate(() => fullscreenCache.size + fullscreenPendingTasks.size), 0);
   passed('closing releases fullscreen cache and pending preloads');
+
+  // Keep the full extension, network and image decoder real. Only delay delivery
+  // of selected runtime replies to reproduce the two independent Pro findings.
+  await ui.evaluate(() => {
+    closeLightbox();
+    const send = chrome.runtime.sendMessage.bind(chrome.runtime);
+    globalThis.replyGate = { mode: '', held: [], started: [], cardsDone: 0 };
+    chrome.runtime.sendMessage = (message, callback) => {
+      const gate = globalThis.replyGate;
+      const url = message.payload?.url || '';
+      if (message.type === 'PROBE_IMAGE_DIMENSIONS') gate.started.push(url);
+      const kind = gate.mode === 'race' && message.type === 'GET_IMAGE_PREVIEW' && url.endsWith('/large-other.png') ? 'old'
+        : gate.mode === 'race' && message.type === 'PROBE_IMAGE_DIMENSIONS' ? 'comparison'
+        : gate.mode === 'queue' && message.type === 'PROBE_IMAGE_DIMENSIONS' && url.includes('?card=') ? 'card' : '';
+      if (!kind) return send(message, callback);
+      return send(message, response => gate.held.push({ kind, release: () => callback(response) }));
+    };
+  });
+  if (process.env.PIC_FULLSCREEN_REGRESSION !== 'queue') {
+    await ui.evaluate(index => {
+      closeFullscreenViewer(); dimensionProbeQueue?.clear(); cardDimensionCache.clear();
+      previewCompatibility = true; replyGate.mode = 'race';
+      const b = currentImages[index];
+      const other = currentImages.find(image => image.id !== b.id);
+      const a = { ...other, src: other.originalSrc, hdSrc: other.originalSrc, originalSrc: other.originalSrc };
+      globalThis.regressionRecords = currentImages;
+      currentImages = [a, b]; openFullscreenViewer(0);
+    }, primaryIndex);
+    await ui.waitForFunction(() => replyGate.held.some(reply => reply.kind === 'old'));
+    await ui.evaluate(() => { fullscreenIndex = 1; void renderFullscreenImage(); });
+    await ui.waitForFunction(() => replyGate.held.filter(reply => reply.kind === 'comparison').length === 2);
+    await ui.evaluate(() => {
+      const index = replyGate.held.findIndex(reply => reply.kind === 'old');
+      replyGate.held.splice(index, 1)[0].release();
+    });
+    // Give an erroneous old blob assignment enough time to decode and fire load.
+    await ui.waitForTimeout(200);
+    assert.equal(await ui.locator('#fullscreen-image').getAttribute('src'), null);
+    assert.equal(await ui.locator('#fullscreen-loading').evaluate(node => node.classList.contains('active')), true);
+    await ui.evaluate(() => { replyGate.mode = ''; for (const reply of replyGate.held.splice(0)) reply.release(); });
+    await ui.waitForFunction(() => !elements.fullscreenLoading.classList.contains('active') && elements.fullscreenImage.naturalWidth === 1600);
+    assert.equal(await ui.evaluate(() => getLoadedPreviewUrl(elements.fullscreenImage).endsWith('/large.png')), true);
+    passed('late A compatibility response cannot display A or stop B loading during B comparison');
+    await ui.evaluate(() => { closeFullscreenViewer(); currentImages = regressionRecords; });
+  }
+  await ui.evaluate(async index => {
+    closeFullscreenViewer(); closeLightbox(); dimensionProbeQueue?.clear(); cardDimensionCache.clear();
+    previewCompatibility = false; replyGate.mode = 'queue'; replyGate.started = [];
+    const image = currentImages[index];
+    await getImageDimensions(image.src);
+    const decoded = new Image(); decoded.src = image.src; await decoded.decode();
+    globalThis.cardProbes = Array.from({ length: 24 }, (_, i) => getImageDimensions(`${image.src}?card=${i}`).then(() => { replyGate.cardsDone += 1; }));
+    openFullscreenViewer(index);
+  }, primaryIndex);
+  await ui.waitForFunction(() => replyGate.held.filter(reply => reply.kind === 'card').length === 8);
+  await ui.waitForFunction(() => elements.fullscreenImage.naturalWidth === 1600 && !elements.fullscreenLoading.classList.contains('active'), null, { timeout: 3000 });
+  assert.equal(await ui.evaluate(() => replyGate.cardsDone), 0);
+  await ui.evaluate(() => replyGate.held.shift().release());
+  await ui.waitForFunction(() => replyGate.started.some(url => url.endsWith('/small.png')));
+  await ui.evaluate(async () => {
+    replyGate.mode = '';
+    for (const reply of replyGate.held.splice(0)) reply.release();
+    await Promise.all(cardProbes);
+  });
+  assert.equal((await inspectFullscreen()).width, 1600);
+  passed('decoded 1600px image displays while 24 card probes wait; comparison gets a free slot without waiting for them all');
 } finally {
   await context?.close();
   await new Promise(resolve => server.close(resolve));

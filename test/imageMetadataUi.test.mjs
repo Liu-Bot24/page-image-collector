@@ -395,6 +395,107 @@ test("Fullscreen uses cancellable image preloads and bounds retained decoded pix
   assert.equal(ui.run("fullscreenCache.size"), 1);
 });
 
+test('fullscreen cancels an old compatibility preview while the next comparison is pending', async () => {
+  const probes = [];
+  const ui = await loadUi('workspace', ({ type }) => type === 'PROBE_IMAGE_DIMENSIONS'
+    ? new Promise(resolve => probes.push(resolve)) : { success: true });
+  let loading = false;
+  let finishOld;
+  let released = false;
+  ui.nodes.get('fullscreen-loading').classList.toggle = (name, value) => { if (name === 'active') loading = value; };
+  ui.put('fetchPreview', () => new Promise(resolve => { finishOld = resolve; }));
+  ui.put('fixtures', [record({ id: 'a', src: 'https://cdn.example/a.jpg', hdSrc: 'https://cdn.example/a.jpg' }),
+    record({ id: 'b', src: 'https://cdn.example/b.jpg', hdSrc: 'https://cdn.example/b.jpg', originalSrc: 'https://cdn.example/b-alt.jpg' })]);
+  ui.run('previewLoader = PageImageCollectorPreview.createLoader({ fetchPreview }); previewCompatibility = true; currentImages = fixtures; fullscreenActive = true; fullscreenIndex = 0');
+  await ui.run('renderFullscreenImage()'); await flush();
+  const oldLoad = ui.nodes.get('fullscreen-image').onload;
+  const oldError = ui.nodes.get('fullscreen-image').onerror;
+  ui.run('fullscreenIndex = 1');
+  const next = ui.run('renderFullscreenImage()'); await flush();
+  finishOld({ url: 'blob:old-a', release: () => { released = true; } }); await flush();
+  assert.notEqual(ui.nodes.get('fullscreen-image').src, 'blob:old-a');
+  oldLoad(); oldError(); await flush();
+  assert.equal(loading, true, 'old load/error callbacks must not finish the new loading state');
+  assert.equal(released, true, 'late object URL must be released');
+  ui.run('closeFullscreenViewer()');
+  for (const resolve of probes) resolve({ success: true, width: 800, height: 1200 });
+  await next;
+});
+
+test('fullscreen displays a measured source before unrelated card probes finish', async () => {
+  const pending = [];
+  const started = [];
+  const primary = 'https://cdn.example/primary.jpg';
+  const alternative = 'https://cdn.example/alternative.jpg';
+  const ui = await loadUi('workspace', ({ type, payload }) => {
+    if (type !== 'PROBE_IMAGE_DIMENSIONS') return { success: true };
+    started.push(payload.url);
+    if (payload.url === primary) return { success: true, width: 1600, height: 2399 };
+    return new Promise(resolve => pending.push({ url: payload.url, resolve }));
+  });
+  await ui.run(`getImageDimensions('${primary}')`);
+  const cards = Array.from({ length: 24 }, (_, i) => ui.run(`getImageDimensions('https://cdn.example/card-${i}.jpg')`));
+  await flush();
+  ui.put('fixture', record({ src: primary, hdSrc: primary, originalSrc: alternative }));
+  ui.run('currentImages = [fixture]; fullscreenActive = true; fullscreenIndex = 0');
+  const rendering = ui.run('renderFullscreenImage()'); await flush();
+  assert.equal(ui.nodes.get('fullscreen-image').src, primary, 'available image must not wait for the shared queue');
+  assert.equal(pending.length, ui.run('DIMENSION_PROBE_CONCURRENCY'));
+  pending.shift().resolve({ success: true, width: 100, height: 100 }); await flush();
+  assert.equal(started.at(-1), alternative, 'fullscreen comparison takes the next free slot without raising concurrency');
+  while (pending.length) {
+    for (const task of pending.splice(0)) task.resolve({ success: true, width: 450, height: 675 });
+    await flush();
+  }
+  await Promise.all(cards); await rendering;
+  assert.equal(ui.nodes.get('fullscreen-image').src, primary);
+});
+
+test('fullscreen upgrades a displayed measured source only after a larger candidate resolves', async () => {
+  let finishAlternative;
+  const ui = await loadUi('workspace', ({ type, payload }) => {
+    if (type !== 'PROBE_IMAGE_DIMENSIONS') return { success: true };
+    return payload.url.endsWith('/primary.jpg') ? { success: true, width: 450, height: 675 }
+      : new Promise(resolve => { finishAlternative = resolve; });
+  });
+  ui.put('fixture', record({ src: 'https://cdn.example/primary.jpg', hdSrc: 'https://cdn.example/primary.jpg', originalSrc: 'https://cdn.example/alternative.jpg' }));
+  await ui.run('getImageDimensions(fixture.src)');
+  ui.run('currentImages = [fixture]; fullscreenActive = true; fullscreenIndex = 0');
+  const rendering = ui.run('renderFullscreenImage()'); await flush();
+  const element = ui.nodes.get('fullscreen-image');
+  assert.equal(element.src, 'https://cdn.example/primary.jpg');
+  element.naturalWidth = 450; element.naturalHeight = 675; element.complete = true;
+  element.onload();
+  finishAlternative({ success: true, width: 1600, height: 2399 }); await flush();
+  for (const image of ui.images) { image.naturalWidth = 1600; image.naturalHeight = 2399; image.onload?.(); }
+  await rendering;
+  assert.equal(element.src, 'https://cdn.example/alternative.jpg');
+});
+
+test('priority probes reuse queued work and peek respects expiry and context', async () => {
+  const pending = [];
+  const ui = await loadUi('workspace', () => ({ success: true }));
+  ui.put('probe', url => new Promise(resolve => pending.push({ url, resolve })));
+  ui.run('const priorityQueue = PageImageCollectorMetadata.createDimensionProbeQueue({ probe, concurrency: 1, successTtlMs: 100 });');
+  const a = ui.run('priorityQueue.get("a", "current")');
+  const b = ui.run('priorityQueue.get("b", "current")');
+  const c = ui.run('priorityQueue.get("c", "current")');
+  assert.equal(ui.run('priorityQueue.get("c", "current", { priority: true })'), c);
+  await flush();
+  assert.deepEqual(pending.map(item => item.url), ['a']);
+  pending.shift().resolve({ width: 100, height: 200 }); await a; await flush();
+  assert.deepEqual(pending.map(item => item.url), ['c']);
+  pending.shift().resolve({ width: 300, height: 400 }); await c; await flush();
+  assert.equal(ui.run('priorityQueue.peek("c", "current").width'), 300);
+  assert.equal(ui.run('priorityQueue.peek("c", "other")'), undefined);
+  assert.deepEqual(pending.map(item => item.url), ['b']);
+  pending.shift().resolve({ width: 100, height: 200 }); await b;
+  await ui.tick(101);
+  assert.equal(ui.run('priorityQueue.peek("c", "current")'), undefined);
+  ui.run('priorityQueue.clear()');
+  assert.equal(ui.run('priorityQueue.peek("b", "current")'), undefined);
+});
+
 for (const primaryIsLarger of [true, false]) {
   test(`fullscreen compares equal src/HD against the alternative on a cold entry (${primaryIsLarger ? 'primary' : 'alternative'} is larger)`, async () => {
     const primary = 'https://cdn.example/primary.jpg';

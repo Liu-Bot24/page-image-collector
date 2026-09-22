@@ -504,7 +504,7 @@ const getEffectiveHdSrc = (image) => {
   return "";
 };
 
-const getImageDimensions = (url, collectionId = activeCollectionId) => {
+const getImageDimensions = (url, collectionId = activeCollectionId, priority = false) => {
   if (!dimensionProbeQueue) {
     dimensionProbeQueue = PageImageCollectorMetadata.createDimensionProbeQueue({
       concurrency: DIMENSION_PROBE_CONCURRENCY,
@@ -527,7 +527,7 @@ const getImageDimensions = (url, collectionId = activeCollectionId) => {
       }
     });
   }
-  return dimensionProbeQueue.get(url, JSON.stringify({ tabId: sourceTabId, collectionId }));
+  return dimensionProbeQueue.get(url, JSON.stringify({ tabId: sourceTabId, collectionId }), { priority });
 };
 
 const computeArea = (width, height) => Math.max(0, (Number(width) || 0) * (Number(height) || 0));
@@ -1841,10 +1841,28 @@ const getFullscreenSourceCandidates = (image) => {
     : [source].filter(Boolean);
 };
 
+const getKnownFullscreenDimensions = (image, url) => {
+  const collectionId = image.collectionId || activeCollectionId;
+  const sameRecord = other => other?.id === image.id && other?.src === image.src &&
+    (other.collectionId || activeCollectionId) === collectionId;
+  const displayed = sameRecord(lightboxImage) && getLoadedPreviewUrl(elements.lightboxImage) === url
+    ? elements.lightboxImage : null;
+  const preloaded = fullscreenCache.get(url)?.image;
+  for (const loaded of [displayed, preloaded]) {
+    if (loaded?.complete && loaded.naturalWidth > 0 && loaded.naturalHeight > 0) {
+      return { width: loaded.naturalWidth, height: loaded.naturalHeight };
+    }
+  }
+  return dimensionProbeQueue?.peek(url, JSON.stringify({ tabId: sourceTabId, collectionId }));
+};
+
 const getFullscreenSourceForImage = async (image) => {
   const sources = getFullscreenSourceCandidates(image);
   if (sources.length < 2) return sources[0] || "";
-  const dimensions = await Promise.all(sources.map(url => getImageDimensions(url, image.collectionId || activeCollectionId)));
+  const dimensions = await Promise.all(sources.map(url => {
+    const known = getKnownFullscreenDimensions(image, url);
+    return computeArea(known?.width, known?.height) > 0 ? known : getImageDimensions(url, image.collectionId || activeCollectionId, true);
+  }));
   // Preserve the existing order on equal sizes or if both probes fail. The
   // preview loader still handles network/decoding failures of the chosen URL.
   return computeArea(dimensions[1].width, dimensions[1].height) > computeArea(dimensions[0].width, dimensions[0].height)
@@ -2083,57 +2101,80 @@ const renderFullscreenImage = async () => {
   const image = currentImages[fullscreenIndex];
   if (!image) return;
   const renderToken = ++fullscreenRenderToken;
+  const isCurrent = () => fullscreenActive && renderToken === fullscreenRenderToken;
   fullscreenImageId = image.id;
+  // Invalidate pending proxy responses and native handlers before any await.
+  previewLoader?.cancel(elements.fullscreenImage);
+  elements.fullscreenImage.onload = null;
+  elements.fullscreenImage.onerror = null;
+  elements.fullscreenImage.removeAttribute("src");
   pruneFullscreenCache(fullscreenIndex);
   setFullscreenLoading(true, "加载原图...");
+  let displayToken = 0;
+  let displayedSource = "";
+  const showSource = source => {
+    if (!isCurrent()) return;
+    const token = ++displayToken;
+    const isDisplayCurrent = () => isCurrent() && token === displayToken;
+    displayedSource = source;
+    elements.fullscreenImage.dataset.source = source;
+    elements.fullscreenImage.dataset.fsFallbackStage = "0";
+    setFullscreenLoading(true, "加载原图...");
+    elements.fullscreenImage.onerror = () => {
+      if (!isDisplayCurrent()) return;
+      fallbackImageError(elements.fullscreenImage, image.originalSrc || image.src, image).then(advanced => {
+        if (!isDisplayCurrent()) return;
+        if (!advanced) { setFullscreenLoading(false); requestAnimationFrame(() => { if (isDisplayCurrent()) updateFullscreenZoomCapability(); }); }
+      });
+    };
+    elements.fullscreenImage.onload = () => {
+      if (!isDisplayCurrent()) return;
+      const loadedSrc = getLoadedPreviewUrl(elements.fullscreenImage);
+      const width = elements.fullscreenImage.naturalWidth || 0;
+      const height = elements.fullscreenImage.naturalHeight || 0;
+      if (image.id && width > 0 && height > 0) {
+        rememberImageDimensions(image, { width, height, area: width * height }, { url: loadedSrc });
+      }
+      setFullscreenLoading(false);
+      requestAnimationFrame(() => { if (isDisplayCurrent()) updateFullscreenZoomCapability(); });
+    };
+    startImagePreview(elements.fullscreenImage, image, source);
+  };
+
+  const known = getFullscreenSourceCandidates(image).map(url => ({ url, ...getKnownFullscreenDimensions(image, url) }))
+    .sort((a, b) => computeArea(b.width, b.height) - computeArea(a.width, a.height))[0];
+  // Display a measured, usable source without waiting for another candidate or
+  // unrelated queued card probes. Comparison can still upgrade it afterwards.
+  if (computeArea(known?.width, known?.height) > 0) showSource(known.url);
+  updateFullscreenNavigation();
   const source = await getFullscreenSourceForImage(image);
-  if (!fullscreenActive || renderToken !== fullscreenRenderToken) return;
-  if (!source) return;
-  elements.fullscreenImage.dataset.source = source;
-  elements.fullscreenImage.dataset.fsFallbackStage = "0";
-  setFullscreenLoading(true, "加载原图...");
+  if (!isCurrent()) return;
+  if (!source) { setFullscreenLoading(false); return; }
+  if (source === displayedSource) { preloadFullscreenAround(fullscreenIndex); return; }
+  if (displayedSource && elements.fullscreenImage.complete && elements.fullscreenImage.naturalWidth > 0) {
+    const target = getKnownFullscreenDimensions(image, source);
+    if (computeArea(target?.width, target?.height) <= computeArea(elements.fullscreenImage.naturalWidth, elements.fullscreenImage.naturalHeight)) {
+      preloadFullscreenAround(fullscreenIndex);
+      return;
+    }
+  }
 
   let loadUrl = source;
   const { displayUrl, cached } = previewCompatibility ? { displayUrl: source, cached: false } : await ensureFullscreenCache(source);
-  if (!fullscreenActive || renderToken !== fullscreenRenderToken) return;
-  if (elements.fullscreenImage.dataset.source !== source) return;
-
+  if (!isCurrent()) return;
   if (!previewCompatibility && !cached && /\.webp(?:\?|$)/i.test(source)) {
     const jpgAlt = source.replace(/\.webp(?=\?|$)/i, ".jpg");
     if (jpgAlt !== source) {
       const { cached: jpgCached } = await ensureFullscreenCache(jpgAlt);
+      if (!isCurrent()) return;
       if (jpgCached) {
         loadUrl = jpgAlt;
-        if (image?.id) rememberResolvedHdSrc(image, jpgAlt);
+        if (image.id) rememberResolvedHdSrc(image, jpgAlt);
       }
     }
   }
-  if (!fullscreenActive || renderToken !== fullscreenRenderToken) return;
-  if (elements.fullscreenImage.dataset.source !== source) return;
-
-  const finalDisplay = loadUrl === source ? (displayUrl || source) : loadUrl;
-  startImagePreview(elements.fullscreenImage, image, finalDisplay);
-
-  elements.fullscreenImage.onerror = () => {
-    fallbackImageError(elements.fullscreenImage, image.originalSrc || image.src, image).then(advanced => {
-      if (!advanced) { setFullscreenLoading(false); requestAnimationFrame(updateFullscreenZoomCapability); }
-    });
-  };
-  elements.fullscreenImage.onload = () => {
-    if (image?.id) {
-      const loadedSrc = getLoadedPreviewUrl(elements.fullscreenImage);
-      const nw = elements.fullscreenImage.naturalWidth || 0;
-      const nh = elements.fullscreenImage.naturalHeight || 0;
-      if (nw > 0 && nh > 0) {
-        const loadedArea = nw * nh;
-
-        rememberImageDimensions(image, { width: nw, height: nh, area: loadedArea }, { url: loadedSrc });
-      }
-    }
-    setFullscreenLoading(false);
-    requestAnimationFrame(updateFullscreenZoomCapability);
-  };
-  updateFullscreenNavigation();
+  if (!isCurrent()) return;
+  showSource(loadUrl === source ? (displayUrl || source) : loadUrl);
   preloadFullscreenAround(fullscreenIndex);
 };
 

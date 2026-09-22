@@ -30,6 +30,7 @@
             if (pending.get(entry.key) === entry) {
               pending.delete(entry.key);
               entry.expiresAt = Date.now() + (value.area > 0 ? successTtlMs : failureTtlMs);
+              entry.value = value;
               cache.set(entry.key, entry);
               while (cache.size > maxEntries) cache.delete(cache.keys().next().value);
             }
@@ -41,7 +42,11 @@
       }
     };
     return {
-      get(url, context = "") {
+      peek(url, context = "") {
+        const entry = cache.get(JSON.stringify([context, String(url || "").trim()]));
+        return entry && entry.expiresAt > Date.now() ? entry.value : undefined;
+      },
+      get(url, context = "", { priority = false } = {}) {
         const normalizedUrl = String(url || "").trim();
         if (!normalizedUrl) return Promise.resolve(empty());
         const key = JSON.stringify([context, normalizedUrl]);
@@ -52,11 +57,17 @@
           return cached.promise;
         }
         cache.delete(key);
-        if (pending.has(key)) return pending.get(key).promise;
+        if (pending.has(key)) {
+          const entry = pending.get(key);
+          const index = priority ? queued.indexOf(entry) : -1;
+          if (index > 0) queued.unshift(...queued.splice(index, 1));
+          return entry.promise;
+        }
         const entry = { key, url: normalizedUrl, context, controller: new AbortController() };
         entry.promise = new Promise((resolve) => { entry.resolve = resolve; });
         pending.set(key, entry);
-        queued.push(entry);
+        if (priority) queued.unshift(entry);
+        else queued.push(entry);
         drain();
         return entry.promise;
       },
