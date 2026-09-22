@@ -25,14 +25,14 @@ Languages: [简体中文](README.md) · [English](README-en.md)
 ### 从 GitHub Releases 安装
 
 1. 进入项目的 `Releases` 页面
-2. 下载对应版本的解压包，例如 `page-image-collector-1.2.10-unpacked.zip`
+2. 下载对应版本的解压包，例如 `page-image-collector-1.3.0-unpacked.zip`
 3. 打开 `chrome://extensions/`
 4. 开启“开发者模式”
 5. 解压下载的 ZIP 文件
 6. 点击“加载已解压的扩展程序”
 7. 选择解压后的扩展目录
 
-## 1.2.10 更新
+## 1.3.0 更新
 
 - 修复普通预览和 1:1 已能显示大图，全屏查看却选中缩略图的问题
 - 已知尺寸的图片进入全屏时可立即显示，避免等待无关图片探测；快速切图时旧图片不再覆盖新画面
