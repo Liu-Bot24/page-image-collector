@@ -21,7 +21,7 @@ A Chrome extension for daily browsing scenarios, used to quickly collect web pag
 ### Install from GitHub Releases
 
 1. Go to the project's `Releases` page.
-2. Download the unpacked zip for the corresponding version, e.g., `page-image-collector-1.2.9-unpacked.zip`.
+2. Download the unpacked zip for the corresponding version, e.g., `page-image-collector-1.2.10-unpacked.zip`.
 3. Open `chrome://extensions/`.
 4. Enable "Developer mode".
 5. Unzip the downloaded ZIP file.
@@ -31,6 +31,13 @@ A Chrome extension for daily browsing scenarios, used to quickly collect web pag
 ## Documentation
 
 - Privacy Policy: [PRIVACY.md](./PRIVACY.md)
+
+## What's New in 1.2.10
+
+- Fixed fullscreen selecting a thumbnail when ordinary preview and 1:1 view already display a larger image.
+- Fullscreen can display an image with known dimensions immediately without waiting for unrelated probes; late results no longer overwrite the next image after switching.
+- Fixed upgraded images reverting to a smaller source after refreshing, reopening, or navigating back.
+- Improved fullscreen fallback: keep a working large image, upgrade when the fallback is larger, and still display a smaller image when it is the only available option.
 
 ## What's New in 1.2.9
 
