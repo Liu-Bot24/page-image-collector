@@ -3127,11 +3127,12 @@ const handleMessage = async (message, sender) => {
 
     case MSG.SET_HIDDEN_IMAGES: {
       if (!tabId) return { success: false, error: "No active tab id" };
-      const hiddenIds = stateManager.setHiddenByIds(
-        tabId,
-        Array.isArray(payload.imageIds) ? payload.imageIds : [],
-        payload.hidden !== false
-      );
+      const requestedIds = Array.isArray(payload.imageIds) ? payload.imageIds : [];
+      // selectedOnly: act on the given ids that are selected right now.
+      const targetIds = payload.selectedOnly === true
+        ? stateManager.getSelectedImages(tabId, [], requestedIds).map((image) => image.id)
+        : requestedIds;
+      const hiddenIds = stateManager.setHiddenByIds(tabId, targetIds, payload.hidden !== false);
       notifyImagesUpdated(tabId);
       return { success: true, hiddenIds };
     }
@@ -3140,7 +3141,7 @@ const handleMessage = async (message, sender) => {
       if (!tabId) return { success: false, error: "No active tab id" };
       return {
         success: true,
-        images: stateManager.getSelectedImages(tabId, payload.orderedImageIds)
+        images: stateManager.getSelectedImages(tabId, payload.orderedImageIds, payload.imageIds)
       };
     }
 
@@ -3210,7 +3211,7 @@ const handleMessage = async (message, sender) => {
 
         activeBatchDownloads.add(tabId);
         ownsActiveDownload = true;
-        const selected = stateManager.getSelectedImages(tabId, payload.orderedImageIds);
+        const selected = stateManager.getSelectedImages(tabId, payload.orderedImageIds, payload.imageIds);
         if (selected.length === 0) {
           return { success: false, error: "No selected images" };
         }

@@ -920,10 +920,14 @@ export const createTabStateManager = () => {
     return Array.from(state.selectedIds);
   };
 
-  const getSelectedImages = (tabId, orderedImageIds = []) => {
+  // onlyIds, when an array, limits the result to selected images in it, so a
+  // batch action can act on the selected images the UI currently shows.
+  const getSelectedImages = (tabId, orderedImageIds = [], onlyIds = null) => {
     const state = tabStates.get(tabId);
     if (!state) return [];
+    const allowed = Array.isArray(onlyIds) ? new Set(onlyIds) : null;
     const selected = Array.from(state.selectedIds)
+      .filter((imageId) => !allowed || allowed.has(imageId))
       .map((imageId) => state.images.get(imageId))
       .filter(Boolean)
       .map(image => ({ ...image, collectionId: state.collectionId }))

@@ -347,7 +347,7 @@ const ensureDownloadStatusPolling = () => {
 };
 
 const syncBatchDownloadButtonState = () => {
-  const selected = selectedIds.size;
+  const selected = getVisibleSelectedIds().length;
   elements.btnDownloadSelected.disabled = batchDownloadInProgress || selected === 0;
 };
 
@@ -979,18 +979,24 @@ const refreshSelectedState = async () => {
 };
 
 const updateStats = async ({ visibleImages = [], facetStats = {}, renderToken = null } = {}) => {
+  // The selected count and buttons depend only on the list just displayed.
+  syncSelectionControls();
   const response = await sendMessage(MSG.GET_STATS);
   if (!response.success) return false;
   if (renderToken !== null && renderToken !== imageRenderToken) return false;
-  const { total, selected } = response.stats;
+  const { total } = response.stats;
   elements.statTotal.textContent = String(total);
   elements.statFiltered.textContent = String(visibleImages.length);
-  elements.statSelected.textContent = String(selected);
-  elements.btnDownloadSelected.disabled = batchDownloadInProgress || selected === 0;
-  elements.btnCopySelected.disabled = selected === 0;
   renderFormatFilters(facetStats);
   return true;
 };
+
+// Batch actions, the selected count and the buttons follow the selected images
+// the current filters show; selections hidden by a filter are kept but skipped.
+// Requests send every visible id and the background keeps the ones it has
+// selected, so a selection made elsewhere is not lost.
+const getVisibleIds = () => currentImages.map((image) => image.id);
+const getVisibleSelectedIds = () => getVisibleIds().filter((id) => selectedIds.has(id));
 
 const getVisibleSelectionInfo = () => {
   const visibleIds = currentImages.map((image) => image.id);
@@ -1117,19 +1123,22 @@ const renderImages = async () => {
     .filter((image) => passesOrientationFilter(image));
   const facetStats = computeFormatStatsFromImages(metricAndOrientationFiltered);
 
-  currentImages = metricAndOrientationFiltered
+  let nextImages = metricAndOrientationFiltered
     .filter((image) => passesFormatFilters(image, filters.formats));
 
   if (currentConfig.enableSizeSort) {
-    currentImages = currentImages.sort((a, b) => {
+    nextImages = nextImages.sort((a, b) => {
       const aMeta = getImageMetaForFilters(a);
       const bMeta = getImageMetaForFilters(b);
       return bMeta.area - aMeta.area;
     });
   }
 
-  selectedIds = await refreshSelectedState();
+  const nextSelectedIds = await refreshSelectedState();
   if (renderToken !== imageRenderToken) return;
+  // Batch actions read currentImages, so it only changes with a render that goes on to display it.
+  currentImages = nextImages;
+  selectedIds = nextSelectedIds;
 
   if (elements.lightbox.classList.contains("active") && lightboxImage) {
     const nextIndex = currentImages.findIndex((item) => item.id === lightboxImage.id);
@@ -1191,9 +1200,14 @@ const toggleSelect = async (imageId) => {
     checkbox.classList.toggle("checked", selected);
     checkbox.textContent = selected ? "✓" : "";
   }
-  elements.statSelected.textContent = String(selectedIds.size);
+  syncSelectionControls();
+};
+
+const syncSelectionControls = () => {
+  const visibleSelected = getVisibleSelectedIds().length;
+  elements.statSelected.textContent = String(visibleSelected);
   syncBatchDownloadButtonState();
-  elements.btnCopySelected.disabled = selectedIds.size === 0;
+  elements.btnCopySelected.disabled = visibleSelected === 0;
   syncSelectAllButtonLabel();
 };
 
@@ -1207,6 +1221,19 @@ const toggleSelectAll = async () => {
   if (!response.success) {
     setActionStatus(`操作失败: ${response.error || "未知错误"}`, 3200);
     return;
+  }
+  if (Array.isArray(response.selectedIds)) {
+    selectedIds = new Set(response.selectedIds);
+    for (const card of document.querySelectorAll(".image-card[data-id]")) {
+      const selected = selectedIds.has(card.dataset.id);
+      card.classList.toggle("selected", selected);
+      const checkbox = card.querySelector(".checkbox");
+      if (checkbox) {
+        checkbox.classList.toggle("checked", selected);
+        checkbox.textContent = selected ? "✓" : "";
+      }
+    }
+    syncSelectionControls();
   }
   await renderImages();
 };
@@ -1383,6 +1410,8 @@ const clearImages = async () => {
 
 const downloadSelected = async () => {
   if (batchDownloadInProgress) return;
+  const imageIds = getVisibleIds();
+  if (imageIds.length === 0) return;
   batchDownloadInProgress = true;
   const enableBatchZipDownload = elements.toggleBatchZipDownload?.checked === true;
   const enableConvertToJpg = elements.toggleWebP?.checked === true;
@@ -1391,7 +1420,7 @@ const downloadSelected = async () => {
     mode: enableBatchZipDownload ? "zip" : "direct",
     phase: enableBatchZipDownload ? "zip_prepare" : "direct_prepare",
     current: 0,
-    total: selectedIds.size
+    total: getVisibleSelectedIds().length
   });
   try {
     const response = await sendMessage(MSG.DOWNLOAD_BATCH, {
@@ -1400,7 +1429,8 @@ const downloadSelected = async () => {
       zip: enableBatchZipDownload,
       mode: enableBatchZipDownload ? "zip" : "direct",
       downloadMode: enableBatchZipDownload ? "zip" : "direct",
-      enableConvertToJpg
+      enableConvertToJpg,
+      imageIds
     });
     if (!response.success) {
       if (response?.zipped && Number(response?.zipPartCount) > 1) {
@@ -1465,7 +1495,9 @@ const downloadSelected = async () => {
 };
 
 const copySelected = async () => {
-  const response = await sendMessage(MSG.GET_SELECTED);
+  const imageIds = getVisibleIds();
+  if (imageIds.length === 0) return;
+  const response = await sendMessage(MSG.GET_SELECTED, { imageIds });
   if (!response.success || response.images.length === 0) return;
   const useOriginal = currentConfig.enableHD;
   const urls = response.images

@@ -670,6 +670,26 @@ test("uses caller order for selected images without dropping selected items", ()
   );
 });
 
+test("limits selected images to the given ids while keeping the order rules", () => {
+  const manager = createTabStateManager();
+  manager.mergeImages(tabId, [
+    { src: "https://cdn.example.com/large.jpg", width: 1000, height: 1000 },
+    { src: "https://cdn.example.com/first.jpg", width: 100, height: 100 },
+    { src: "https://cdn.example.com/second.jpg", width: 200, height: 100 },
+    { src: "https://cdn.example.com/unselected.jpg", width: 50, height: 50 }
+  ]);
+  const images = manager.getAllImages(tabId);
+  const bySuffix = (name) => images.find((image) => image.src.endsWith(`/${name}.jpg`));
+  manager.setSelectionByIds(tabId, ["large", "first", "second"].map((name) => bySuffix(name).id), true);
+  const srcs = (list) => list.map((image) => image.src.split("/").pop());
+
+  const only = [bySuffix("first").id, bySuffix("large").id, bySuffix("unselected").id, "missing"];
+  assert.deepEqual(srcs(manager.getSelectedImages(tabId, [], only)), ["large.jpg", "first.jpg"]);
+  assert.deepEqual(srcs(manager.getSelectedImages(tabId, [bySuffix("first").id], only)), ["first.jpg", "large.jpg"]);
+  assert.deepEqual(srcs(manager.getSelectedImages(tabId, [], [])), []);
+  assert.deepEqual(srcs(manager.getSelectedImages(tabId, [], null)), ["large.jpg", "second.jpg", "first.jpg"]);
+});
+
 test("finishing a scan after tab removal does not recreate the removed tab state", async () => {
   await waitForPersistence();
   const originalSet = chrome.storage.local.set;

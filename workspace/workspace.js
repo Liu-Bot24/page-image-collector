@@ -1561,7 +1561,7 @@ const formatDownloadButtonText = (status) => {
 };
 
 const syncBatchDownloadUiState = () => {
-  const selected = selectedIds.size;
+  const selected = getVisibleSelectedIds().length;
   elements.btnDownloadBatch.disabled = batchDownloadInProgress || selected === 0;
   elements.btnDownloadBatch.textContent = formatDownloadButtonText(activeDownloadStatus);
 };
@@ -2414,15 +2414,14 @@ const evaluateMeaningfulOriginal = async (sessionId) => {
 };
 
 const updateStats = async ({ visibleImages = [], facetStats = {}, renderToken = null } = {}) => {
+  // The selected count and buttons depend only on the list just displayed.
+  syncSelectionControls();
   const response = await sendMessage(MSG.GET_STATS);
   if (!response.success) return;
   if (renderToken !== null && renderToken !== galleryRenderToken) return false;
-  const { total, selected } = response.stats;
+  const { total } = response.stats;
   elements.statTotal.textContent = String(total);
   elements.statFiltered.textContent = String(visibleImages.length);
-  elements.statSelected.textContent = String(selected);
-  elements.btnDownloadBatch.disabled = batchDownloadInProgress || selected === 0;
-  elements.btnCopyBatch.disabled = selected === 0;
   elements.btnDownloadBatch.textContent = formatDownloadButtonText(activeDownloadStatus);
   renderFormatFilters(facetStats);
   return true;
@@ -2433,6 +2432,13 @@ const refreshSelectedState = async () => {
   if (!response.success) return new Set();
   return new Set(response.images.map((image) => image.id));
 };
+
+// Batch actions, the selected count and the buttons follow the selected images
+// the current filters show; selections hidden by a filter are kept but skipped.
+// Requests send every visible id and the background keeps the ones it has
+// selected, so a selection made elsewhere is not lost.
+const getVisibleIds = () => currentImages.map((image) => image.id);
+const getVisibleSelectedIds = () => getVisibleIds().filter((id) => selectedIds.has(id));
 
 const getVisibleSelectionInfo = () => {
   const visibleIds = currentImages.map((image) => image.id);
@@ -2467,24 +2473,28 @@ const syncSelectAllButtonLabel = () => {
 const syncHideToggleButton = () => {
   const btn = elements.btnHideToggle;
   if (!btn) return;
-  if (selectedIds.size === 0) {
+  const ids = getVisibleSelectedIds();
+  if (ids.length === 0) {
     btn.disabled = true;
     btn.textContent = "隐藏";
+    btn.dataset.hideAction = "hide";
     return;
   }
   btn.disabled = false;
-  const allHidden = [...selectedIds].every((id) => hiddenImageIds.has(id));
+  const allHidden = ids.every((id) => hiddenImageIds.has(id));
   btn.textContent = allHidden ? "显示" : "隐藏";
+  // A click does what the label says, even if hidden state changes before the next render.
+  btn.dataset.hideAction = allHidden ? "show" : "hide";
 };
 
 const toggleHideSelected = async () => {
-  if (selectedIds.size === 0) return;
-  const allHidden = [...selectedIds].every((id) => hiddenImageIds.has(id));
-  const ids = [...selectedIds];
-
+  if (getVisibleSelectedIds().length === 0) return;
+  // The direction is what the button showed; the background applies it to the
+  // visible images it has selected at that moment.
   const response = await sendMessage(MSG.SET_HIDDEN_IMAGES, {
-    imageIds: ids,
-    hidden: !allHidden
+    imageIds: getVisibleIds(),
+    selectedOnly: true,
+    hidden: elements.btnHideToggle?.dataset.hideAction !== "show"
   });
   if (!response.success) {
     setActionStatus(`隐藏操作失败: ${response.error || "未知错误"}`, 3200);
@@ -2989,6 +2999,8 @@ const renderGallery = async () => {
 
   currentImages = nextImages;
   selectedIds = nextSelectedIds;
+  // Cards may mount over several frames; the toolbar follows the new list now.
+  syncSelectionControls();
 
   if (elements.lightbox.classList.contains("active") && lightboxImage) {
     const nextIndex = currentImages.findIndex((item) => item.id === lightboxImage.id);
@@ -3080,9 +3092,14 @@ const toggleSelect = async (imageId) => {
     checkbox.classList.toggle("checked", selected);
     checkbox.textContent = selected ? "✓" : "";
   }
-  elements.statSelected.textContent = String(selectedIds.size);
+  syncSelectionControls();
+};
+
+const syncSelectionControls = () => {
+  const visibleSelected = getVisibleSelectedIds().length;
+  elements.statSelected.textContent = String(visibleSelected);
   syncBatchDownloadUiState();
-  elements.btnCopyBatch.disabled = selectedIds.size === 0;
+  elements.btnCopyBatch.disabled = visibleSelected === 0;
   syncSelectAllButtonLabel();
   syncHideToggleButton();
 };
@@ -3539,11 +3556,26 @@ const toggleSelectAll = async () => {
     setActionStatus(`操作失败: ${response.error || "未知错误"}`, 3200);
     return;
   }
+  if (Array.isArray(response.selectedIds)) {
+    selectedIds = new Set(response.selectedIds);
+    for (const card of document.querySelectorAll(".gallery-card[data-id]")) {
+      const selected = selectedIds.has(card.dataset.id);
+      card.classList.toggle("selected", selected);
+      const checkbox = card.querySelector(".checkbox");
+      if (checkbox) {
+        checkbox.classList.toggle("checked", selected);
+        checkbox.textContent = selected ? "✓" : "";
+      }
+    }
+    syncSelectionControls();
+  }
   await renderGallery();
 };
 
 const downloadBatch = async () => {
   if (batchDownloadInProgress) return;
+  const imageIds = getVisibleIds();
+  if (imageIds.length === 0) return;
   batchDownloadInProgress = true;
   const enableBatchZipDownload = elements.toggleBatchZipDownload?.checked === true;
   const enableConvertToJpg = elements.toggleWebP?.checked === true;
@@ -3552,7 +3584,7 @@ const downloadBatch = async () => {
     mode: enableBatchZipDownload ? "zip" : "direct",
     phase: enableBatchZipDownload ? "zip_prepare" : "direct_prepare",
     current: 0,
-    total: selectedIds.size
+    total: getVisibleSelectedIds().length
   });
   try {
     const orderedImageIds = await getComicOrderedImageIds();
@@ -3564,7 +3596,8 @@ const downloadBatch = async () => {
       downloadMode: enableBatchZipDownload ? "zip" : "direct",
       enableConvertToJpg,
       zipPartPreset: getZipPartPreset(),
-      orderedImageIds
+      orderedImageIds,
+      imageIds
     });
     if (!response.success) {
       if (response?.zipped && Number(response?.zipPartCount) > 1) {
@@ -3629,9 +3662,12 @@ const downloadBatch = async () => {
 };
 
 const copyBatch = async () => {
+  const imageIds = getVisibleIds();
+  if (imageIds.length === 0) return;
   const orderedImageIds = await getComicOrderedImageIds();
   const response = await sendMessage(MSG.GET_SELECTED, {
-    orderedImageIds
+    orderedImageIds,
+    imageIds
   });
   if (!response.success || response.images.length === 0) return;
 
