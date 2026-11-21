@@ -3343,6 +3343,8 @@ const handleMessage = async (message, sender) => {
           const restoredConfig = stateManager.setConfig(tabId, {
             enableRightClick: previousConfig.enableRightClick === true
           });
+          // A refresh during the attempt may have shown the value now rolled back.
+          refreshRightClickMenuTick().catch(() => {});
           return {
             success: false,
             error: rightClickResult.error,
@@ -3471,6 +3473,8 @@ const handleMessage = async (message, sender) => {
         const restoredConfig = stateManager.setConfig(tabId, {
           enableRightClick: previousConfig.enableRightClick === true
         });
+        // A refresh during the attempt may have shown the value now rolled back.
+        refreshRightClickMenuTick().catch(() => {});
         return {
           success: false,
           error: result.error,
