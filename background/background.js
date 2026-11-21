@@ -1218,21 +1218,21 @@ const copyOriginalImageByUrl = async (tabId, url) => {
     },
     { preferredUrl: resolved, preferHD: true }
   );
-  // Without image data, copy the page's own address: the rewritten one is a guess.
-  const copiedUrl = payload?.success ? payload.sourceUrl : url;
-
+  // A copied link always uses the page's own address: a rewritten one may only
+  // have worked with the extension's temporary Referer.
   const response = await sendMessageToTab(tabId, {
     type: MSG.COPY_IMAGE_DATA_URL,
     payload: {
       dataUrl: payload?.success ? payload.dataUrl : "",
-      fallbackUrl: copiedUrl
+      fallbackUrl: url
     }
   });
 
+  const mode = response?.mode || (payload?.success ? "image" : "url");
   return {
     success: response?.success !== false,
-    mode: response?.mode || (payload?.success ? "image" : "url"),
-    url: copiedUrl
+    mode,
+    url: mode === "image" && payload?.success ? payload.sourceUrl : url
   };
 };
 

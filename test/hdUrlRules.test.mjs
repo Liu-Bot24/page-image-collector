@@ -47,6 +47,12 @@ test("Discord size is dropped without breaking the remaining query", () => {
     "https://cdn.discordapp.com/attachments/1/2/a.webp?quality=lossless");
   assert.equal(getHDUrl("https://cdn.discordapp.com/attachments/1/2/a.png?ex=ab%20c&size=48&hm=1"),
     "https://cdn.discordapp.com/attachments/1/2/a.png?ex=ab%20c&hm=1");
+  assert.equal(getHDUrl("https://cdn.discordapp.com/attachments/1/2/a.webp?size=48&size=96"),
+    "https://cdn.discordapp.com/attachments/1/2/a.webp");
+  assert.equal(getHDUrl("https://cdn.discordapp.com/attachments/1/2/a.webp?size=48px&quality=lossless"),
+    "https://cdn.discordapp.com/attachments/1/2/a.webp?size=48px&quality=lossless");
+  assert.equal(getHDUrl("https://cdn.discordapp.com/attachments/1/2/a.webp?size=48#frag"),
+    "https://cdn.discordapp.com/attachments/1/2/a.webp#frag");
 });
 
 test("a size suffix after a full file name is the only thing stripped", () => {
@@ -111,6 +117,12 @@ test("right-click copy falls back to the page image and never copies a guessed l
   const works = contextMenuHarness({ reachable: [page] });
   assert.equal((await works.copy(7, page)).url, page);
   assert.equal(works.sent.payload.dataUrl, "data:image/png;base64," + page);
+  // The rewritten image may only load with the extension's Referer, so a text
+  // fallback in the page still gets the page's own address.
+  const rewritten = contextMenuHarness({ reachable: ["https://example.com/wallpaper.jpg"] });
+  await rewritten.copy(7, page);
+  assert.equal(rewritten.sent.payload.dataUrl, "data:image/png;base64,https://example.com/wallpaper.jpg");
+  assert.equal(rewritten.sent.payload.fallbackUrl, page);
   const broken = contextMenuHarness({ reachable: [] });
   const result = await broken.copy(7, page);
   assert.equal(result.mode, "url");

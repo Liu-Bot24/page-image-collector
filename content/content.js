@@ -89,10 +89,16 @@ const HD_RULES = [
   },
   {
     test: /cdn\.discordapp\.com.*\.(jpg|jpeg|png|webp|gif)\?(?:[^#]*&)?size=\d+/i,
-    // Drop only the size parameter; other parameters keep their exact text.
-    replace: (url) => url
-      .replace(/([?&])size=\d+(&?)/i, (_match, separator, next) => (next ? separator : ""))
-      .replace(/[?&](?=#|$)/, "")
+    // Drop every whole "size=<digits>" field; other fields keep their exact text.
+    replace: (url) => {
+      const hashAt = url.indexOf("#");
+      const base = hashAt < 0 ? url : url.slice(0, hashAt);
+      const hash = hashAt < 0 ? "" : url.slice(hashAt);
+      const queryAt = base.indexOf("?");
+      if (queryAt < 0) return url;
+      const kept = base.slice(queryAt + 1).split("&").filter((field) => !/^size=\d+$/i.test(field));
+      return base.slice(0, queryAt) + (kept.length ? `?${kept.join("&")}` : "") + hash;
+    }
   }
 ];
 
