@@ -1028,9 +1028,14 @@ const resolveOriginalImageUrl = (url) => {
       parsed.pathname = pathname.replace(/\/imagecache\/[^/]+\//i, "/");
     }
 
+    // "name.jpg_300x300.jpg" is a resized copy of "name.jpg"; nothing else to strip.
+    const named = parsed.pathname.replace(/(\.(?:jpe?g|png|webp|gif))_\d{2,4}x\d{2,4}\.(jpg|jpeg|png|webp|gif|svg|avif|bmp)$/i, "$1");
+    if (named !== parsed.pathname) {
+      parsed.pathname = named;
+      return parsed.toString();
+    }
+
     parsed.pathname = parsed.pathname
-      // "name.jpg_300x300.jpg" is a resized copy of "name.jpg".
-      .replace(/(\.(?:jpe?g|png|webp|gif))_\d{2,4}x\d{2,4}\.(jpg|jpeg|png|webp|gif|svg|avif|bmp)$/i, "$1")
       .replace(/-\d{2,4}x\d{2,4}(?=\.(jpg|jpeg|png|webp|gif|svg|avif|bmp)$)/i, "")
       .replace(/_(\d{2,4})x(\d{2,4})(?=\.(jpg|jpeg|png|webp|gif|svg|avif|bmp)$)/i, "");
 
@@ -1178,8 +1183,10 @@ const downloadContextImageUrl = async (tabId, url) => {
       const blob = await fetchBlob(url, 12000, sourceUrl);
       return await downloadByBlob(blob, filename, { awaitCompletion: true });
     } catch (blobError) {
+      const final = blobError?.cancelled === true || blobError?.retryable === false;
       return {
         success: false,
+        ...(final ? { final: true, cancelled: blobError.cancelled === true } : {}),
         error: blobError?.message || directError?.message || "Download failed"
       };
     }

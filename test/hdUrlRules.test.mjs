@@ -41,9 +41,20 @@ test("Discord size is dropped without breaking the remaining query", () => {
     "https://cdn.discordapp.com/attachments/1/2/a.webp?quality=lossless");
   assert.equal(getHDUrl("https://cdn.discordapp.com/attachments/1/2/a.png?size=48"),
     "https://cdn.discordapp.com/attachments/1/2/a.png");
+  assert.equal(getHDUrl("https://cdn.discordapp.com/attachments/1/2/a.png?SIZE=48"),
+    "https://cdn.discordapp.com/attachments/1/2/a.png");
+  assert.equal(getHDUrl("https://cdn.discordapp.com/attachments/1/2/a.webp?quality=lossless&size=48"),
+    "https://cdn.discordapp.com/attachments/1/2/a.webp?quality=lossless");
+  assert.equal(getHDUrl("https://cdn.discordapp.com/attachments/1/2/a.png?ex=ab%20c&size=48&hm=1"),
+    "https://cdn.discordapp.com/attachments/1/2/a.png?ex=ab%20c&hm=1");
 });
 
-const contextMenuHarness = ({ reachable }) => {
+test("a size suffix after a full file name is the only thing stripped", () => {
+  assert.equal(getHDUrl("https://example.com/wallpaper-1920x1080.jpg_300x300.jpg"), "https://example.com/wallpaper-1920x1080.jpg");
+  assert.equal(resolveOriginalImageUrl("https://example.com/wallpaper-1920x1080.jpg_300x300.jpg"), "https://example.com/wallpaper-1920x1080.jpg");
+});
+
+const contextMenuHarness = ({ reachable, cancelBlob = false }) => {
   const requested = [];
   const fail = (url) => { throw Object.assign(new Error("HTTP 404 " + url), { retryable: true }); };
   const context = vm.createContext({
@@ -52,7 +63,10 @@ const contextMenuHarness = ({ reachable }) => {
     resolveImageRequestSource: async () => "https://example.com/page",
     downloadByUrl: async (url) => { requested.push(["download", url]); return reachable.includes(url) ? { success: true, url } : fail(url); },
     fetchBlob: async (url) => { requested.push(["fetch", url]); return reachable.includes(url) ? { type: "image/jpeg", url } : fail(url); },
-    downloadByBlob: async (blob) => ({ success: true, url: blob.url }),
+    downloadByBlob: async (blob) => {
+      if (cancelBlob) throw Object.assign(new Error("USER_CANCELED"), { cancelled: true, retryable: false });
+      return { success: true, url: blob.url };
+    },
     mimeFromFormat: () => "image/jpeg", formatFromUrl: () => "jpg",
     convertBlobToPng: async (blob) => blob, blobToDataUrl: async (blob) => "data:image/png;base64," + blob.url,
     sendMessageToTab: async (_tabId, message) => { context.sent = message; return { success: true, mode: message.payload.dataUrl ? "image" : "url" }; }
@@ -72,6 +86,17 @@ test("right-click download falls back to the page address when the rewritten one
   assert.equal(result.success, true);
   assert.equal(result.url, page);
   assert.equal(harness.requested[0][1], "https://example.com/wallpaper.jpg");
+});
+
+test("cancelling the rewritten download does not start another one", async () => {
+  const rewritten = "https://example.com/wallpaper.jpg";
+  const harness = contextMenuHarness({ reachable: [], cancelBlob: true });
+  // The direct download fails, the blob fetch works, then the user cancels.
+  harness.fetchBlob = async (url) => { harness.requested.push(["fetch", url]); return { type: "image/jpeg", url }; };
+  const result = await harness.download(7, "https://example.com/wallpaper-1920x1080.jpg");
+  assert.equal(result.success, false);
+  assert.equal(result.cancelled, true);
+  assert.deepEqual(harness.requested.map(([, url]) => url), [rewritten, rewritten]);
 });
 
 test("right-click download keeps the rewritten address when it works", async () => {
