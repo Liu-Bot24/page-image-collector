@@ -1029,6 +1029,8 @@ const resolveOriginalImageUrl = (url) => {
     }
 
     parsed.pathname = parsed.pathname
+      // "name.jpg_300x300.jpg" is a resized copy of "name.jpg".
+      .replace(/(\.(?:jpe?g|png|webp|gif))_\d{2,4}x\d{2,4}\.(jpg|jpeg|png|webp|gif|svg|avif|bmp)$/i, "$1")
       .replace(/-\d{2,4}x\d{2,4}(?=\.(jpg|jpeg|png|webp|gif|svg|avif|bmp)$)/i, "")
       .replace(/_(\d{2,4})x(\d{2,4})(?=\.(jpg|jpeg|png|webp|gif|svg|avif|bmp)$)/i, "");
 
@@ -1165,18 +1167,15 @@ const openSourceUrlInTab = async (tabId, url) => {
   }
 };
 
-const downloadOriginalImageByUrl = async (tabId, url) => {
-  if (!url) return { success: false, error: "No image URL available" };
-
-  const resolved = resolveOriginalImageUrl(url);
-  const filename = filenameFromImageUrl(resolved);
-  const sourceUrl = await resolveImageRequestSource(tabId, resolved);
+const downloadContextImageUrl = async (tabId, url) => {
+  const filename = filenameFromImageUrl(url);
+  const sourceUrl = await resolveImageRequestSource(tabId, url);
   try {
-    return await downloadByUrl(resolved, filename, { sourceUrl, awaitCompletion: true });
+    return await downloadByUrl(url, filename, { sourceUrl, awaitCompletion: true });
   } catch (directError) {
-    if (directError?.cancelled || directError?.retryable === false) return { success: false, cancelled: directError.cancelled === true, error: directError.message };
+    if (directError?.cancelled || directError?.retryable === false) return { success: false, final: true, cancelled: directError.cancelled === true, error: directError.message };
     try {
-      const blob = await fetchBlob(resolved, 12000, sourceUrl);
+      const blob = await fetchBlob(url, 12000, sourceUrl);
       return await downloadByBlob(blob, filename, { awaitCompletion: true });
     } catch (blobError) {
       return {
@@ -1187,6 +1186,16 @@ const downloadOriginalImageByUrl = async (tabId, url) => {
   }
 };
 
+const downloadOriginalImageByUrl = async (tabId, url) => {
+  if (!url) return { success: false, error: "No image URL available" };
+
+  const resolved = resolveOriginalImageUrl(url);
+  const result = await downloadContextImageUrl(tabId, resolved);
+  // The rewritten address is only a guess; the page's own address still works.
+  if (result.success || result.final || resolved === url) return result;
+  return await downloadContextImageUrl(tabId, url);
+};
+
 const copyOriginalImageByUrl = async (tabId, url) => {
   if (!tabId) return { success: false, error: "No active tab id" };
   if (!url) return { success: false, error: "No image URL available" };
@@ -1194,27 +1203,29 @@ const copyOriginalImageByUrl = async (tabId, url) => {
   const resolved = resolveOriginalImageUrl(url);
   const payload = await prepareClipboardPayload(
     {
-      src: resolved,
+      src: url,
       hdSrc: resolved,
-      originalSrc: resolved,
-      displaySrc: resolved,
+      originalSrc: url,
+      displaySrc: url,
       sourceUrl: await resolveImageRequestSource(tabId, resolved)
     },
     { preferredUrl: resolved, preferHD: true }
   );
+  // Without image data, copy the page's own address: the rewritten one is a guess.
+  const copiedUrl = payload?.success ? payload.sourceUrl : url;
 
   const response = await sendMessageToTab(tabId, {
     type: MSG.COPY_IMAGE_DATA_URL,
     payload: {
       dataUrl: payload?.success ? payload.dataUrl : "",
-      fallbackUrl: resolved
+      fallbackUrl: copiedUrl
     }
   });
 
   return {
     success: response?.success !== false,
     mode: response?.mode || (payload?.success ? "image" : "url"),
-    url: resolved
+    url: copiedUrl
   };
 };
 

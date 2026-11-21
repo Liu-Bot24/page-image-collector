@@ -81,11 +81,23 @@ const HD_RULES = [
   },
   {
     test: /_\d{1,5}x\d{1,5}\.(jpg|jpeg|png|webp)(\?.*)?$/i,
-    replace: (url) => url.replace(/_\d{1,5}x\d{1,5}(\.[a-z]+(\?.*)?)$/i, "$1")
+    replace: (url) => {
+      // "name.jpg_300x300.jpg" is a resized copy of "name.jpg".
+      const named = url.replace(/(\.(?:jpe?g|png|webp|gif))_\d{1,5}x\d{1,5}\.[a-z]+((?:\?.*)?)$/i, "$1$2");
+      return named !== url ? named : url.replace(/_\d{1,5}x\d{1,5}(\.[a-z]+(\?.*)?)$/i, "$1");
+    }
   },
   {
     test: /cdn\.discordapp\.com.*\.(jpg|jpeg|png|webp|gif)\?size=\d+/i,
-    replace: (url) => url.replace(/\?size=\d+/i, "")
+    replace: (url) => {
+      try {
+        const parsed = new URL(url, location.href);
+        parsed.searchParams.delete("size");
+        return parsed.toString();
+      } catch {
+        return url;
+      }
+    }
   }
 ];
 
