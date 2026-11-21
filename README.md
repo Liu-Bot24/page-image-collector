@@ -281,7 +281,7 @@ Languages: [简体中文](README.md) · [English](README-en.md)
 - `clipboardWrite`：复制图片或图片链接
 - `offscreen`：在后台页面中打包 ZIP
 - `declarativeNetRequest` / `declarativeNetRequestWithHostAccess`：处理部分图床请求兼容
-- `host_permissions: <all_urls>`：支持在绝大多数常见网页中执行采集；采集脚本会随每个网页自动加载，扫描和各项开关都通过它在页面里工作
+- `host_permissions: <all_urls>`：支持在绝大多数常见网页中执行采集；支持的网页会自动加载采集脚本，扫描和各项开关都通过它在页面里工作
 
 ## 适用范围与限制
 

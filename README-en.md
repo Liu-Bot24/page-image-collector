@@ -281,7 +281,7 @@ For dynamic pages, it is recommended to perform a manual scan first, then enable
 - `clipboardWrite`: Copy images or image links.
 - `offscreen`: Build ZIP files in a background page.
 - `declarativeNetRequest` / `declarativeNetRequestWithHostAccess`: Handle request compatibility for some image hosts.
-- `host_permissions: <all_urls>`: Supports executing collection on the vast majority of common web pages. The collection script loads with every page; scanning and the switches work through it.
+- `host_permissions: <all_urls>`: Supports executing collection on the vast majority of common web pages. Supported pages load the collection script automatically; scanning and the switches work through it.
 
 ## Scope and Limitations
 
