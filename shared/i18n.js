@@ -371,16 +371,17 @@
 
   const DYNAMIC_PATTERNS = [
     {
+      // Before the generic "…失败: …" pattern: its detail may itself contain "失败: ".
+      zh: /^分页加载出错: ([\s\S]+)$/,
+      en: /^Pagination load error: ([\s\S]+)$/,
+      toEn: (match) => `Pagination load error: ${translateErrorText("en", match[1])}`,
+      toZh: (match) => `分页加载出错: ${translateErrorText("zh", match[1])}`
+    },
+    {
       zh: /^(.+)失败: (.+)$/,
       en: /^(.+) failed: (.+)$/,
       toEn: (match) => `${translateActionName("en", match[1])} failed: ${translateErrorText("en", match[2])}`,
       toZh: (match) => `${translateActionName("zh", match[1])}失败: ${translateErrorText("zh", match[2])}`
-    },
-    {
-      zh: /^分页加载出错: (.+)$/,
-      en: /^Pagination load error: (.+)$/,
-      toEn: (match) => `Pagination load error: ${translateErrorText("en", match[1])}`,
-      toZh: (match) => `分页加载出错: ${translateErrorText("zh", match[1])}`
     },
     {
       zh: /^已复制 (\d+) 条链接$/,
