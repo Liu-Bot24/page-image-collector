@@ -3349,10 +3349,7 @@ const handleMessage = async (message, sender) => {
             config: await withZipPreferences(restoredConfig)
           };
         }
-        try {
-          chrome.contextMenus.update(CONTEXT_MENU_IDS.TOGGLE_UNLOCK_RIGHT_CLICK,
-            { checked: config.enableRightClick === true }, () => chrome.runtime.lastError);
-        } catch { /* ignore */ }
+        refreshRightClickMenuTick().catch(() => {});
       }
 
       if (Object.prototype.hasOwnProperty.call(payload, "enableAutoScan")) {
@@ -3481,10 +3478,7 @@ const handleMessage = async (message, sender) => {
         };
       }
 
-      try {
-        chrome.contextMenus.update(CONTEXT_MENU_IDS.TOGGLE_UNLOCK_RIGHT_CLICK,
-          { checked: config.enableRightClick === true }, () => chrome.runtime.lastError);
-      } catch { /* ignore */ }
+      refreshRightClickMenuTick().catch(() => {});
       return { success: true, enabled: config.enableRightClick };
     }
 
@@ -3648,10 +3642,7 @@ const handleTabUpdated = async (tabId, changeInfo, tab) => {
   if (config.enableRightClick) {
     await syncRightClickForTab(tabId, true);
   }
-  try {
-    chrome.contextMenus.update(CONTEXT_MENU_IDS.TOGGLE_UNLOCK_RIGHT_CLICK,
-      { checked: config.enableRightClick === true }, () => chrome.runtime.lastError);
-  } catch { /* ignore */ }
+  refreshRightClickMenuTick().catch(() => {});
 
   if (config.enableAutoScan) {
     await runScanForTab(tabId).catch(() => ({ success: false }));
@@ -3736,6 +3727,20 @@ const updateContextMenuItem = (id, updateProperties) =>
       resolve(false);
     });
   });
+
+// Chrome has no contextMenus.onShown, and the "unlock right-click" tick is one
+// global item, so it always shows the setting of the focused window's active
+// tab. Every change goes through here; a newer refresh supersedes older ones.
+let rightClickMenuTickSequence = 0;
+const refreshRightClickMenuTick = async () => {
+  const sequence = ++rightClickMenuTickSequence;
+  const [tab] = await chrome.tabs.query({ active: true, lastFocusedWindow: true });
+  await stateManager.ensureReady();
+  if (sequence !== rightClickMenuTickSequence || !Number.isInteger(tab?.id)) return;
+  await updateContextMenuItem(CONTEXT_MENU_IDS.TOGGLE_UNLOCK_RIGHT_CLICK, {
+    checked: stateManager.getConfig(tab.id).enableRightClick === true
+  });
+};
 
 const upsertContextMenuItem = async (options) => {
   const { id, ...updateProperties } = options;
@@ -3847,25 +3852,13 @@ if (chrome.contextMenus.onShown) {
   });
 }
 
-// Chrome has no contextMenus.onShown, and the menu tick is one global item, so
-// it follows the right-click setting of whichever tab becomes active.
-const syncRightClickMenuForTab = async (tabId) => {
-  if (!Number.isInteger(tabId) || tabId < 0) return;
-  await stateManager.ensureReady();
-  await updateContextMenuItem(CONTEXT_MENU_IDS.TOGGLE_UNLOCK_RIGHT_CLICK, {
-    checked: stateManager.getConfig(tabId).enableRightClick === true
-  });
-};
-
-chrome.tabs.onActivated?.addListener(({ tabId }) => {
-  syncRightClickMenuForTab(tabId).catch(() => {});
+chrome.tabs.onActivated?.addListener(() => {
+  refreshRightClickMenuTick().catch(() => {});
 });
 
 chrome.windows?.onFocusChanged?.addListener((windowId) => {
   if (windowId === chrome.windows.WINDOW_ID_NONE) return;
-  chrome.tabs.query({ active: true, windowId })
-    .then(([tab]) => syncRightClickMenuForTab(tab?.id))
-    .catch(() => {});
+  refreshRightClickMenuTick().catch(() => {});
 });
 
 chrome.contextMenus.onClicked.addListener(async (info, tab) => {
@@ -3901,17 +3894,15 @@ chrome.contextMenus.onClicked.addListener(async (info, tab) => {
   }
 
   if (info.menuItemId === CONTEXT_MENU_IDS.TOGGLE_UNLOCK_RIGHT_CLICK) {
-    const enabled = info.checked === true;
+    // Toggle this tab's own setting; the shared tick may have shown another tab's.
     const previousConfig = stateManager.getConfig(tab.id);
+    const enabled = previousConfig.enableRightClick !== true;
     const config = stateManager.setConfig(tab.id, { enableRightClick: enabled });
     const result = await syncRightClickForTab(tab.id, config.enableRightClick);
     if (!result.success) {
       stateManager.setConfig(tab.id, { enableRightClick: previousConfig.enableRightClick === true });
-      try {
-        chrome.contextMenus.update(CONTEXT_MENU_IDS.TOGGLE_UNLOCK_RIGHT_CLICK,
-          { checked: previousConfig.enableRightClick === true }, () => chrome.runtime.lastError);
-      } catch { /* ignore */ }
     }
+    refreshRightClickMenuTick().catch(() => {});
   }
 });
 
