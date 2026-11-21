@@ -2496,7 +2496,22 @@ let rightClickEnabled = false;
 let unlockStyleNode = null;
 let unlockInterval = null;
 const unlockHandlers = new Map();
-const unlockEvents = ["contextmenu", "selectstart", "copy", "cut", "paste", "dragstart"];
+// Paste stays with the page: sites rarely block it to keep content, while
+// editors depend on handling it themselves.
+const unlockEvents = ["contextmenu", "selectstart", "copy", "cut", "dragstart"];
+// Inline svg is left out: it is usually an icon inside a link or list item.
+const UNLOCK_MEDIA_SELECTOR = "img, picture, video, canvas";
+
+// Dragging is unlocked only for images (or a link around one), so the page's
+// own drag-to-sort and similar keep working.
+// The real drag source comes from the event path, which also reaches inside an
+// open shadow root; a text node there means a text-selection drag.
+const isMediaDrag = (event) => {
+  const source = event.composedPath?.()[0] || event.target;
+  if (!(source instanceof Element)) return false;
+  if (source.closest(UNLOCK_MEDIA_SELECTOR)) return true;
+  return source.localName === "a" && Boolean(source.querySelector(UNLOCK_MEDIA_SELECTOR));
+};
 
 const unlockCss = `
   * {
@@ -2531,6 +2546,7 @@ const setRightClickEnabled = (enabled) => {
 
     for (const eventType of unlockEvents) {
       const handler = (event) => {
+        if (event.type === "dragstart" && !isMediaDrag(event)) return;
         event.stopImmediatePropagation();
       };
       unlockHandlers.set(eventType, handler);
