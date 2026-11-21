@@ -2938,9 +2938,18 @@ const focusSourceTabAndStartAutoScroll = async (tabId) => {
 };
 
 const offscreenRefererLeases = new Map();
+// Messages only the extension's own offscreen ZIP document may send: they
+// start downloads with caller-supplied URLs and file names.
+const OFFSCREEN_ONLY_MESSAGES = new Set([
+  MSG.OFFSCREEN_ZIP_PROGRESS, MSG.OFFSCREEN_ZIP_PART_READY, MSG.OFFSCREEN_ZIP_DONE, MSG.OFFSCREEN_ZIP_PART_DONE
+]);
+const isOffscreenSender = (sender) => sender?.id === chrome.runtime.id && sender?.url === OFFSCREEN_DOCUMENT_URL;
 const handleMessage = async (message, sender) => {
+  if (OFFSCREEN_ONLY_MESSAGES.has(message?.type) && !isOffscreenSender(sender)) {
+    return { success: false, error: 'Invalid ZIP message context' };
+  }
   if (message?.type === 'ACQUIRE_IMAGE_REFERER' || message?.type === 'RELEASE_IMAGE_REFERER') {
-    if (sender?.id !== chrome.runtime.id || sender?.url !== OFFSCREEN_DOCUMENT_URL) return { success: false, error: 'Invalid image request context' };
+    if (!isOffscreenSender(sender)) return { success: false, error: 'Invalid image request context' };
     await loadImageRefererMetadata();
     if (message.type === 'RELEASE_IMAGE_REFERER') {
       const token = String(message.payload?.token || '');
