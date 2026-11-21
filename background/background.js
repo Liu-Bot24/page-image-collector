@@ -18,6 +18,7 @@ import {
   DEFAULT_ZIP_PART_PRESET,
   formatFromUrl,
   inspectImagePayload,
+  isTextErrorPayload,
   mimeFromFormat,
   normalizeZipPartOptions,
   resolveImagePayloadExtension,
@@ -2647,12 +2648,23 @@ const downloadImage = async (image, options = {}) => {
   const usedFallback = candidateIndex => options.recoveryFallback === true || candidateIndex > 0;
   const candidateOptions = (candidateIndex) => ({
     ...options, sourceUrl, candidateIndex, candidateUrl: candidates[candidateIndex],
-    remainingCandidateUrls: candidates.slice(candidateIndex + 1).filter(url => /^https?:/i.test(url)),
+    remainingCandidateUrls: candidates.slice(candidateIndex + 1).filter(url => /^https?:/i.test(url) && !nonImageUrls.has(url)),
     fallbackUsed: usedFallback(candidateIndex)
   });
   const stoppedResult = (error) => error?.cancelled || error?.code === "USER_CANCELED" || error?.retryable === false
     ? { success: false, cancelled: Boolean(error.cancelled || error.code === "USER_CANCELED"), error: error.message || "Download stopped", fallbackUsed: false, retryable: false }
     : null;
+
+  // Addresses whose response was shown to be an error page or other text; the
+  // browser would save that same response as an image file, so they are not
+  // handed to a direct download afterwards.
+  // Judged from the body, not the header: a real image labelled text/html keeps
+  // its direct-download fallback.
+  const nonImageUrls = new Set();
+  const rejectPayload = (url, inspection, bytes) => {
+    if (isTextErrorPayload(bytes)) nonImageUrls.add(url);
+    return new Error(inspection.reason || "Non-image response");
+  };
 
   const downloadVerifiedOriginal = async (url, candidateIndex) => {
     const blob = await fetchBlob(url, 25000, sourceUrl);
@@ -2663,7 +2675,7 @@ const downloadImage = async (image, options = {}) => {
       url
     });
     if (!inspection.ok) {
-      throw new Error(inspection.reason || "Non-image response");
+      throw rejectPayload(url, inspection, bytes);
     }
     const ext = resolveImagePayloadExtension({
       inspection,
@@ -2692,7 +2704,7 @@ const downloadImage = async (image, options = {}) => {
         const bytes = new Uint8Array(await blob.arrayBuffer());
         const inspection = inspectImagePayload({ bytes, mimeType: type, url });
         if (!inspection.ok) {
-          throw new Error(inspection.reason || "Non-image response");
+          throw rejectPayload(url, inspection, bytes);
         }
         if (shouldConvertImageToJpg({ inspection, mimeType: type, url })) {
           const jpgBlob = await convertBlobToJpg(blob);
@@ -2733,6 +2745,7 @@ const downloadImage = async (image, options = {}) => {
 
   for (let i = startCandidateIndex; i < candidates.length; i += 1) {
     const url = candidates[i];
+    if (nonImageUrls.has(url)) continue;
     const extFromUrl = extensionFromUrl(url, "");
     if (!extFromUrl) {
       try {
@@ -2740,6 +2753,7 @@ const downloadImage = async (image, options = {}) => {
       } catch (error) {
         if (stoppedResult(error)) return stoppedResult(error);
         lastError = error;
+        if (nonImageUrls.has(url)) continue;
       }
     }
     const filename = `${baseFilename(image, index)}.${extFromUrl || "jpg"}`;

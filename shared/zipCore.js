@@ -188,6 +188,63 @@ const detectMagicFormat = (bytes) => {
   return "";
 };
 
+// The start of a text body after BOM, whitespace, comments, processing
+// instructions and doctype (including an internal subset). doctype is the
+// skipped doctype's name; complete is false when one of them never closes
+// within the first 8 KB.
+const rootMarkup = (bytes) => {
+  let text = "";
+  for (const byte of bytes.slice(0, Math.min(bytes.length, 8192))) text += String.fromCharCode(byte);
+  text = text.replace(/^\xef\xbb\xbf/, "");
+  let doctype = "";
+  for (;;) {
+    text = text.replace(/^[ \t\n\r\f]+/, "");
+    let end = -1;
+    if (text.startsWith("<!--")) {
+      const close = text.indexOf("-->");
+      end = close === -1 ? 0 : close + 3;
+    } else if (text.startsWith("<?")) {
+      const close = text.indexOf("?>");
+      end = close === -1 ? 0 : close + 2;
+    } else if (/^<!doctype\b/i.test(text)) {
+      doctype = (text.match(/^<!doctype\s+([^\s>[]+)/i)?.[1] || "").toLowerCase();
+      const gt = text.indexOf(">");
+      const bracket = text.indexOf("[");
+      // An internal subset can hold any text, so its end is not guessed: the
+      // body counts as unclear. Error pages do not carry one.
+      if (bracket !== -1 && (gt === -1 || bracket < gt)) return { text, doctype, complete: false };
+      end = gt === -1 ? 0 : gt + 1;
+    }
+    if (end === -1) return { text, doctype, complete: true };
+    if (end === 0) return { text, doctype, complete: false };
+    text = text.slice(end);
+  }
+};
+
+// True only when the body itself shows it is not an image: empty, an HTML
+// document (by its doctype or root element), or JSON. The response header is
+// not consulted, since servers mislabel real images; anything unclear counts
+// as possibly an image.
+export const isTextErrorPayload = (bytes) => {
+  if (!bytes || !(Number(bytes.length) > 0)) return true;
+  // The SVG signature is loose (any <svg> near an XML declaration), so text
+  // bodies are settled by their root element below.
+  const magic = detectMagicFormat(bytes);
+  if (magic && magic !== "svg") return false;
+  const { text, doctype, complete } = rootMarkup(bytes);
+  if (doctype === "html") return true;
+  if (!complete) return false;
+  if (/^<(?:html|head|body)[\s>/]/i.test(text)) return true;
+  // Binary formats can start with "{" or "[" too; only a body that parses as JSON counts.
+  if (!/^[{[]/.test(text) || bytes.length > 1024 * 1024) return false;
+  try {
+    JSON.parse(new TextDecoder("utf-8", { fatal: true }).decode(bytes));
+    return true;
+  } catch {
+    return false;
+  }
+};
+
 export const inspectImagePayload = ({ bytes, mimeType = "", url = "" } = {}) => {
   const length = Number(bytes?.length) || 0;
   if (!bytes || length <= 0) {
