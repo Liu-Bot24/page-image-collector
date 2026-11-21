@@ -137,6 +137,9 @@ const convertBlobToJpg = async (blob) => {
     const canvas = new OffscreenCanvas(bitmap.width, bitmap.height);
     const context = canvas.getContext("2d");
     if (!context) throw new Error("Canvas context unavailable");
+    // JPEG has no alpha; transparent pixels would otherwise encode as black.
+    context.fillStyle = "#fff";
+    context.fillRect(0, 0, bitmap.width, bitmap.height);
     context.drawImage(bitmap, 0, 0);
     return await canvas.convertToBlob({ type: "image/jpeg", quality: JPG_CONVERT_QUALITY });
   } finally {
