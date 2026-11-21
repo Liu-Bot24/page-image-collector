@@ -584,7 +584,13 @@ const loadImageRefererMetadata = () => {
         imageRefererConsumers.set(raw.tabIds[0], raw.sourceTabId);
       }
       // Dynamic rules from earlier releases must never survive as ambient rules.
-      await chrome.declarativeNetRequest.updateDynamicRules({ removeRuleIds: [SINAIMG_REFERER_RULE_ID, ...imageRefererRuleIds()] });
+      // This cleanup is best effort: if Chrome cannot write its dynamic rule
+      // store, the session rules below still work and must not be blocked.
+      try {
+        await chrome.declarativeNetRequest.updateDynamicRules({ removeRuleIds: [SINAIMG_REFERER_RULE_ID, ...imageRefererRuleIds()] });
+      } catch (error) {
+        console.warn('[图片采集查看器] Legacy dynamic Referer rule cleanup failed:', error);
+      }
       const rules = await getScopedDnrRules();
       const reconciliation = reconcileRefererRuleSet({ records: [...imageRefererRuleMap.values()], scopedRules: rules,
         ruleIdStart: IMAGE_REFERER_RULE_ID_START, ruleIdMax: IMAGE_REFERER_RULE_ID_MAX, resourceTypes: IMAGE_REFERER_RESOURCE_TYPES });
