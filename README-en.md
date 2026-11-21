@@ -279,8 +279,9 @@ For dynamic pages, it is recommended to perform a manual scan first, then enable
 - `contextMenus`: Provides right-click menu capabilities.
 - `storage`: Save tab collection status and interface configuration.
 - `clipboardWrite`: Copy images or image links.
+- `offscreen`: Build ZIP files in a background page.
 - `declarativeNetRequest` / `declarativeNetRequestWithHostAccess`: Handle request compatibility for some image hosts.
-- `host_permissions: <all_urls>`: Supports executing collection on the vast majority of common web pages.
+- `host_permissions: <all_urls>`: Supports executing collection on the vast majority of common web pages. The collection script loads with every page; scanning and the switches work through it.
 
 ## Scope and Limitations
 
@@ -296,5 +297,5 @@ For dynamic pages, it is recommended to perform a manual scan first, then enable
 
 ## Version Info
 
-- Version: `1.2.8`
+- Version: `1.3.0`
 - Manifest: `MV3`
