@@ -192,30 +192,40 @@ const copyImagePayloadToClipboard = async (dataUrl, fallbackUrl = "") => {
   return { success: false, error: "Clipboard write failed" };
 };
 
+// Splits a srcset the way the HTML standard does: an address runs to the next
+// whitespace, so commas inside it (w_300,h_200 or data: addresses) stay part of
+// it; a trailing comma ends a candidate that has no descriptor.
 const splitSrcsetCandidates = (srcset) => {
   const candidates = [];
-  let current = "";
-  let dataUrlCommaConsumed = false;
-
-  for (let i = 0; i < srcset.length; i += 1) {
-    const char = srcset[i];
-    if (char === ",") {
-      const trimmed = current.trim();
-      const dataUrlWithoutDescriptor = /^data:/i.test(trimmed) && !/\s+\d+(?:w|x)\s*$/i.test(trimmed);
-      if (dataUrlWithoutDescriptor && !dataUrlCommaConsumed) {
-        dataUrlCommaConsumed = true;
-      } else {
-        if (trimmed) candidates.push(trimmed);
-        current = "";
-        dataUrlCommaConsumed = false;
-        continue;
+  const isSpace = (char) => char === " " || char === "\t" || char === "\n" || char === "\r" || char === "\f";
+  let pos = 0;
+  while (pos < srcset.length) {
+    while (pos < srcset.length && (isSpace(srcset[pos]) || srcset[pos] === ",")) pos += 1;
+    if (pos >= srcset.length) break;
+    let url = "";
+    while (pos < srcset.length && !isSpace(srcset[pos])) url += srcset[pos++];
+    const descriptors = [];
+    if (url.endsWith(",")) {
+      url = url.replace(/,+$/, "");
+    } else {
+      let current = "";
+      let inParens = false;
+      while (pos < srcset.length) {
+        const char = srcset[pos++];
+        if (!inParens && char === ",") break;
+        if (!inParens && isSpace(char)) {
+          if (current) descriptors.push(current);
+          current = "";
+          continue;
+        }
+        if (char === "(") inParens = true;
+        if (char === ")") inParens = false;
+        current += char;
       }
+      if (current) descriptors.push(current);
     }
-    current += char;
+    if (url) candidates.push({ url, descriptors });
   }
-
-  const trailing = current.trim();
-  if (trailing) candidates.push(trailing);
   return candidates;
 };
 
@@ -233,31 +243,20 @@ const mergeUrlLists = (...lists) => {
   return merged;
 };
 
-const parseSrcsetLegacyUrl = (srcset) => {
-  if (!srcset || typeof srcset !== "string") return null;
-  const candidates = splitSrcsetCandidates(srcset)
-    .map((item) => item.trim())
-    .filter(Boolean)
-    .map((item, order) => {
-      const [url, descriptor] = item.split(/\s+/, 2);
-      const score = descriptor?.endsWith("w")
-        ? parseInt(descriptor, 10)
-        : descriptor?.endsWith("x")
-          ? Math.round(parseFloat(descriptor) * 1000)
-          : Math.max(1, 100 - order);
-      return { url, score: Number.isFinite(score) ? score : Math.max(1, 100 - order) };
-    })
-    .sort((a, b) => b.score - a.score);
-
-  return candidates[0]?.url || null;
-};
-
+// Largest first: width (w) or density (x) descriptors, else document order.
 const parseSrcsetUrls = (srcset) => {
   if (!srcset || typeof srcset !== "string") return [];
-  const legacyUrl = parseSrcsetLegacyUrl(srcset);
-  const legacyUrls = splitSrcsetCandidates(srcset).map((item) => item.trim().split(/\s+/, 1)[0]);
-  const vendorUrls = globalThis.PageImageCollectorParsers?.parseSrcsetUrls?.(srcset);
-  return mergeUrlLists(legacyUrl, vendorUrls, legacyUrls);
+  const scored = splitSrcsetCandidates(srcset).map(({ url, descriptors }, order) => {
+    const width = descriptors.find((item) => /^\d+w$/i.test(item));
+    const density = descriptors.find((item) => /^\d*\.?\d+(?:e[+-]?\d+)?x$/i.test(item));
+    const score = width
+      ? parseInt(width, 10)
+      : density
+        ? Math.round(parseFloat(density) * 1000)
+        : Math.max(1, 100 - order);
+    return { url, score: Number.isFinite(score) ? score : Math.max(1, 100 - order) };
+  });
+  return mergeUrlLists(scored.sort((a, b) => b.score - a.score).map((item) => item.url));
 };
 
 const getHDUrl = (url) => {
