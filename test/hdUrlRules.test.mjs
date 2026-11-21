@@ -53,6 +53,8 @@ test("Discord size is dropped without breaking the remaining query", () => {
     "https://cdn.discordapp.com/attachments/1/2/a.webp?size=48px&quality=lossless");
   assert.equal(getHDUrl("https://cdn.discordapp.com/attachments/1/2/a.webp?size=48#frag"),
     "https://cdn.discordapp.com/attachments/1/2/a.webp#frag");
+  assert.equal(getHDUrl("https://imgproxy.example/cache/cdn.discordapp.com/a.webp?size=48&size=96"),
+    "https://imgproxy.example/cache/cdn.discordapp.com/a.webp?size=48&size=96");
 });
 
 test("a size suffix after a full file name is the only thing stripped", () => {

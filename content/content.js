@@ -91,6 +91,11 @@ const HD_RULES = [
     test: /cdn\.discordapp\.com.*\.(jpg|jpeg|png|webp|gif)\?(?:[^#]*&)?size=\d+/i,
     // Drop every whole "size=<digits>" field; other fields keep their exact text.
     replace: (url) => {
+      try {
+        if (new URL(url, location.href).hostname.toLowerCase() !== "cdn.discordapp.com") return url;
+      } catch {
+        return url;
+      }
       const hashAt = url.indexOf("#");
       const base = hashAt < 0 ? url : url.slice(0, hashAt);
       const hash = hashAt < 0 ? "" : url.slice(hashAt);
