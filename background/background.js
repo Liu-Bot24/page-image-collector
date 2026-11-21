@@ -3840,6 +3840,27 @@ if (chrome.contextMenus.onShown) {
   });
 }
 
+// Chrome has no contextMenus.onShown, and the menu tick is one global item, so
+// it follows the right-click setting of whichever tab becomes active.
+const syncRightClickMenuForTab = async (tabId) => {
+  if (!Number.isInteger(tabId) || tabId < 0) return;
+  await stateManager.ensureReady();
+  await updateContextMenuItem(CONTEXT_MENU_IDS.TOGGLE_UNLOCK_RIGHT_CLICK, {
+    checked: stateManager.getConfig(tabId).enableRightClick === true
+  });
+};
+
+chrome.tabs.onActivated?.addListener(({ tabId }) => {
+  syncRightClickMenuForTab(tabId).catch(() => {});
+});
+
+chrome.windows?.onFocusChanged?.addListener((windowId) => {
+  if (windowId === chrome.windows.WINDOW_ID_NONE) return;
+  chrome.tabs.query({ active: true, windowId })
+    .then(([tab]) => syncRightClickMenuForTab(tab?.id))
+    .catch(() => {});
+});
+
 chrome.contextMenus.onClicked.addListener(async (info, tab) => {
   if (!tab?.id) return;
   await stateManager.ensureReady();
