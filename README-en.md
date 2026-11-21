@@ -204,6 +204,7 @@ Suitable for handling more complex collection tasks:
   - Auto scroll (Popup)
   - Auto collect
   - Unlock right-click (Popup / Right-click menu)
+- The Selected count, batch copy links, batch download and hide/show only act on selected images that the current filters show; images filtered out stay selected and count again once the filter brings them back
 
 ## Downloading and Copying
 
