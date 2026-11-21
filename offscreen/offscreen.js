@@ -88,46 +88,59 @@ const fetchBlob = async (url, timeoutMs = 8000, sourceUrl = '') => {
   }
 };
 
-const fetchBlobUnscoped = async (url, timeoutMs = 8000) => {
-  const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), timeoutMs);
-  try {
-    const baseOptions = {
-      signal: controller.signal,
-      cache: "no-store",
-      redirect: "follow"
-    };
+// timeoutMs bounds the wait for the response to start. Once it has, the body
+// gets its own, longer limit, so a large original on a slow connection is not
+// cut off and silently replaced by the next (smaller) candidate.
+const ZIP_BODY_TIMEOUT_MS = 120000;
 
-    const tryFetch = async (extraOptions = {}) => {
-      const response = await fetch(url, { ...baseOptions, ...extraOptions });
+const fetchBlobUnscoped = async (url, timeoutMs = 8000) => {
+  let bodyStarted = false;
+  // Each attempt has its own controller: the header wait, then the body limit.
+  const tryFetch = async (extraOptions = {}) => {
+    const controller = new AbortController();
+    let timer = setTimeout(() => controller.abort(), timeoutMs);
+    try {
+      const response = await fetch(url, {
+        signal: controller.signal,
+        cache: "no-store",
+        redirect: "follow",
+        ...extraOptions
+      });
       if (!response.ok) {
         const error = new Error(`HTTP ${response.status}`);
         error.status = response.status;
         throw error;
       }
+      clearTimeout(timer);
+      timer = setTimeout(() => controller.abort(), ZIP_BODY_TIMEOUT_MS);
+      bodyStarted = true;
       return await response.blob();
-    };
-
-    const isSinaImage = (() => {
-      try {
-        const parsed = new URL(url);
-        return /\.sinaimg\.cn$/i.test(parsed.hostname);
-      } catch (_error) {
-        return false;
-      }
-    })();
-
-    try {
-      return await tryFetch();
-    } catch (error) {
-      if (!isSinaImage) throw error;
-      return await tryFetch({
-        referrer: "https://weibo.com/",
-        referrerPolicy: "strict-origin-when-cross-origin"
-      });
+    } finally {
+      clearTimeout(timer);
+      // Ends whatever is left of this attempt, e.g. an error page still streaming.
+      controller.abort();
     }
-  } finally {
-    clearTimeout(timer);
+  };
+
+  const isSinaImage = (() => {
+    try {
+      const parsed = new URL(url);
+      return /\.sinaimg\.cn$/i.test(parsed.hostname);
+    } catch (_error) {
+      return false;
+    }
+  })();
+
+  try {
+    return await tryFetch();
+  } catch (error) {
+    // Retry only a request that never started its body: a late retry could
+    // outlive the Referer lease held for this fetch.
+    if (!isSinaImage || bodyStarted) throw error;
+    return await tryFetch({
+      referrer: "https://weibo.com/",
+      referrerPolicy: "strict-origin-when-cross-origin"
+    });
   }
 };
 
