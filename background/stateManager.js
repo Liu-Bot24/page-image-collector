@@ -571,6 +571,7 @@ const normalizeConfig = (config = {}, partial = false) => {
 
 export const createTabStateManager = () => {
   const tabStates = new Map();
+  const storedTabIds = new Set();
   let ready = false;
   let readyPromise = null;
   let loadError = null;
@@ -700,7 +701,10 @@ export const createTabStateManager = () => {
           }
           loadedStates.set(tabId, state);
         }
-        for (const [tabId, state] of loadedStates) tabStates.set(tabId, state);
+        for (const [tabId, state] of loadedStates) {
+          tabStates.set(tabId, state);
+          storedTabIds.add(tabId);
+        }
         loadError = null;
         ready = true;
       } catch (error) {
@@ -1036,6 +1040,19 @@ export const createTabStateManager = () => {
     }
   };
 
+  // Tabs closed while the extension was not listening (browser quit, crash,
+  // extension disabled) never get onRemoved. Only states read from storage are
+  // considered, so a tab that appeared after the live list was taken is kept.
+  const pruneStoredTabStates = (liveTabIds) => {
+    let removed = 0;
+    for (const tabId of storedTabIds) {
+      if (!liveTabIds.has(tabId) && tabStates.delete(tabId)) removed += 1;
+    }
+    storedTabIds.clear();
+    if (removed) schedulePersist();
+    return removed;
+  };
+
   const markHdRejected = (tabId, imageId, rejected = true, collectionId) => {
     const state = tabStates.get(tabId);
     if (!state || !collectionId || collectionId !== state.collectionId) return;
@@ -1173,6 +1190,7 @@ export const createTabStateManager = () => {
     markHdRejected,
     updateImageMetadata,
     removeTabState,
+    pruneStoredTabStates,
     clearTabImages
   };
 };

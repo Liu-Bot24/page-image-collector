@@ -3552,6 +3552,16 @@ chrome.tabs.onRemoved.addListener((tabId) => {
   handleTabRemoved(tabId).catch(() => {});
 });
 
+// Drop stored results of tabs that no longer exist (closed while the browser
+// was quitting, crashing, or the extension was off).
+(async () => {
+  await stateManager.ensureReady();
+  const tabs = await chrome.tabs.query({});
+  stateManager.pruneStoredTabStates(new Set(tabs.map((tab) => tab.id)));
+})().catch((error) => {
+  console.warn("[图片采集查看器] Failed to drop states of closed tabs:", error);
+});
+
 const resetTabCollectionForUrlNavigation = async (tabId) => {
   rotateImageRefererOwnerToken(tabId);
   invalidateCollectionEpoch(tabId);
