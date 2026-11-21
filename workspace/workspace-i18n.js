@@ -50,12 +50,20 @@
     syncScanButton();
   };
 
+  // "隐藏" is both the Hide button and the Hidden format filter; text lookup
+  // alone cannot tell them apart, so the filter label is set by key.
+  const syncHiddenFilterLabel = () => {
+    const name = document.querySelector('input[value="_hidden"] + .format-name');
+    i18n.setTextContent(name, i18n.t(currentLanguage, "filter.hidden"));
+  };
+
   const applyTranslations = (root = document.body, syncStatic = true) => {
     if (applying) return;
     applying = true;
     try {
       if (syncStatic) syncStaticControls();
       i18n.applyDomTranslations(currentLanguage, root);
+      syncHiddenFilterLabel();
     } finally {
       applying = false;
     }

@@ -132,7 +132,11 @@
       "error.paginationScanFailed": "分页图片扫描失败",
       "error.paginationCancelled": "漫画分页加载已取消",
       "error.collectionChanged": "原网页已切换或采集结果已清空",
-      "error.collectionBusy": "页面正在加载或清理采集结果"
+      "error.collectionBusy": "页面正在加载或清理采集结果",
+      "status.saveFailed": "保存失败，当前更改尚未保存",
+      "status.compatibilityPreview": "部分图片正在使用兼容加载方式",
+      "status.compatibilityCapacity": "部分图片已切换到兼容加载方式，采集结果完整保留",
+      "status.compatibilityUnavailable": "图片加载规则暂不可用，已切换到兼容加载方式"
     },
     en: {
       "app.title": "Page Image Collector",
@@ -261,7 +265,11 @@
       "error.paginationScanFailed": "Pagination image scan failed",
       "error.paginationCancelled": "Comic pagination was cancelled",
       "error.collectionChanged": "The source page changed or the collected results were cleared",
-      "error.collectionBusy": "The page is loading or collected results are being cleared"
+      "error.collectionBusy": "The page is loading or collected results are being cleared",
+      "status.saveFailed": "Save failed. Your latest changes are not saved yet",
+      "status.compatibilityPreview": "Some images are loading in compatibility mode",
+      "status.compatibilityCapacity": "Some images switched to compatibility mode. All collected images are kept",
+      "status.compatibilityUnavailable": "Image loading rules are unavailable. Switched to compatibility mode"
     }
   };
 
@@ -367,6 +375,12 @@
       en: /^(.+) failed: (.+)$/,
       toEn: (match) => `${translateActionName("en", match[1])} failed: ${translateErrorText("en", match[2])}`,
       toZh: (match) => `${translateActionName("zh", match[1])}失败: ${translateErrorText("zh", match[2])}`
+    },
+    {
+      zh: /^分页加载出错: (.+)$/,
+      en: /^Pagination load error: (.+)$/,
+      toEn: (match) => `Pagination load error: ${translateErrorText("en", match[1])}`,
+      toZh: (match) => `分页加载出错: ${translateErrorText("zh", match[1])}`
     },
     {
       zh: /^已复制 (\d+) 条链接$/,
